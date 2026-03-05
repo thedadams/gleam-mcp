@@ -1,0 +1,52 @@
+name: Publish
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Gleam
+        uses: gleam-lang/setup-gleam@v1
+        with:
+          gleam-version: latest
+
+      - name: Set up Erlang/OTP
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: "27"
+          rebar3-version: "3"
+
+      - name: Download dependencies
+        run: gleam deps download
+
+      - name: Validate tag matches gleam.toml version
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          manifest_version=$(grep '^version\s*=\s*"' gleam.toml | head -n 1 | sed -E 's/^version\s*=\s*"([^"]+)".*/\1/')
+
+          if [ -z "$manifest_version" ]; then
+            echo "Could not read version from gleam.toml"
+            exit 1
+          fi
+
+          if [ "$tag_version" != "$manifest_version" ]; then
+            echo "Tag version ($tag_version) does not match gleam.toml version ($manifest_version)"
+            exit 1
+          fi
+
+          echo "Tag version matches gleam.toml version: $manifest_version"
+
+      - name: Publish package to Hex
+        env:
+          HEXPM_API_KEY: ${{ secrets.HEXPM_API_KEY }}
+        run: gleam publish --yes

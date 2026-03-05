@@ -1,0 +1,3 @@
+/build
+src/gleam_mcp_http_client.gleam
+src/gleam_mcp_http_client_ffi.erl

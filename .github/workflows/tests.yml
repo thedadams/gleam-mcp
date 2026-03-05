@@ -1,0 +1,55 @@
+name: Tests
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Gleam & OTP
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: "28"
+          gleam-version: "1.14.0"
+          rebar3-version: "3"
+
+      - name: Format code
+        run: gleam format --check src test
+
+      - name: Download dependencies
+        run: gleam deps download
+
+      - name: Start Everything server
+        env:
+          PORT: "3001"
+        run: |
+          npx -y @modelcontextprotocol/server-everything@2026.1.26 streamableHttp > /tmp/mcp-everything.log 2>&1 &
+
+      - name: Wait for Everything server
+        env:
+          MCP_EVERYTHING_URL: http://127.0.0.1:3001/mcp
+        run: |
+          for _ in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w "%{http_code}" "$MCP_EVERYTHING_URL" || true)
+            if [ "$code" != "000" ]; then
+              exit 0
+            fi
+            sleep 1
+          done
+          cat /tmp/mcp-everything.log
+          exit 1
+
+      - name: Run tests
+        env:
+          MCP_EVERYTHING_URL: http://127.0.0.1:3001/mcp
+        run: gleam test
