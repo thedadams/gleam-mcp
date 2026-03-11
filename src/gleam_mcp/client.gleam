@@ -16,7 +16,7 @@ pub type Client {
     runners: transport.Runners,
     capabilities: capabilities.Config,
     protocol_version: String,
-    http_session_id: Option(String),
+    session_id: Option(String),
   )
 }
 
@@ -42,7 +42,7 @@ pub fn new_with_runners(
     runners: runners,
     capabilities: capabilities,
     protocol_version: jsonrpc.latest_protocol_version,
-    http_session_id: None,
+    session_id: None,
   )
 }
 
@@ -102,12 +102,16 @@ pub fn initialized(client: Client) -> #(Client, Result(Nil, ClientError)) {
 
 pub fn list_resources(
   client: Client,
-  params: actions.PaginatedRequestParams,
+  params: Option(actions.PaginatedRequestParams),
 ) -> #(Client, Result(actions.ListResourcesResult, ClientError)) {
+  let resource_params = case params {
+    Some(p) -> p
+    None -> actions.PaginatedRequestParams(None, None)
+  }
   send_request(
     client,
     mcp.method_list_resources,
-    Some(actions.RequestListResources(params)),
+    Some(actions.RequestListResources(resource_params)),
   )
   |> expect_result("resources/list", fn(result) {
     case result {
@@ -119,12 +123,16 @@ pub fn list_resources(
 
 pub fn list_resource_templates(
   client: Client,
-  params: actions.PaginatedRequestParams,
+  params: Option(actions.PaginatedRequestParams),
 ) -> #(Client, Result(actions.ListResourceTemplatesResult, ClientError)) {
+  let template_params = case params {
+    Some(p) -> p
+    None -> actions.PaginatedRequestParams(None, None)
+  }
   send_request(
     client,
     mcp.method_list_resource_templates,
-    Some(actions.RequestListResourceTemplates(params)),
+    Some(actions.RequestListResourceTemplates(template_params)),
   )
   |> expect_result("resources/templates/list", fn(result) {
     case result {
@@ -177,12 +185,16 @@ pub fn unsubscribe_resource(
 
 pub fn list_prompts(
   client: Client,
-  params: actions.PaginatedRequestParams,
+  params: Option(actions.PaginatedRequestParams),
 ) -> #(Client, Result(actions.ListPromptsResult, ClientError)) {
+  let prompt_params = case params {
+    Some(p) -> p
+    None -> actions.PaginatedRequestParams(None, None)
+  }
   send_request(
     client,
     mcp.method_list_prompts,
-    Some(actions.RequestListPrompts(params)),
+    Some(actions.RequestListPrompts(prompt_params)),
   )
   |> expect_result("prompts/list", fn(result) {
     case result {
@@ -328,12 +340,16 @@ pub fn elicit(
 
 pub fn list_tasks(
   client: Client,
-  params: actions.PaginatedRequestParams,
+  params: Option(actions.PaginatedRequestParams),
 ) -> #(Client, Result(actions.ListTasksResult, ClientError)) {
+  let request_params = case params {
+    Some(p) -> p
+    None -> actions.PaginatedRequestParams(None, None)
+  }
   send_request(
     client,
     mcp.method_list_tasks,
-    Some(actions.RequestListTasks(params)),
+    Some(actions.RequestListTasks(request_params)),
   )
   |> expect_result("tasks/list", fn(result) {
     case result {
@@ -542,7 +558,7 @@ fn send_request(
     transport_config: transport_config,
     runners: runners,
     protocol_version: protocol_version,
-    http_session_id: session_id,
+    session_id: session_id,
     ..,
   ) = client
 
@@ -580,7 +596,7 @@ fn send_notification(
     transport_config: transport_config,
     runners: runners,
     protocol_version: protocol_version,
-    http_session_id: session_id,
+    session_id: session_id,
     ..,
   ) = client
 
@@ -616,7 +632,7 @@ fn send(
   protocol_version: String,
   method: String,
   params: Option(action),
-  stdio_request: fn(transport.StdioConfig, Request(action)) ->
+  stdio_request: fn(transport.StdioConfig, Option(String), Request(action)) ->
     Result(transport.TransportResponse(result), transport.TransportError),
   streamable_request: fn(
     transport.HttpConfig,
@@ -643,7 +659,7 @@ fn send_message(
   session_id: Option(String),
   protocol_version: String,
   request: Request(action),
-  stdio_request: fn(transport.StdioConfig, Request(action)) ->
+  stdio_request: fn(transport.StdioConfig, Option(String), Request(action)) ->
     Result(transport.TransportResponse(result), transport.TransportError),
   streamable_request: fn(
     transport.HttpConfig,
@@ -675,7 +691,7 @@ fn set_runtime(client: Client, session_id: Option(String)) -> Client {
 
   let next_session_id = case session_id {
     Some(_) -> session_id
-    None -> client.http_session_id
+    None -> client.session_id
   }
 
   Client(
@@ -683,6 +699,6 @@ fn set_runtime(client: Client, session_id: Option(String)) -> Client {
     runners: runners,
     capabilities: capabilities,
     protocol_version: protocol_version,
-    http_session_id: next_session_id,
+    session_id: next_session_id,
   )
 }

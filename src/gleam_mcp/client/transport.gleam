@@ -11,6 +11,7 @@ import gleam_mcp/actions.{
   type ActionNotification, type ActionRequest, type ActionResult,
 }
 import gleam_mcp/client/codec as client_codec
+import gleam_mcp/client/stdio_manager
 import gleam_mcp/jsonrpc.{type Request, type Response}
 
 pub type CompatibilityMode {
@@ -60,9 +61,13 @@ pub type TransportResponse(result) {
 
 pub type Runners {
   Runners(
-    stdio_request: fn(StdioConfig, Request(ActionRequest)) ->
+    stdio_request: fn(StdioConfig, Option(String), Request(ActionRequest)) ->
       Result(TransportResponse(ActionResult), TransportError),
-    stdio_notification: fn(StdioConfig, Request(ActionNotification)) ->
+    stdio_notification: fn(
+      StdioConfig,
+      Option(String),
+      Request(ActionNotification),
+    ) ->
       Result(TransportResponse(Nil), TransportError),
     streamable_request: fn(
       HttpConfig,
@@ -82,12 +87,14 @@ pub type Runners {
 }
 
 pub fn default_runners() -> Runners {
+  let manager = stdio_manager.start()
+
   Runners(
-    stdio_request: fn(_, _) {
-      Error(ProcessError("Default stdio transport runner is not configured"))
+    stdio_request: fn(config, session_id, message) {
+      stdio_process_request(manager, config, session_id, message)
     },
-    stdio_notification: fn(_, _) {
-      Error(ProcessError("Default stdio transport runner is not configured"))
+    stdio_notification: fn(config, session_id, message) {
+      stdio_process_notification(manager, config, session_id, message)
     },
     streamable_request: fn(config, session_id, protocol_version, message) {
       streamable_http_request(
@@ -116,15 +123,68 @@ pub fn send_request(
   session_id: Option(String),
   protocol_version: String,
   request: Request(action),
-  stdio_request: fn(StdioConfig, Request(action)) ->
+  stdio_request: fn(StdioConfig, Option(String), Request(action)) ->
     Result(TransportResponse(action_result), TransportError),
   streamable_request: fn(HttpConfig, Option(String), String, Request(action)) ->
     Result(TransportResponse(action_result), TransportError),
 ) -> Result(TransportResponse(action_result), TransportError) {
   case config {
-    Stdio(stdio_config) -> stdio_request(stdio_config, request)
+    Stdio(stdio_config) -> stdio_request(stdio_config, session_id, request)
     Http(http_config) ->
       streamable_request(http_config, session_id, protocol_version, request)
+  }
+}
+
+fn stdio_process_request(
+  manager: stdio_manager.Manager,
+  config: StdioConfig,
+  session_id: Option(String),
+  message: Request(ActionRequest),
+) -> Result(TransportResponse(ActionResult), TransportError) {
+  use #(response_payload, next_session_id) <- result.try(
+    stdio_manager.request(
+      manager,
+      to_stdio_manager_config(config),
+      session_id,
+      client_codec.encode_request(message),
+    )
+    |> result.map_error(map_stdio_error),
+  )
+
+  client_codec.decode_response(response_payload, message)
+  |> result.map_error(UnexpectedResponse)
+  |> result.map(fn(response) {
+    TransportResponse(response:, session_id: next_session_id)
+  })
+}
+
+fn stdio_process_notification(
+  manager: stdio_manager.Manager,
+  config: StdioConfig,
+  session_id: Option(String),
+  message: Request(ActionNotification),
+) -> Result(TransportResponse(Nil), TransportError) {
+  stdio_manager.notification(
+    manager,
+    to_stdio_manager_config(config),
+    session_id,
+    client_codec.encode_notification(message),
+  )
+  |> result.map_error(map_stdio_error)
+  |> result.map(fn(next_session_id) {
+    TransportResponse(response: jsonrpc_ok(), session_id: next_session_id)
+  })
+}
+
+fn to_stdio_manager_config(config: StdioConfig) -> stdio_manager.Config {
+  let StdioConfig(command:, args:, env:, cwd:, timeout_ms:) = config
+  stdio_manager.Config(command, args, env, cwd, timeout_ms)
+}
+
+fn map_stdio_error(message: String) -> TransportError {
+  case message {
+    "timeout" -> TimeoutError
+    _ -> ProcessError(message)
   }
 }
 

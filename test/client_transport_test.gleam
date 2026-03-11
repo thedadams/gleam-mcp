@@ -22,12 +22,13 @@ pub fn transport_stdio_mode_uses_stdio_runner_test() {
       None,
       jsonrpc.latest_protocol_version,
       request,
-      fn(stdio_config, incoming_request) {
+      fn(stdio_config, session_id, incoming_request) {
         should.equal(
           stdio_config,
           transport.StdioConfig("cmd", [], [], None, None),
         )
         should.equal(incoming_request, request)
+        should.equal(session_id, None)
         transport_ok(jsonrpc.ResultResponse(jsonrpc.StringId("stdio"), Nil))
       },
       fn(_, _, _, _) { Error(transport.UnexpectedResponse("wrong runner")) },
@@ -50,7 +51,7 @@ pub fn transport_http_mode_uses_streamable_runner_test() {
       Some("session-1"),
       jsonrpc.latest_protocol_version,
       request,
-      fn(_, _) { Error(transport.UnexpectedResponse("wrong runner")) },
+      fn(_, _, _) { Error(transport.UnexpectedResponse("wrong runner")) },
       fn(http_config, session_id, protocol_version, incoming_request) {
         should.equal(
           http_config,
@@ -80,14 +81,14 @@ pub fn client_new_uses_protocol_defaults_test() {
     transport_config: created_transport_config,
     capabilities: created_capabilities,
     protocol_version: created_protocol_version,
-    http_session_id: created_http_session_id,
+    session_id: created_session_id,
     ..,
   ) = created
 
   should.equal(created_transport_config, transport_config)
   should.equal(created_capabilities, config)
   should.equal(created_protocol_version, jsonrpc.latest_protocol_version)
-  should.equal(created_http_session_id, None)
+  should.equal(created_session_id, None)
 }
 
 pub fn initialize_sends_requests_and_notification_test() {
@@ -95,7 +96,7 @@ pub fn initialize_sends_requests_and_notification_test() {
     client.new_with_runners(
       transport.Stdio(transport.StdioConfig("cmd", [], [], None, None)),
       transport.Runners(
-        stdio_request: fn(_, request) {
+        stdio_request: fn(_, _, request) {
           case request {
             jsonrpc.Request(_, method, Some(actions.RequestInitialize(params))) -> {
               should.equal(method, mcp.method_initialize)
@@ -123,7 +124,7 @@ pub fn initialize_sends_requests_and_notification_test() {
             _ -> panic
           }
         },
-        stdio_notification: fn(_, request) {
+        stdio_notification: fn(_, _, request) {
           case request {
             jsonrpc.Notification(method, params) -> {
               should.equal(method, mcp.method_initialized)
@@ -155,10 +156,10 @@ pub fn initialize_persists_http_session_id_test() {
     client.new_with_runners(
       transport.Http(transport.HttpConfig("https://example.com/mcp", [], None)),
       transport.Runners(
-        stdio_request: fn(_, _) {
+        stdio_request: fn(_, _, _) {
           Error(transport.UnexpectedResponse("wrong runner"))
         },
-        stdio_notification: fn(_, _) {
+        stdio_notification: fn(_, _, _) {
           Error(transport.UnexpectedResponse("wrong runner"))
         },
         streamable_request: fn(_, session_id, _, request) {
@@ -199,8 +200,8 @@ pub fn initialize_persists_http_session_id_test() {
   let assert Ok(#(next_client, _)) =
     client.initialize(created, sample_implementation())
 
-  let client.Client(http_session_id:, ..) = next_client
-  should.equal(http_session_id, Some("session-1"))
+  let client.Client(session_id:, ..) = next_client
+  should.equal(session_id, Some("session-1"))
 }
 
 pub fn initialize_keeps_http_session_id_when_notification_returns_none_test() {
@@ -208,10 +209,10 @@ pub fn initialize_keeps_http_session_id_when_notification_returns_none_test() {
     client.new_with_runners(
       transport.Http(transport.HttpConfig("https://example.com/mcp", [], None)),
       transport.Runners(
-        stdio_request: fn(_, _) {
+        stdio_request: fn(_, _, _) {
           Error(transport.UnexpectedResponse("wrong runner"))
         },
-        stdio_notification: fn(_, _) {
+        stdio_notification: fn(_, _, _) {
           Error(transport.UnexpectedResponse("wrong runner"))
         },
         streamable_request: fn(_, session_id, _, request) {
@@ -255,8 +256,8 @@ pub fn initialize_keeps_http_session_id_when_notification_returns_none_test() {
   let assert Ok(#(next_client, _)) =
     client.initialize(created, sample_implementation())
 
-  let client.Client(http_session_id:, ..) = next_client
-  should.equal(http_session_id, Some("session-1"))
+  let client.Client(session_id:, ..) = next_client
+  should.equal(session_id, Some("session-1"))
 }
 
 pub fn initialize_returns_rpc_errors_test() {
@@ -264,13 +265,13 @@ pub fn initialize_returns_rpc_errors_test() {
     client.new_with_runners(
       transport.Stdio(transport.StdioConfig("cmd", [], [], None, None)),
       transport.Runners(
-        stdio_request: fn(_, _) {
+        stdio_request: fn(_, _, _) {
           transport_ok(jsonrpc.ErrorResponse(
             Some(jsonrpc.StringId("req-1")),
             jsonrpc.invalid_params_error("bad init"),
           ))
         },
-        stdio_notification: fn(_, _) {
+        stdio_notification: fn(_, _, _) {
           transport_ok(jsonrpc.ResultResponse(jsonrpc.StringId("notif-1"), Nil))
         },
         streamable_request: fn(_, _, _, _) {
@@ -292,13 +293,13 @@ pub fn initialize_rejects_unexpected_result_variants_test() {
     client.new_with_runners(
       transport.Stdio(transport.StdioConfig("cmd", [], [], None, None)),
       transport.Runners(
-        stdio_request: fn(_, _) {
+        stdio_request: fn(_, _, _) {
           transport_ok(jsonrpc.ResultResponse(
             jsonrpc.StringId("req-1"),
             actions.ResultEmpty(None),
           ))
         },
-        stdio_notification: fn(_, _) {
+        stdio_notification: fn(_, _, _) {
           transport_ok(jsonrpc.ResultResponse(jsonrpc.StringId("notif-1"), Nil))
         },
         streamable_request: fn(_, _, _, _) {
@@ -326,13 +327,13 @@ pub fn initialize_surfaces_notification_errors_test() {
     client.new_with_runners(
       transport.Stdio(transport.StdioConfig("cmd", [], [], None, None)),
       transport.Runners(
-        stdio_request: fn(_, _) {
+        stdio_request: fn(_, _, _) {
           transport_ok(jsonrpc.ResultResponse(
             jsonrpc.StringId("req-1"),
             actions.ResultInitialize(sample_initialize_result()),
           ))
         },
-        stdio_notification: fn(_, _) { Error(transport.TimeoutError) },
+        stdio_notification: fn(_, _, _) { Error(transport.TimeoutError) },
         streamable_request: fn(_, _, _, _) {
           Error(transport.UnexpectedResponse("wrong runner"))
         },
@@ -352,7 +353,7 @@ pub fn ping_returns_success_test() {
     client.new_with_runners(
       transport.Stdio(transport.StdioConfig("cmd", [], [], None, None)),
       transport.Runners(
-        stdio_request: fn(_, request) {
+        stdio_request: fn(_, _, request) {
           case request {
             jsonrpc.Request(_, method, params) -> {
               should.equal(method, mcp.method_ping)
@@ -365,7 +366,7 @@ pub fn ping_returns_success_test() {
             _ -> panic
           }
         },
-        stdio_notification: fn(_, _) {
+        stdio_notification: fn(_, _, _) {
           transport_ok(jsonrpc.ResultResponse(jsonrpc.StringId("notif-1"), Nil))
         },
         streamable_request: fn(_, _, _, _) {
@@ -387,13 +388,13 @@ pub fn ping_returns_rpc_errors_test() {
     client.new_with_runners(
       transport.Stdio(transport.StdioConfig("cmd", [], [], None, None)),
       transport.Runners(
-        stdio_request: fn(_, _) {
+        stdio_request: fn(_, _, _) {
           transport_ok(jsonrpc.ErrorResponse(
             Some(jsonrpc.StringId("req-1")),
             jsonrpc.method_not_found_error("ping"),
           ))
         },
-        stdio_notification: fn(_, _) {
+        stdio_notification: fn(_, _, _) {
           transport_ok(jsonrpc.ResultResponse(jsonrpc.StringId("notif-1"), Nil))
         },
         streamable_request: fn(_, _, _, _) {
@@ -420,7 +421,7 @@ pub fn list_tools_returns_typed_result_test() {
     client.new_with_runners(
       transport.Stdio(transport.StdioConfig("cmd", [], [], None, None)),
       transport.Runners(
-        stdio_request: fn(_, request) {
+        stdio_request: fn(_, _, request) {
           case request {
             jsonrpc.Request(
               _,
@@ -437,7 +438,7 @@ pub fn list_tools_returns_typed_result_test() {
             _ -> panic
           }
         },
-        stdio_notification: fn(_, _) {
+        stdio_notification: fn(_, _, _) {
           transport_ok(jsonrpc.ResultResponse(jsonrpc.StringId("notif-1"), Nil))
         },
         streamable_request: fn(_, _, _, _) {
@@ -459,13 +460,13 @@ pub fn list_tools_rejects_unexpected_result_variants_test() {
     client.new_with_runners(
       transport.Stdio(transport.StdioConfig("cmd", [], [], None, None)),
       transport.Runners(
-        stdio_request: fn(_, _) {
+        stdio_request: fn(_, _, _) {
           transport_ok(jsonrpc.ResultResponse(
             jsonrpc.StringId("req-1"),
             actions.ResultEmpty(None),
           ))
         },
-        stdio_notification: fn(_, _) {
+        stdio_notification: fn(_, _, _) {
           transport_ok(jsonrpc.ResultResponse(jsonrpc.StringId("notif-1"), Nil))
         },
         streamable_request: fn(_, _, _, _) {
@@ -495,7 +496,7 @@ pub fn set_logging_level_accepts_empty_results_test() {
     client.new_with_runners(
       transport.Stdio(transport.StdioConfig("cmd", [], [], None, None)),
       transport.Runners(
-        stdio_request: fn(_, request) {
+        stdio_request: fn(_, _, request) {
           case request {
             jsonrpc.Request(
               _,
@@ -512,7 +513,7 @@ pub fn set_logging_level_accepts_empty_results_test() {
             _ -> panic
           }
         },
-        stdio_notification: fn(_, _) {
+        stdio_notification: fn(_, _, _) {
           transport_ok(jsonrpc.ResultResponse(jsonrpc.StringId("notif-1"), Nil))
         },
         streamable_request: fn(_, _, _, _) {
@@ -536,7 +537,7 @@ pub fn call_tool_accepts_regular_results_test() {
     client.new_with_runners(
       transport.Stdio(transport.StdioConfig("cmd", [], [], None, None)),
       transport.Runners(
-        stdio_request: fn(_, request) {
+        stdio_request: fn(_, _, request) {
           case request {
             jsonrpc.Request(
               _,
@@ -553,7 +554,7 @@ pub fn call_tool_accepts_regular_results_test() {
             _ -> panic
           }
         },
-        stdio_notification: fn(_, _) {
+        stdio_notification: fn(_, _, _) {
           transport_ok(jsonrpc.ResultResponse(jsonrpc.StringId("notif-1"), Nil))
         },
         streamable_request: fn(_, _, _, _) {
@@ -577,13 +578,13 @@ pub fn call_tool_accepts_task_results_test() {
     client.new_with_runners(
       transport.Stdio(transport.StdioConfig("cmd", [], [], None, None)),
       transport.Runners(
-        stdio_request: fn(_, _) {
+        stdio_request: fn(_, _, _) {
           transport_ok(jsonrpc.ResultResponse(
             jsonrpc.StringId("req-1"),
             actions.ResultCreateTask(expected),
           ))
         },
-        stdio_notification: fn(_, _) {
+        stdio_notification: fn(_, _, _) {
           transport_ok(jsonrpc.ResultResponse(jsonrpc.StringId("notif-1"), Nil))
         },
         streamable_request: fn(_, _, _, _) {
@@ -613,13 +614,13 @@ pub fn progress_sends_notification_params_test() {
     client.new_with_runners(
       transport.Stdio(transport.StdioConfig("cmd", [], [], None, None)),
       transport.Runners(
-        stdio_request: fn(_, _) {
+        stdio_request: fn(_, _, _) {
           transport_ok(jsonrpc.ResultResponse(
             jsonrpc.StringId("req-1"),
             actions.ResultEmpty(None),
           ))
         },
-        stdio_notification: fn(_, request) {
+        stdio_notification: fn(_, _, request) {
           case request {
             jsonrpc.Notification(
               method,
@@ -654,13 +655,13 @@ pub fn roots_list_changed_sends_notification_test() {
     client.new_with_runners(
       transport.Stdio(transport.StdioConfig("cmd", [], [], None, None)),
       transport.Runners(
-        stdio_request: fn(_, _) {
+        stdio_request: fn(_, _, _) {
           transport_ok(jsonrpc.ResultResponse(
             jsonrpc.StringId("req-1"),
             actions.ResultEmpty(None),
           ))
         },
-        stdio_notification: fn(_, request) {
+        stdio_notification: fn(_, _, request) {
           case request {
             jsonrpc.Notification(
               method,

@@ -52,4 +52,6 @@ jobs:
       - name: Run tests
         env:
           MCP_EVERYTHING_URL: http://127.0.0.1:3001/mcp
+          MCP_EVERYTHING_STDIO_COMMAND: npx
+          MCP_EVERYTHING_STDIO_ARGS: "-y @modelcontextprotocol/server-everything@2026.1.26"
         run: gleam test
