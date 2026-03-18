@@ -2,7 +2,7 @@ import gleam_mcp/jsonrpc
 import gleeunit
 import gleeunit/should
 
-pub fn main() -> Nil {
+pub fn main() {
   gleeunit.main()
 }
 

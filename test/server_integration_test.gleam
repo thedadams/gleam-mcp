@@ -11,7 +11,7 @@ import gleeunit
 import gleeunit/should
 import server_test_support
 
-pub fn main() -> Nil {
+pub fn main() {
   gleeunit.main()
 }
 
@@ -135,6 +135,91 @@ pub fn client_can_talk_to_sdk_http_server_test() {
     )
   let complete = complete_result |> should.be_ok
   should.equal(complete.completion.values, ["gleam-prompt"])
+
+  let #(_, logging_result) =
+    client.set_logging_level(
+      app_client,
+      actions.SetLevelRequestParams(actions.Info, None),
+    )
+  logging_result |> should.equal(Ok(Nil))
+}
+
+pub fn client_can_talk_to_sdk_stdio_server_test() {
+  let app_client =
+    client.new(
+      transport.Stdio(transport.StdioConfig(
+        "gleam",
+        ["run", "-m", "gleam_mcp/examples/example_server"],
+        [],
+        None,
+        Some(5000),
+      )),
+      capabilities.none(),
+    )
+
+  let #(app_client, initialized) = case
+    client.initialize(app_client, server_test_support.sample_client_info())
+  {
+    Ok(value) -> value
+    Error(error) -> panic as string.inspect(error)
+  }
+
+  should.equal(initialized.server_info.name, "gleam-mcp-test-server")
+
+  let #(app_client, tools_result) = client.list_tools(app_client, None)
+  let tools = tools_result |> should.be_ok
+  should.be_true(list.any(tools.tools, fn(tool) { tool.name == "echo" }))
+
+  let #(app_client, resources_result) = client.list_resources(app_client, None)
+  let resources = resources_result |> should.be_ok
+  should.be_true(
+    list.any(resources.resources, fn(resource) {
+      resource.uri == "demo://resource/static"
+    }),
+  )
+
+  let #(app_client, prompt_result) =
+    client.get_prompt(
+      app_client,
+      actions.GetPromptRequestParams("simple-prompt", None, None),
+    )
+  let prompt = prompt_result |> should.be_ok
+  should.be_true(
+    list.any(prompt.messages, fn(message) {
+      let actions.PromptMessage(content:, ..) = message
+      case content {
+        actions.TextBlock(actions.TextContent(text:, ..)) ->
+          string.contains(text, "simple prompt")
+        _ -> False
+      }
+    }),
+  )
+
+  let #(app_client, tool_result) =
+    client.call_tool(
+      app_client,
+      actions.CallToolRequestParams(
+        "echo",
+        Some(dict.from_list([#("message", jsonrpc.VString("hello"))])),
+        None,
+        None,
+      ),
+    )
+
+  case tool_result |> should.be_ok {
+    actions.ResultCallTool(result) -> {
+      should.be_true(
+        list.any(result.content, fn(block) {
+          case block {
+            actions.TextBlock(actions.TextContent(text:, ..)) ->
+              text == "Echo: hello"
+            _ -> False
+          }
+        }),
+      )
+    }
+    _ -> should.fail()
+  }
 
   let #(_, logging_result) =
     client.set_logging_level(

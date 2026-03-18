@@ -1,5 +1,5 @@
 import gleeunit
 
-pub fn main() -> Nil {
+pub fn main() {
   gleeunit.main()
 }

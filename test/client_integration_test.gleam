@@ -13,7 +13,7 @@ import gleeunit/should
 
 const dynamic_resource_uri = "demo://resource/dynamic/text/1"
 
-pub fn main() -> Nil {
+pub fn main() {
   gleeunit.main()
 }
 

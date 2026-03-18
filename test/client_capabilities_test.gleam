@@ -5,7 +5,7 @@ import gleam_mcp/jsonrpc.{VObject}
 import gleeunit
 import gleeunit/should
 
-pub fn main() -> Nil {
+pub fn main() {
   gleeunit.main()
 }
 

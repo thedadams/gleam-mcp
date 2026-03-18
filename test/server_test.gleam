@@ -4,6 +4,7 @@ import gleam/option.{None, Some}
 import gleam/string
 import gleam_mcp/actions
 import gleam_mcp/client/capabilities
+import gleam_mcp/examples/example_server
 import gleam_mcp/jsonrpc
 import gleam_mcp/mcp
 import gleam_mcp/server
@@ -11,7 +12,7 @@ import gleeunit
 import gleeunit/should
 import server_test_support
 
-pub fn main() -> Nil {
+pub fn main() {
   gleeunit.main()
 }
 
@@ -32,7 +33,7 @@ pub fn initialize_infers_capabilities_test() {
     )
 
   let #(_, response) =
-    server.handle_request(server_test_support.sample_server(), request)
+    server.handle_request(example_server.sample_server(), request)
 
   case response {
     jsonrpc.ResultResponse(_, actions.ResultInitialize(result)) -> {
@@ -62,7 +63,7 @@ pub fn initialize_infers_capabilities_test() {
 }
 
 pub fn resources_prompts_tools_completion_and_logging_test() {
-  let sample_server = server_test_support.sample_server()
+  let sample_server = example_server.sample_server()
 
   let #(_, resources_response) =
     server.handle_request(

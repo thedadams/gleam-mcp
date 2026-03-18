@@ -1,6 +1,7 @@
 import gleam/option.{None, Some}
 import gleam/string
 import gleam_mcp/actions
+import gleam_mcp/examples/example_server
 import gleam_mcp/jsonrpc
 import gleam_mcp/server
 import gleam_mcp/server/codec
@@ -8,7 +9,7 @@ import gleeunit
 import gleeunit/should
 import server_test_support
 
-pub fn main() -> Nil {
+pub fn main() {
   gleeunit.main()
 }
 
@@ -64,7 +65,7 @@ pub fn encode_response_serializes_initialize_result_test() {
       ),
     )
   let #(_, response) =
-    server_test_support.sample_server() |> server.handle_request(request)
+    example_server.sample_server() |> server.handle_request(request)
   let encoded = codec.encode_response(response)
 
   should.be_true(string.contains(

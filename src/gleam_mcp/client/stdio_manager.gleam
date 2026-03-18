@@ -69,7 +69,7 @@ pub fn start() -> Manager {
   }
 }
 
-fn manager_worker(reply_to: process.Subject(process.Subject(Command))) -> Nil {
+fn manager_worker(reply_to: process.Subject(process.Subject(Command))) {
   let subject = process.new_subject()
   process.send(reply_to, subject)
   loop(subject, dict.new())
@@ -123,10 +123,7 @@ pub fn notification(
   }
 }
 
-fn loop(
-  subject: process.Subject(Command),
-  sessions: dict.Dict(String, Session),
-) -> Nil {
+fn loop(subject: process.Subject(Command), sessions: dict.Dict(String, Session)) {
   case process.receive_forever(subject) {
     Request(config:, session_id:, payload:, reply_to:) -> {
       let #(next_sessions, response) =
@@ -242,7 +239,7 @@ fn start_session(
 fn session_worker(
   ready_to: process.Subject(Result(process.Subject(SessionCommand), String)),
   config: Config,
-) -> Nil {
+) {
   let subject = process.new_subject()
   case start_program(config) {
     Ok(handle) -> {
@@ -282,7 +279,7 @@ fn session_loop(
   subject: process.Subject(SessionCommand),
   handle: sceall.ProgramHandle,
   buffer: BitArray,
-) -> Nil {
+) {
   let selector =
     process.new_selector()
     |> process.select_map(subject, SessionEvent)
