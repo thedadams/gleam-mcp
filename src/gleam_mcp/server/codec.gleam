@@ -278,8 +278,8 @@ fn encode_action_result(result: actions.ActionResult) -> json.Json {
     actions.ResultComplete(value) -> encode_complete_result(value)
     actions.ResultCreateTask(_) -> json.object([])
     actions.ResultListRoots(_) -> json.object([])
-    actions.ResultCreateMessage(_) -> json.object([])
-    actions.ResultElicit(_) -> json.object([])
+    actions.ResultCreateMessage(value) -> encode_create_message_result(value)
+    actions.ResultElicit(value) -> encode_elicit_result(value)
     actions.ResultGetTask(_) -> json.object([])
     actions.ResultTaskPayload(_) -> json.object([])
     actions.ResultCancelTask(_) -> json.object([])
@@ -493,6 +493,134 @@ fn encode_complete_result(result: actions.CompleteResult) -> json.Json {
   [#("completion", encode_completion_values(completion))]
   |> append_optional("_meta", option_map(meta, encode_meta))
   |> json.object
+}
+
+fn encode_create_message_result(
+  result: actions.CreateMessageResult,
+) -> json.Json {
+  let actions.CreateMessageResult(message, model, stop_reason, meta) = result
+  [
+    #("message", encode_sampling_message(message)),
+    #("model", json.string(model)),
+  ]
+  |> append_optional("stopReason", option_map(stop_reason, json.string))
+  |> append_optional("_meta", option_map(meta, encode_meta))
+  |> json.object
+}
+
+fn encode_elicit_result(result: actions.ElicitResult) -> json.Json {
+  let actions.ElicitResult(action, content, meta) = result
+  [#("action", encode_elicit_action(action))]
+  |> append_optional("content", option_map(content, encode_elicit_content))
+  |> append_optional("_meta", option_map(meta, encode_meta))
+  |> json.object
+}
+
+fn encode_sampling_message(message: actions.SamplingMessage) -> json.Json {
+  let actions.SamplingMessage(role, content, meta) = message
+  [#("role", encode_role(role)), #("content", encode_sampling_content(content))]
+  |> append_optional("_meta", option_map(meta, encode_meta))
+  |> json.object
+}
+
+fn encode_sampling_content(content: actions.SamplingContent) -> json.Json {
+  case content {
+    actions.SingleSamplingContent(block) ->
+      encode_sampling_message_content_block(block)
+    actions.MultipleSamplingContent(blocks) ->
+      json.array(blocks, encode_sampling_message_content_block)
+  }
+}
+
+fn encode_sampling_message_content_block(
+  block: actions.SamplingMessageContentBlock,
+) -> json.Json {
+  case block {
+    actions.SamplingText(content) -> encode_text_content(content)
+    actions.SamplingImage(content) -> encode_image_content(content)
+    actions.SamplingAudio(content) -> encode_audio_content(content)
+    actions.SamplingToolUse(content) -> encode_tool_use_content(content)
+    actions.SamplingToolResult(content) -> encode_tool_result_content(content)
+  }
+}
+
+fn encode_tool_use_content(content: actions.ToolUseContent) -> json.Json {
+  let actions.ToolUseContent(id, name, input, meta) = content
+  [
+    #("type", json.string("tool_use")),
+    #("id", json.string(id)),
+    #("name", json.string(name)),
+    #(
+      "input",
+      dict.to_list(input)
+        |> list.map(fn(entry) {
+          let #(key, value) = entry
+          #(key, encode_value(value))
+        })
+        |> json.object,
+    ),
+  ]
+  |> append_optional("_meta", option_map(meta, encode_meta))
+  |> json.object
+}
+
+fn encode_tool_result_content(content: actions.ToolResultContent) -> json.Json {
+  let actions.ToolResultContent(
+    tool_use_id,
+    blocks,
+    structured_content,
+    is_error,
+    meta,
+  ) = content
+  [
+    #("type", json.string("tool_result")),
+    #("toolUseId", json.string(tool_use_id)),
+    #("content", json.array(blocks, encode_content_block)),
+  ]
+  |> append_optional(
+    "structuredContent",
+    option_map(structured_content, fn(fields) {
+      dict.to_list(fields)
+      |> list.map(fn(entry) {
+        let #(key, value) = entry
+        #(key, encode_value(value))
+      })
+      |> json.object
+    }),
+  )
+  |> append_optional("isError", option_map(is_error, json.bool))
+  |> append_optional("_meta", option_map(meta, encode_meta))
+  |> json.object
+}
+
+fn encode_elicit_action(action: actions.ElicitAction) -> json.Json {
+  case action {
+    actions.ElicitAccept -> json.string("accept")
+    actions.ElicitDecline -> json.string("decline")
+    actions.ElicitCancel -> json.string("cancel")
+  }
+}
+
+fn encode_elicit_content(
+  content: dict.Dict(String, actions.ElicitValue),
+) -> json.Json {
+  content
+  |> dict.to_list
+  |> list.map(fn(entry) {
+    let #(key, value) = entry
+    #(key, encode_elicit_value(value))
+  })
+  |> json.object
+}
+
+fn encode_elicit_value(value: actions.ElicitValue) -> json.Json {
+  case value {
+    actions.ElicitString(value) -> json.string(value)
+    actions.ElicitInt(value) -> json.int(value)
+    actions.ElicitFloat(value) -> json.float(value)
+    actions.ElicitBool(value) -> json.bool(value)
+    actions.ElicitStringArray(value) -> json.array(value, json.string)
+  }
 }
 
 fn encode_completion_values(values: actions.CompletionValues) -> json.Json {

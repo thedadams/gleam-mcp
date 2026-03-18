@@ -12,6 +12,7 @@ import gleam_mcp/actions.{
 }
 import gleam_mcp/client/capabilities
 import gleam_mcp/client/codec as client_codec
+import gleam_mcp/client/http_stream
 import gleam_mcp/client/stdio_manager
 import gleam_mcp/jsonrpc.{type Request, type Response}
 import gleam_mcp/server/codec as server_codec
@@ -297,27 +298,24 @@ pub fn streamable_http_listen(
   protocol_version: String,
   capability_config: capabilities.Config,
 ) -> Result(Option(String), TransportError) {
-  let http_request = build_get_request(config, session_id, protocol_version)
-
-  use http_response <- result.try(send_http_request(config, http_request))
-  let response.Response(status:, ..) = http_response
-
-  case status {
-    200 -> {
-      use _ <- result.try(assert_sse_response(http_response))
-      use events <- result.try(parse_sse_events(http_response.body))
-      use _ <- result.try(process_listener_events(
-        config,
-        session_id,
-        protocol_version,
-        capability_config,
-        events,
-      ))
-      Ok(session_id_from_response(http_response))
-    }
-    405 -> Error(UnexpectedResponse("Server does not offer an SSE stream"))
-    _ -> Error(http_status_error(status, http_response.body))
+  let HttpConfig(base_url:, timeout_ms:, ..) = config
+  let timeout_ms = case timeout_ms {
+    Some(value) -> value
+    None -> 30_000
   }
+  let headers = streamable_get_headers(config, session_id, protocol_version)
+
+  http_stream.listen(base_url, headers, timeout_ms, fn(payload) {
+    process_server_message(
+      config,
+      session_id,
+      protocol_version,
+      capability_config,
+      payload,
+    )
+    |> result.map_error(transport_error_message)
+  })
+  |> result.map_error(map_stream_listener_error)
 }
 
 pub fn first_sse_data(body: String) -> Result(String, TransportError) {
@@ -363,32 +361,24 @@ fn build_post_request(
   })
 }
 
-fn build_get_request(
+fn streamable_get_headers(
   config: HttpConfig,
   session_id: Option(String),
   protocol_version: String,
-) -> request.Request(String) {
-  let HttpConfig(base_url:, headers:, ..) = config
-  let base_request = case request.to(base_url) {
-    Ok(value) -> value
-    Error(_) -> panic as "Invalid HTTP transport URL"
-  }
+) -> List(#(String, String)) {
+  let HttpConfig(headers:, ..) = config
 
-  let request =
-    base_request
-    |> request.set_method(http.Get)
-    |> request.set_header("accept", "text/event-stream")
-    |> request.set_header("mcp-protocol-version", protocol_version)
-
-  let request = case session_id {
-    Some(value) -> request.set_header(request, "mcp-session-id", value)
-    None -> request
-  }
-
-  list.fold(over: headers, from: request, with: fn(request, header) {
-    let #(key, value) = header
-    request.set_header(request, string.lowercase(key), value)
-  })
+  [
+    #("accept", "text/event-stream"),
+    #("mcp-protocol-version", protocol_version),
+  ]
+  |> prepend_optional_header("mcp-session-id", session_id)
+  |> list.append(
+    list.map(headers, fn(header) {
+      let #(key, value) = header
+      #(string.lowercase(key), value)
+    }),
+  )
 }
 
 fn send_http_request(
@@ -437,23 +427,6 @@ fn decode_post_response(
                 "Unsupported HTTP response content type: " <> content_type,
               ))
           }
-      }
-    Error(_) ->
-      Error(UnexpectedResponse("HTTP response missing content-type header"))
-  }
-}
-
-fn assert_sse_response(
-  http_response: response.Response(String),
-) -> Result(Nil, TransportError) {
-  case response.get_header(http_response, "content-type") {
-    Ok(content_type) ->
-      case string.starts_with(content_type, "text/event-stream") {
-        True -> Ok(Nil)
-        False ->
-          Error(UnexpectedResponse(
-            "Unsupported HTTP response content type: " <> content_type,
-          ))
       }
     Error(_) ->
       Error(UnexpectedResponse("HTTP response missing content-type header"))
@@ -529,45 +502,6 @@ fn process_sse_request_event_list(
               )
             }
           }
-      }
-  }
-}
-
-fn process_listener_events(
-  config: HttpConfig,
-  session_id: Option(String),
-  protocol_version: String,
-  capability_config: capabilities.Config,
-  events: List(SseEvent),
-) -> Result(Nil, TransportError) {
-  case events {
-    [] -> Ok(Nil)
-    [SseEvent(data: data), ..rest] ->
-      case string.is_empty(data) {
-        True ->
-          process_listener_events(
-            config,
-            session_id,
-            protocol_version,
-            capability_config,
-            rest,
-          )
-        False -> {
-          use _ <- result.try(process_server_message(
-            config,
-            session_id,
-            protocol_version,
-            capability_config,
-            data,
-          ))
-          process_listener_events(
-            config,
-            session_id,
-            protocol_version,
-            capability_config,
-            rest,
-          )
-        }
       }
   }
 }
@@ -689,6 +623,33 @@ fn normalise_sse_body(body: String) -> String {
   body
   |> string.replace(each: "\r\n", with: "\n")
   |> string.replace(each: "\r", with: "\n")
+}
+
+fn transport_error_message(error: TransportError) -> String {
+  case error {
+    ProcessError(message) -> message
+    HttpError(message) -> message
+    TimeoutError -> "Timed out waiting for transport response"
+    UnexpectedResponse(message) -> message
+  }
+}
+
+fn map_stream_listener_error(message: String) -> TransportError {
+  case message {
+    "Timed out waiting for transport response" -> TimeoutError
+    _ -> HttpError(message)
+  }
+}
+
+fn prepend_optional_header(
+  headers: List(#(String, String)),
+  key: String,
+  value: Option(String),
+) -> List(#(String, String)) {
+  case value {
+    Some(value) -> [#(key, value), ..headers]
+    None -> headers
+  }
 }
 
 fn session_id_from_response(

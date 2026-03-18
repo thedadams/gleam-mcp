@@ -101,6 +101,10 @@ pub fn initialized(client: Client) -> #(Client, Result(Nil, ClientError)) {
 }
 
 pub fn listen(client: Client) -> #(Client, Result(Nil, ClientError)) {
+  #(client, listen_forever(client))
+}
+
+fn listen_forever(client: Client) -> Result(Nil, ClientError) {
   let Client(
     transport_config: transport_config,
     capabilities: capability_config,
@@ -119,17 +123,16 @@ pub fn listen(client: Client) -> #(Client, Result(Nil, ClientError)) {
           capability_config,
         )
       {
-        Ok(next_session_id) -> #(set_runtime(client, next_session_id), Ok(Nil))
-        Error(error) -> #(client, Error(Transport(error)))
+        Ok(next_session_id) ->
+          listen_forever(set_runtime(client, next_session_id))
+        Error(error) -> Error(Transport(error))
       }
-    transport.Stdio(_) -> #(
-      client,
+    transport.Stdio(_) ->
       Error(
         Transport(transport.UnexpectedResponse(
           "Listening for server-sent requests is only supported over HTTP",
         )),
-      ),
-    )
+      )
   }
 }
 

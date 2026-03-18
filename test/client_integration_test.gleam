@@ -1,5 +1,6 @@
 import client_integration_support
 import gleam/dict
+import gleam/erlang/process
 import gleam/list
 import gleam/option.{None, Some}
 import gleam/string
@@ -10,6 +11,7 @@ import gleam_mcp/client/transport
 import gleam_mcp/jsonrpc
 import gleeunit
 import gleeunit/should
+import server_sent_request_integration_support
 
 const dynamic_resource_uri = "demo://resource/dynamic/text/1"
 
@@ -32,7 +34,7 @@ pub fn initialize_and_basic_requests_stdio_test() {
 }
 
 fn basic_request_with_transport(config: transport.Config) {
-  let client = new_client(config)
+  let client = client.new(config, capabilities.none())
   let #(client, init) = initialize_client(client)
 
   let actions.InitializeResult(
@@ -147,7 +149,7 @@ pub fn mutation_requests_succeed_stdio_test() {
 }
 
 fn mutation_request_with_transport(config: transport.Config) {
-  let client = new_client(config)
+  let client = client.new(config, capabilities.none())
   let #(client, _) = initialize_client(client)
 
   let #(client, subscribe_result) =
@@ -187,7 +189,7 @@ pub fn list_tasks_request_stdio_test() {
 }
 
 fn list_tasks_request_with_transport_test(config: transport.Config) {
-  let client = new_client(config)
+  let client = client.new(config, capabilities.none())
   let #(client, _) = initialize_client(client)
 
   let #(_, list_result) =
@@ -210,7 +212,7 @@ pub fn task_lookup_requests_surface_errors_stdio_test() {
 }
 
 fn test_task_for_transport(config: transport.Config) {
-  let client = new_client(config)
+  let client = client.new(config, capabilities.none())
   let #(client, _) = initialize_client(client)
   let missing_task_id = "missing-task-id"
 
@@ -227,8 +229,120 @@ fn test_task_for_transport(config: transport.Config) {
   let _ = cancel_result |> should.be_error
 }
 
-fn new_client(config: transport.Config) -> client.Client {
-  client.new(config, capabilities.none())
+pub fn elicitation_server_sent_roundtrip_http_test() {
+  let config =
+    transport.Http(transport.HttpConfig(
+      server_sent_request_integration_support.start_http_server(
+        server_sent_request_integration_support.Elicitation,
+      ),
+      [],
+      Some(5000),
+    ))
+
+  let capability_config =
+    capabilities.none()
+    |> capabilities.with_elicit_form(fn(param) {
+      Ok(
+        capabilities.Elicit(actions.ElicitResult(
+          actions.ElicitAccept,
+          Some(
+            dict.from_list([
+              #(
+                "answer",
+                actions.ElicitString("elicited for " <> param.message),
+              ),
+            ]),
+          ),
+          None,
+        )),
+      )
+    })
+
+  let client = client.new(config, capability_config)
+  let #(client, _) = initialize_client(client)
+  let _ = spawn_listener(client)
+  process.sleep(100)
+
+  let #(_, call_result) =
+    client.call_tool(
+      client,
+      actions.CallToolRequestParams("roundtrip-elicitation", None, None, None),
+    )
+
+  case call_result {
+    Ok(actions.ResultCallTool(actions.CallToolResult(content:, ..))) ->
+      should.be_true(has_text_content(
+        content,
+        "Elicited: elicited for Please provide a value for requst roundtrip-elicitation",
+      ))
+    _ -> panic as string.inspect(call_result)
+  }
+
+  let #(_, call_result) =
+    client.call_tool(
+      client,
+      actions.CallToolRequestParams("roundtrip-elicitation-1", None, None, None),
+    )
+
+  case call_result {
+    Ok(actions.ResultCallTool(actions.CallToolResult(content:, ..))) ->
+      should.be_true(has_text_content(
+        content,
+        "Elicited: elicited for Please provide a value for requst roundtrip-elicitation-1",
+      ))
+    _ -> panic as string.inspect(call_result)
+  }
+}
+
+pub fn sampling_server_sent_roundtrip_http_test() {
+  let config =
+    transport.Http(transport.HttpConfig(
+      server_sent_request_integration_support.start_http_server(
+        server_sent_request_integration_support.Sampling,
+      ),
+      [],
+      Some(5000),
+    ))
+
+  let capability_config =
+    capabilities.none()
+    |> capabilities.with_create_message(fn(_) {
+      Ok(
+        capabilities.CreateMessage(actions.CreateMessageResult(
+          message: actions.SamplingMessage(
+            actions.Assistant,
+            actions.SingleSamplingContent(
+              actions.SamplingText(actions.TextContent(
+                "sampled value",
+                None,
+                None,
+              )),
+            ),
+            None,
+          ),
+          model: "integration-test-model",
+          stop_reason: None,
+          meta: None,
+        )),
+      )
+    })
+
+  let client = client.new(config, capability_config)
+  let #(client, _) = initialize_client(client)
+  let _ = spawn_listener(client)
+  process.sleep(100)
+
+  let #(_, call_result) =
+    client.call_tool(
+      client,
+      actions.CallToolRequestParams("roundtrip-sampling", None, None, None),
+    )
+
+  case call_result {
+    Ok(actions.ResultCallTool(actions.CallToolResult(content:, ..))) ->
+      should.be_true(has_text_content(content, "Sampled: sampled value"))
+    _ -> panic as string.inspect(call_result)
+  }
 }
 
 fn initialize_client(
@@ -249,6 +363,18 @@ fn sample_implementation() -> actions.Implementation {
     website_url: None,
     icons: [],
   )
+}
+
+fn spawn_listener(
+  listening_client: client.Client,
+) -> process.Subject(Result(Nil, client.ClientError)) {
+  let reply_to = process.new_subject()
+  let _ =
+    process.spawn(fn() {
+      let #(_, result) = client.listen(listening_client)
+      process.send(reply_to, result)
+    })
+  reply_to
 }
 
 fn has_resource_template(
