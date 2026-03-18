@@ -1,0 +1,1377 @@
+import gleam/dict
+import gleam/dynamic/decode
+import gleam/int
+import gleam/json
+import gleam/list
+import gleam/option.{type Option, None, Some}
+import gleam/result
+import gleam/string
+import gleam_mcp/actions
+import gleam_mcp/jsonrpc
+import gleam_mcp/mcp
+
+pub type Message {
+  ActionRequest(jsonrpc.Request(actions.ActionRequest))
+  ActionNotification(jsonrpc.Request(actions.ActionNotification))
+  UnknownRequest(id: jsonrpc.RequestId, method: String)
+  UnknownNotification(method: String)
+}
+
+pub fn decode_message(body: String) -> Result(Message, String) {
+  json.parse(body, message_decoder()) |> result.map_error(json_error_message)
+}
+
+pub fn encode_response(
+  response: jsonrpc.Response(actions.ActionResult),
+) -> String {
+  response |> encode_jsonrpc_response |> json.to_string
+}
+
+fn message_decoder() -> decode.Decoder(Message) {
+  decode.then(decode.at(["method"], decode.string), fn(method) {
+    case method {
+      "initialize" -> initialize_message_decoder()
+      "ping" -> ping_message_decoder()
+      "resources/list" -> list_resources_message_decoder()
+      "resources/templates/list" -> list_resource_templates_message_decoder()
+      "resources/read" -> read_resource_message_decoder()
+      "prompts/list" -> list_prompts_message_decoder()
+      "prompts/get" -> get_prompt_message_decoder()
+      "tools/list" -> list_tools_message_decoder()
+      "tools/call" -> call_tool_message_decoder()
+      "completion/complete" -> complete_message_decoder()
+      "logging/setLevel" -> set_logging_level_message_decoder()
+      "notifications/initialized" -> initialized_notification_decoder()
+      _ -> unknown_message_decoder(method)
+    }
+  })
+}
+
+fn initialize_message_decoder() -> decode.Decoder(Message) {
+  decode_request_message(
+    mcp.method_initialize,
+    {
+      use params <- decode.field("params", initialize_request_params_decoder())
+      decode.success(params)
+    },
+    fn(params) { actions.RequestInitialize(params) },
+  )
+}
+
+fn ping_message_decoder() -> decode.Decoder(Message) {
+  decode_request_message(
+    mcp.method_ping,
+    {
+      use params <- decode.optional_field(
+        "params",
+        None,
+        decode.optional(request_meta_decoder()),
+      )
+      decode.success(params)
+    },
+    fn(params) { actions.RequestPing(params) },
+  )
+}
+
+fn list_resources_message_decoder() -> decode.Decoder(Message) {
+  decode_request_message(
+    mcp.method_list_resources,
+    {
+      use params <- decode.optional_field(
+        "params",
+        actions.PaginatedRequestParams(None, None),
+        paginated_request_params_decoder(),
+      )
+      decode.success(params)
+    },
+    fn(params) { actions.RequestListResources(params) },
+  )
+}
+
+fn list_resource_templates_message_decoder() -> decode.Decoder(Message) {
+  decode_request_message(
+    mcp.method_list_resource_templates,
+    {
+      use params <- decode.optional_field(
+        "params",
+        actions.PaginatedRequestParams(None, None),
+        paginated_request_params_decoder(),
+      )
+      decode.success(params)
+    },
+    fn(params) { actions.RequestListResourceTemplates(params) },
+  )
+}
+
+fn read_resource_message_decoder() -> decode.Decoder(Message) {
+  decode_request_message(
+    mcp.method_read_resource,
+    {
+      use params <- decode.field(
+        "params",
+        read_resource_request_params_decoder(),
+      )
+      decode.success(params)
+    },
+    fn(params) { actions.RequestReadResource(params) },
+  )
+}
+
+fn list_prompts_message_decoder() -> decode.Decoder(Message) {
+  decode_request_message(
+    mcp.method_list_prompts,
+    {
+      use params <- decode.optional_field(
+        "params",
+        actions.PaginatedRequestParams(None, None),
+        paginated_request_params_decoder(),
+      )
+      decode.success(params)
+    },
+    fn(params) { actions.RequestListPrompts(params) },
+  )
+}
+
+fn get_prompt_message_decoder() -> decode.Decoder(Message) {
+  decode_request_message(
+    mcp.method_get_prompt,
+    {
+      use params <- decode.field("params", get_prompt_request_params_decoder())
+      decode.success(params)
+    },
+    fn(params) { actions.RequestGetPrompt(params) },
+  )
+}
+
+fn list_tools_message_decoder() -> decode.Decoder(Message) {
+  decode_request_message(
+    mcp.method_list_tools,
+    {
+      use params <- decode.optional_field(
+        "params",
+        actions.PaginatedRequestParams(None, None),
+        paginated_request_params_decoder(),
+      )
+      decode.success(params)
+    },
+    fn(params) { actions.RequestListTools(params) },
+  )
+}
+
+fn call_tool_message_decoder() -> decode.Decoder(Message) {
+  decode_request_message(
+    mcp.method_call_tool,
+    {
+      use params <- decode.field("params", call_tool_request_params_decoder())
+      decode.success(params)
+    },
+    fn(params) { actions.RequestCallTool(params) },
+  )
+}
+
+fn complete_message_decoder() -> decode.Decoder(Message) {
+  decode_request_message(
+    mcp.method_complete,
+    {
+      use params <- decode.field("params", complete_request_params_decoder())
+      decode.success(params)
+    },
+    fn(params) { actions.RequestComplete(params) },
+  )
+}
+
+fn set_logging_level_message_decoder() -> decode.Decoder(Message) {
+  decode_request_message(
+    mcp.method_set_logging_level,
+    {
+      use params <- decode.field("params", set_level_request_params_decoder())
+      decode.success(params)
+    },
+    fn(params) { actions.RequestSetLoggingLevel(params) },
+  )
+}
+
+fn initialized_notification_decoder() -> decode.Decoder(Message) {
+  {
+    use id <- decode.optional_field(
+      "id",
+      None,
+      decode.optional(request_id_decoder()),
+    )
+    use meta <- decode.optional_field(
+      "params",
+      None,
+      notification_meta_only_decoder(),
+    )
+    case id {
+      Some(request_id) ->
+        decode.success(UnknownRequest(request_id, mcp.method_initialized))
+      None ->
+        decode.success(
+          ActionNotification(jsonrpc.Notification(
+            mcp.method_initialized,
+            Some(actions.NotifyInitialized(meta)),
+          )),
+        )
+    }
+  }
+}
+
+fn unknown_message_decoder(method: String) -> decode.Decoder(Message) {
+  {
+    use id <- decode.optional_field(
+      "id",
+      None,
+      decode.optional(request_id_decoder()),
+    )
+    case id {
+      Some(request_id) -> decode.success(UnknownRequest(request_id, method))
+      None -> decode.success(UnknownNotification(method))
+    }
+  }
+}
+
+fn decode_request_message(
+  method: String,
+  params_decoder: decode.Decoder(params),
+  wrap: fn(params) -> actions.ActionRequest,
+) -> decode.Decoder(Message) {
+  decode.then(decode.at(["id"], request_id_decoder()), fn(id) {
+    decode.then(params_decoder, fn(params) {
+      decode.success(
+        ActionRequest(jsonrpc.Request(id, method, Some(wrap(params)))),
+      )
+    })
+  })
+}
+
+fn encode_jsonrpc_response(
+  response: jsonrpc.Response(actions.ActionResult),
+) -> json.Json {
+  case response {
+    jsonrpc.ResultResponse(id, result) ->
+      json.object([
+        #("jsonrpc", json.string(jsonrpc.jsonrpc_version)),
+        #("id", encode_request_id(id)),
+        #("result", encode_action_result(result)),
+      ])
+    jsonrpc.ErrorResponse(id, error) ->
+      [#("jsonrpc", json.string(jsonrpc.jsonrpc_version))]
+      |> append_optional("id", option_map(id, encode_request_id))
+      |> append_optional("error", Some(encode_error(error)))
+      |> json.object
+  }
+}
+
+fn encode_action_result(result: actions.ActionResult) -> json.Json {
+  case result {
+    actions.ResultEmpty(meta) -> encode_meta_only(meta)
+    actions.ResultInitialize(value) -> encode_initialize_result(value)
+    actions.ResultListResources(value) -> encode_list_resources_result(value)
+    actions.ResultListResourceTemplates(value) ->
+      encode_list_resource_templates_result(value)
+    actions.ResultReadResource(value) -> encode_read_resource_result(value)
+    actions.ResultListPrompts(value) -> encode_list_prompts_result(value)
+    actions.ResultGetPrompt(value) -> encode_get_prompt_result(value)
+    actions.ResultListTools(value) -> encode_list_tools_result(value)
+    actions.ResultCallTool(value) -> encode_call_tool_result(value)
+    actions.ResultComplete(value) -> encode_complete_result(value)
+    actions.ResultCreateTask(_) -> json.object([])
+    actions.ResultListRoots(_) -> json.object([])
+    actions.ResultCreateMessage(_) -> json.object([])
+    actions.ResultElicit(_) -> json.object([])
+    actions.ResultGetTask(_) -> json.object([])
+    actions.ResultTaskPayload(_) -> json.object([])
+    actions.ResultCancelTask(_) -> json.object([])
+    actions.ResultListTasks(_) -> json.object([])
+  }
+}
+
+fn encode_meta_only(meta: Option(actions.Meta)) -> json.Json {
+  case meta {
+    Some(value) -> json.object([#("_meta", encode_meta(value))])
+    None -> json.object([])
+  }
+}
+
+fn encode_initialize_result(result: actions.InitializeResult) -> json.Json {
+  let actions.InitializeResult(
+    protocol_version,
+    capabilities,
+    server_info,
+    instructions,
+    meta,
+  ) = result
+
+  [
+    #("protocolVersion", json.string(protocol_version)),
+    #("capabilities", encode_server_capabilities(capabilities)),
+    #("serverInfo", encode_implementation(server_info)),
+  ]
+  |> append_optional("instructions", option_map(instructions, json.string))
+  |> append_optional("_meta", option_map(meta, encode_meta))
+  |> json.object
+}
+
+fn encode_server_capabilities(
+  capabilities: actions.ServerCapabilities,
+) -> json.Json {
+  let actions.ServerCapabilities(
+    experimental,
+    logging,
+    completions,
+    prompts,
+    resources,
+    tools,
+    tasks,
+  ) = capabilities
+
+  []
+  |> append_optional(
+    "experimental",
+    option_map(experimental, fn(fields) {
+      dict.to_list(fields)
+      |> list.map(fn(entry) {
+        let #(key, value) = entry
+        #(key, encode_value(value))
+      })
+      |> json.object
+    }),
+  )
+  |> append_optional("logging", option_map(logging, encode_value))
+  |> append_optional("completions", option_map(completions, encode_value))
+  |> append_optional(
+    "prompts",
+    option_map(prompts, encode_server_prompts_capabilities),
+  )
+  |> append_optional(
+    "resources",
+    option_map(resources, encode_server_resources_capabilities),
+  )
+  |> append_optional(
+    "tools",
+    option_map(tools, encode_server_tools_capabilities),
+  )
+  |> append_optional(
+    "tasks",
+    option_map(tasks, encode_server_tasks_capabilities),
+  )
+  |> json.object
+}
+
+fn encode_server_prompts_capabilities(
+  capabilities: actions.ServerPromptsCapabilities,
+) -> json.Json {
+  let actions.ServerPromptsCapabilities(list_changed) = capabilities
+  []
+  |> append_optional("listChanged", option_map(list_changed, json.bool))
+  |> json.object
+}
+
+fn encode_server_resources_capabilities(
+  capabilities: actions.ServerResourcesCapabilities,
+) -> json.Json {
+  let actions.ServerResourcesCapabilities(subscribe, list_changed) =
+    capabilities
+  []
+  |> append_optional("subscribe", option_map(subscribe, json.bool))
+  |> append_optional("listChanged", option_map(list_changed, json.bool))
+  |> json.object
+}
+
+fn encode_server_tools_capabilities(
+  capabilities: actions.ServerToolsCapabilities,
+) -> json.Json {
+  let actions.ServerToolsCapabilities(list_changed) = capabilities
+  []
+  |> append_optional("listChanged", option_map(list_changed, json.bool))
+  |> json.object
+}
+
+fn encode_server_tasks_capabilities(
+  capabilities: actions.ServerTasksCapabilities,
+) -> json.Json {
+  let actions.ServerTasksCapabilities(list, cancel, requests) = capabilities
+  []
+  |> append_optional("list", option_map(list, encode_value))
+  |> append_optional("cancel", option_map(cancel, encode_value))
+  |> append_optional(
+    "requests",
+    option_map(requests, encode_server_task_request_capabilities),
+  )
+  |> json.object
+}
+
+fn encode_server_task_request_capabilities(
+  capabilities: actions.ServerTaskRequestCapabilities,
+) -> json.Json {
+  let actions.ServerTaskRequestCapabilities(tools_call) = capabilities
+  []
+  |> append_optional("tools", option_map(tools_call, encode_value))
+  |> json.object
+}
+
+fn encode_list_resources_result(
+  result: actions.ListResourcesResult,
+) -> json.Json {
+  let actions.ListResourcesResult(resources, page, meta) = result
+  [#("resources", json.array(resources, encode_resource))]
+  |> append_page(page)
+  |> append_optional("_meta", option_map(meta, encode_meta))
+  |> json.object
+}
+
+fn encode_list_resource_templates_result(
+  result: actions.ListResourceTemplatesResult,
+) -> json.Json {
+  let actions.ListResourceTemplatesResult(resource_templates, page, meta) =
+    result
+  [
+    #(
+      "resourceTemplates",
+      json.array(resource_templates, encode_resource_template),
+    ),
+  ]
+  |> append_page(page)
+  |> append_optional("_meta", option_map(meta, encode_meta))
+  |> json.object
+}
+
+fn encode_read_resource_result(result: actions.ReadResourceResult) -> json.Json {
+  let actions.ReadResourceResult(contents, meta) = result
+  [#("contents", json.array(contents, encode_resource_contents))]
+  |> append_optional("_meta", option_map(meta, encode_meta))
+  |> json.object
+}
+
+fn encode_list_prompts_result(result: actions.ListPromptsResult) -> json.Json {
+  let actions.ListPromptsResult(prompts, page, meta) = result
+  [#("prompts", json.array(prompts, encode_prompt))]
+  |> append_page(page)
+  |> append_optional("_meta", option_map(meta, encode_meta))
+  |> json.object
+}
+
+fn encode_get_prompt_result(result: actions.GetPromptResult) -> json.Json {
+  let actions.GetPromptResult(description, messages, meta) = result
+  [#("messages", json.array(messages, encode_prompt_message))]
+  |> append_optional("description", option_map(description, json.string))
+  |> append_optional("_meta", option_map(meta, encode_meta))
+  |> json.object
+}
+
+fn encode_list_tools_result(result: actions.ListToolsResult) -> json.Json {
+  let actions.ListToolsResult(tools, page, meta) = result
+  [#("tools", json.array(tools, encode_tool))]
+  |> append_page(page)
+  |> append_optional("_meta", option_map(meta, encode_meta))
+  |> json.object
+}
+
+fn encode_call_tool_result(result: actions.CallToolResult) -> json.Json {
+  let actions.CallToolResult(content, structured_content, is_error, meta) =
+    result
+  [#("content", json.array(content, encode_content_block))]
+  |> append_optional(
+    "structuredContent",
+    option_map(structured_content, fn(fields) {
+      dict.to_list(fields)
+      |> list.map(fn(entry) {
+        let #(key, value) = entry
+        #(key, encode_value(value))
+      })
+      |> json.object
+    }),
+  )
+  |> append_optional("isError", option_map(is_error, json.bool))
+  |> append_optional("_meta", option_map(meta, encode_meta))
+  |> json.object
+}
+
+fn encode_complete_result(result: actions.CompleteResult) -> json.Json {
+  let actions.CompleteResult(completion, meta) = result
+  [#("completion", encode_completion_values(completion))]
+  |> append_optional("_meta", option_map(meta, encode_meta))
+  |> json.object
+}
+
+fn encode_completion_values(values: actions.CompletionValues) -> json.Json {
+  let actions.CompletionValues(entries, total, has_more) = values
+  [#("values", json.array(entries, json.string))]
+  |> append_optional("total", option_map(total, json.int))
+  |> append_optional("hasMore", option_map(has_more, json.bool))
+  |> json.object
+}
+
+fn append_page(
+  fields: List(#(String, json.Json)),
+  page: actions.Page,
+) -> List(#(String, json.Json)) {
+  let actions.Page(next_cursor) = page
+  append_optional(fields, "nextCursor", option_map(next_cursor, encode_cursor))
+}
+
+fn encode_implementation(implementation: actions.Implementation) -> json.Json {
+  let actions.Implementation(
+    name,
+    version,
+    title,
+    description,
+    website_url,
+    icons,
+  ) = implementation
+
+  [#("name", json.string(name)), #("version", json.string(version))]
+  |> append_optional("title", option_map(title, json.string))
+  |> append_optional("description", option_map(description, json.string))
+  |> append_optional("websiteUrl", option_map(website_url, json.string))
+  |> append_optional("icons", case icons {
+    [] -> None
+    _ -> Some(json.array(icons, encode_icon))
+  })
+  |> json.object
+}
+
+fn encode_icon(icon: actions.Icon) -> json.Json {
+  let actions.Icon(src, mime_type, sizes, theme) = icon
+  [#("src", json.string(src))]
+  |> append_optional("mimeType", option_map(mime_type, json.string))
+  |> append_optional("sizes", case sizes {
+    [] -> None
+    _ -> Some(json.array(sizes, json.string))
+  })
+  |> append_optional("theme", option_map(theme, encode_icon_theme))
+  |> json.object
+}
+
+fn encode_icon_theme(theme: actions.IconTheme) -> json.Json {
+  case theme {
+    actions.LightTheme -> json.string("light")
+    actions.DarkTheme -> json.string("dark")
+  }
+}
+
+fn encode_resource(resource: actions.Resource) -> json.Json {
+  resource_fields(resource) |> json.object
+}
+
+fn encode_resource_template(template: actions.ResourceTemplate) -> json.Json {
+  let actions.ResourceTemplate(
+    uri_template,
+    name,
+    title,
+    description,
+    mime_type,
+    annotations,
+    icons,
+    meta,
+  ) = template
+
+  [#("uriTemplate", json.string(uri_template)), #("name", json.string(name))]
+  |> append_optional("title", option_map(title, json.string))
+  |> append_optional("description", option_map(description, json.string))
+  |> append_optional("mimeType", option_map(mime_type, json.string))
+  |> append_optional("annotations", option_map(annotations, encode_annotations))
+  |> append_optional("icons", case icons {
+    [] -> None
+    _ -> Some(json.array(icons, encode_icon))
+  })
+  |> append_optional("_meta", option_map(meta, encode_meta))
+  |> json.object
+}
+
+fn encode_resource_contents(contents: actions.ResourceContents) -> json.Json {
+  case contents {
+    actions.TextResourceContents(uri, mime_type, text, meta) ->
+      [#("uri", json.string(uri)), #("text", json.string(text))]
+      |> append_optional("mimeType", option_map(mime_type, json.string))
+      |> append_optional("_meta", option_map(meta, encode_meta))
+      |> json.object
+    actions.BlobResourceContents(uri, mime_type, blob, meta) ->
+      [#("uri", json.string(uri)), #("blob", json.string(blob))]
+      |> append_optional("mimeType", option_map(mime_type, json.string))
+      |> append_optional("_meta", option_map(meta, encode_meta))
+      |> json.object
+  }
+}
+
+fn encode_prompt(prompt: actions.Prompt) -> json.Json {
+  let actions.Prompt(name, title, description, arguments, icons, meta) = prompt
+  [#("name", json.string(name))]
+  |> append_optional("title", option_map(title, json.string))
+  |> append_optional("description", option_map(description, json.string))
+  |> append_optional("arguments", case arguments {
+    [] -> None
+    _ -> Some(json.array(arguments, encode_prompt_argument))
+  })
+  |> append_optional("icons", case icons {
+    [] -> None
+    _ -> Some(json.array(icons, encode_icon))
+  })
+  |> append_optional("_meta", option_map(meta, encode_meta))
+  |> json.object
+}
+
+fn encode_prompt_argument(argument: actions.PromptArgument) -> json.Json {
+  let actions.PromptArgument(name, title, description, required) = argument
+  [#("name", json.string(name))]
+  |> append_optional("title", option_map(title, json.string))
+  |> append_optional("description", option_map(description, json.string))
+  |> append_optional("required", option_map(required, json.bool))
+  |> json.object
+}
+
+fn encode_prompt_message(message: actions.PromptMessage) -> json.Json {
+  let actions.PromptMessage(role, content) = message
+  json.object([
+    #("role", encode_role(role)),
+    #("content", encode_content_block(content)),
+  ])
+}
+
+fn encode_tool(tool: actions.Tool) -> json.Json {
+  let actions.Tool(
+    name,
+    title,
+    description,
+    input_schema,
+    execution,
+    output_schema,
+    annotations,
+    icons,
+    meta,
+  ) = tool
+
+  [#("name", json.string(name)), #("inputSchema", encode_value(input_schema))]
+  |> append_optional("title", option_map(title, json.string))
+  |> append_optional("description", option_map(description, json.string))
+  |> append_optional("execution", option_map(execution, encode_tool_execution))
+  |> append_optional("outputSchema", option_map(output_schema, encode_value))
+  |> append_optional(
+    "annotations",
+    option_map(annotations, encode_tool_annotations),
+  )
+  |> append_optional("icons", case icons {
+    [] -> None
+    _ -> Some(json.array(icons, encode_icon))
+  })
+  |> append_optional("_meta", option_map(meta, encode_meta))
+  |> json.object
+}
+
+fn encode_tool_execution(execution: actions.ToolExecution) -> json.Json {
+  let actions.ToolExecution(task_support) = execution
+  []
+  |> append_optional(
+    "taskSupport",
+    option_map(task_support, fn(task_support) {
+      case task_support {
+        actions.TaskForbidden -> json.string("forbidden")
+        actions.TaskOptional -> json.string("optional")
+        actions.TaskRequired -> json.string("required")
+      }
+    }),
+  )
+  |> json.object
+}
+
+fn encode_tool_annotations(annotations: actions.ToolAnnotations) -> json.Json {
+  let actions.ToolAnnotations(
+    title,
+    read_only_hint,
+    destructive_hint,
+    idempotent_hint,
+    open_world_hint,
+  ) = annotations
+
+  []
+  |> append_optional("title", option_map(title, json.string))
+  |> append_optional("readOnlyHint", option_map(read_only_hint, json.bool))
+  |> append_optional("destructiveHint", option_map(destructive_hint, json.bool))
+  |> append_optional("idempotentHint", option_map(idempotent_hint, json.bool))
+  |> append_optional("openWorldHint", option_map(open_world_hint, json.bool))
+  |> json.object
+}
+
+fn encode_content_block(block: actions.ContentBlock) -> json.Json {
+  case block {
+    actions.TextBlock(content) -> encode_text_content(content)
+    actions.ImageBlock(content) -> encode_image_content(content)
+    actions.AudioBlock(content) -> encode_audio_content(content)
+    actions.ResourceLinkBlock(link) -> encode_resource_link(link)
+    actions.EmbeddedResourceBlock(resource) ->
+      encode_embedded_resource(resource)
+  }
+}
+
+fn encode_text_content(content: actions.TextContent) -> json.Json {
+  let actions.TextContent(text, annotations, meta) = content
+  [#("type", json.string("text")), #("text", json.string(text))]
+  |> append_optional("annotations", option_map(annotations, encode_annotations))
+  |> append_optional("_meta", option_map(meta, encode_meta))
+  |> json.object
+}
+
+fn encode_image_content(content: actions.ImageContent) -> json.Json {
+  let actions.ImageContent(data, mime_type, annotations, meta) = content
+  [
+    #("type", json.string("image")),
+    #("data", json.string(data)),
+    #("mimeType", json.string(mime_type)),
+  ]
+  |> append_optional("annotations", option_map(annotations, encode_annotations))
+  |> append_optional("_meta", option_map(meta, encode_meta))
+  |> json.object
+}
+
+fn encode_audio_content(content: actions.AudioContent) -> json.Json {
+  let actions.AudioContent(data, mime_type, annotations, meta) = content
+  [
+    #("type", json.string("audio")),
+    #("data", json.string(data)),
+    #("mimeType", json.string(mime_type)),
+  ]
+  |> append_optional("annotations", option_map(annotations, encode_annotations))
+  |> append_optional("_meta", option_map(meta, encode_meta))
+  |> json.object
+}
+
+fn encode_resource_link(link: actions.ResourceLink) -> json.Json {
+  let actions.ResourceLink(resource) = link
+  resource_fields(resource)
+  |> prepend_field(#("type", json.string("resource_link")))
+  |> json.object
+}
+
+fn encode_embedded_resource(resource: actions.EmbeddedResource) -> json.Json {
+  let actions.EmbeddedResource(contents, annotations, meta) = resource
+  [
+    #("type", json.string("resource")),
+    #("resource", encode_resource_contents(contents)),
+  ]
+  |> append_optional("annotations", option_map(annotations, encode_annotations))
+  |> append_optional("_meta", option_map(meta, encode_meta))
+  |> json.object
+}
+
+fn encode_annotations(annotations: actions.Annotations) -> json.Json {
+  let actions.Annotations(audience, priority, last_modified) = annotations
+  []
+  |> append_optional("audience", case audience {
+    [] -> None
+    _ -> Some(json.array(audience, encode_role))
+  })
+  |> append_optional("priority", option_map(priority, json.float))
+  |> append_optional("lastModified", option_map(last_modified, json.string))
+  |> json.object
+}
+
+fn encode_meta(meta: actions.Meta) -> json.Json {
+  let actions.Meta(fields) = meta
+  dict.to_list(fields)
+  |> list.map(fn(entry) {
+    let #(key, value) = entry
+    #(key, encode_value(value))
+  })
+  |> json.object
+}
+
+fn encode_role(role: actions.Role) -> json.Json {
+  case role {
+    actions.User -> json.string("user")
+    actions.Assistant -> json.string("assistant")
+  }
+}
+
+fn encode_cursor(cursor: actions.Cursor) -> json.Json {
+  let actions.Cursor(value) = cursor
+  json.string(value)
+}
+
+fn encode_error(error: jsonrpc.RpcError) -> json.Json {
+  let jsonrpc.RpcError(code, message, data) = error
+  [#("code", json.int(code)), #("message", json.string(message))]
+  |> append_optional("data", option_map(data, encode_value))
+  |> json.object
+}
+
+fn encode_value(value: jsonrpc.Value) -> json.Json {
+  case value {
+    jsonrpc.VNull -> json.null()
+    jsonrpc.VString(value) -> json.string(value)
+    jsonrpc.VInt(value) -> json.int(value)
+    jsonrpc.VFloat(value) -> json.float(value)
+    jsonrpc.VBool(value) -> json.bool(value)
+    jsonrpc.VArray(values) -> json.array(values, encode_value)
+    jsonrpc.VObject(values) ->
+      values
+      |> list.map(fn(entry) {
+        let #(key, entry_value) = entry
+        #(key, encode_value(entry_value))
+      })
+      |> json.object
+  }
+}
+
+fn encode_request_id(id: jsonrpc.RequestId) -> json.Json {
+  case id {
+    jsonrpc.IntId(value) -> json.int(value)
+    jsonrpc.StringId(value) -> json.string(value)
+  }
+}
+
+fn resource_fields(resource: actions.Resource) -> List(#(String, json.Json)) {
+  let actions.Resource(
+    uri,
+    name,
+    title,
+    description,
+    mime_type,
+    annotations,
+    size,
+    icons,
+    meta,
+  ) = resource
+
+  [#("uri", json.string(uri)), #("name", json.string(name))]
+  |> append_optional("title", option_map(title, json.string))
+  |> append_optional("description", option_map(description, json.string))
+  |> append_optional("mimeType", option_map(mime_type, json.string))
+  |> append_optional("annotations", option_map(annotations, encode_annotations))
+  |> append_optional("size", option_map(size, json.int))
+  |> append_optional("icons", case icons {
+    [] -> None
+    _ -> Some(json.array(icons, encode_icon))
+  })
+  |> append_optional("_meta", option_map(meta, encode_meta))
+}
+
+fn initialize_request_params_decoder() -> decode.Decoder(
+  actions.InitializeRequestParams,
+) {
+  {
+    use protocol_version <- decode.field("protocolVersion", decode.string)
+    use capabilities <- decode.optional_field(
+      "capabilities",
+      actions.ClientCapabilities(None, None, None, None, None),
+      client_capabilities_decoder(),
+    )
+    use client_info <- decode.field("clientInfo", implementation_decoder())
+    use meta <- decode.optional_field(
+      "_meta",
+      None,
+      decode.optional(request_meta_decoder()),
+    )
+    decode.success(actions.InitializeRequestParams(
+      protocol_version: protocol_version,
+      capabilities: capabilities,
+      client_info: client_info,
+      meta: meta,
+    ))
+  }
+}
+
+fn client_capabilities_decoder() -> decode.Decoder(actions.ClientCapabilities) {
+  {
+    use experimental <- decode.optional_field(
+      "experimental",
+      None,
+      decode.optional(value_dict_decoder()),
+    )
+    use roots <- decode.optional_field(
+      "roots",
+      None,
+      decode.optional(client_roots_capabilities_decoder()),
+    )
+    use sampling <- decode.optional_field(
+      "sampling",
+      None,
+      decode.optional(client_sampling_capabilities_decoder()),
+    )
+    use elicitation <- decode.optional_field(
+      "elicitation",
+      None,
+      decode.optional(client_elicitation_capabilities_decoder()),
+    )
+    use tasks <- decode.optional_field(
+      "tasks",
+      None,
+      decode.optional(client_tasks_capabilities_decoder()),
+    )
+    decode.success(actions.ClientCapabilities(
+      experimental,
+      roots,
+      sampling,
+      elicitation,
+      tasks,
+    ))
+  }
+}
+
+fn client_roots_capabilities_decoder() -> decode.Decoder(
+  actions.ClientRootsCapabilities,
+) {
+  {
+    use list_changed <- decode.optional_field(
+      "listChanged",
+      None,
+      decode.optional(decode.bool),
+    )
+    decode.success(actions.ClientRootsCapabilities(list_changed: list_changed))
+  }
+}
+
+fn client_sampling_capabilities_decoder() -> decode.Decoder(
+  actions.ClientSamplingCapabilities,
+) {
+  {
+    use context <- decode.optional_field(
+      "context",
+      None,
+      decode.optional(value_decoder()),
+    )
+    use tools <- decode.optional_field(
+      "tools",
+      None,
+      decode.optional(value_decoder()),
+    )
+    decode.success(actions.ClientSamplingCapabilities(context, tools))
+  }
+}
+
+fn client_elicitation_capabilities_decoder() -> decode.Decoder(
+  actions.ClientElicitationCapabilities,
+) {
+  {
+    use form <- decode.optional_field(
+      "form",
+      None,
+      decode.optional(value_decoder()),
+    )
+    use url <- decode.optional_field(
+      "url",
+      None,
+      decode.optional(value_decoder()),
+    )
+    decode.success(actions.ClientElicitationCapabilities(form, url))
+  }
+}
+
+fn client_tasks_capabilities_decoder() -> decode.Decoder(
+  actions.ClientTasksCapabilities,
+) {
+  {
+    use list <- decode.optional_field(
+      "list",
+      None,
+      decode.optional(value_decoder()),
+    )
+    use cancel <- decode.optional_field(
+      "cancel",
+      None,
+      decode.optional(value_decoder()),
+    )
+    use requests <- decode.optional_field(
+      "requests",
+      None,
+      decode.optional(client_task_request_capabilities_decoder()),
+    )
+    decode.success(actions.ClientTasksCapabilities(list, cancel, requests))
+  }
+}
+
+fn client_task_request_capabilities_decoder() -> decode.Decoder(
+  actions.ClientTaskRequestCapabilities,
+) {
+  {
+    use sampling_create_message <- decode.optional_field(
+      "sampling/createMessage",
+      None,
+      decode.optional(value_decoder()),
+    )
+    use elicitation_create <- decode.optional_field(
+      "elicitation/create",
+      None,
+      decode.optional(value_decoder()),
+    )
+    decode.success(actions.ClientTaskRequestCapabilities(
+      sampling_create_message,
+      elicitation_create,
+    ))
+  }
+}
+
+fn paginated_request_params_decoder() -> decode.Decoder(
+  actions.PaginatedRequestParams,
+) {
+  {
+    use cursor <- decode.optional_field(
+      "cursor",
+      None,
+      decode.optional(decode.map(decode.string, actions.Cursor)),
+    )
+    use meta <- decode.optional_field(
+      "_meta",
+      None,
+      decode.optional(request_meta_decoder()),
+    )
+    decode.success(actions.PaginatedRequestParams(cursor, meta))
+  }
+}
+
+fn read_resource_request_params_decoder() -> decode.Decoder(
+  actions.ReadResourceRequestParams,
+) {
+  {
+    use uri <- decode.field("uri", decode.string)
+    use meta <- decode.optional_field(
+      "_meta",
+      None,
+      decode.optional(request_meta_decoder()),
+    )
+    decode.success(actions.ReadResourceRequestParams(uri, meta))
+  }
+}
+
+fn get_prompt_request_params_decoder() -> decode.Decoder(
+  actions.GetPromptRequestParams,
+) {
+  {
+    use name <- decode.field("name", decode.string)
+    use arguments <- decode.optional_field(
+      "arguments",
+      None,
+      decode.optional(decode.dict(decode.string, decode.string)),
+    )
+    use meta <- decode.optional_field(
+      "_meta",
+      None,
+      decode.optional(request_meta_decoder()),
+    )
+    decode.success(actions.GetPromptRequestParams(name, arguments, meta))
+  }
+}
+
+fn call_tool_request_params_decoder() -> decode.Decoder(
+  actions.CallToolRequestParams,
+) {
+  {
+    use name <- decode.field("name", decode.string)
+    use arguments <- decode.optional_field(
+      "arguments",
+      None,
+      decode.optional(value_dict_decoder()),
+    )
+    use task <- decode.optional_field(
+      "task",
+      None,
+      decode.optional(task_metadata_decoder()),
+    )
+    use meta <- decode.optional_field(
+      "_meta",
+      None,
+      decode.optional(request_meta_decoder()),
+    )
+    decode.success(actions.CallToolRequestParams(name, arguments, task, meta))
+  }
+}
+
+fn complete_request_params_decoder() -> decode.Decoder(
+  actions.CompleteRequestParams,
+) {
+  {
+    use ref <- decode.field("ref", completion_ref_decoder())
+    use argument <- decode.field("argument", complete_argument_decoder())
+    use context <- decode.optional_field(
+      "context",
+      None,
+      decode.optional(complete_context_decoder()),
+    )
+    use meta <- decode.optional_field(
+      "_meta",
+      None,
+      decode.optional(request_meta_decoder()),
+    )
+    decode.success(actions.CompleteRequestParams(ref, argument, context, meta))
+  }
+}
+
+fn set_level_request_params_decoder() -> decode.Decoder(
+  actions.SetLevelRequestParams,
+) {
+  {
+    use level <- decode.field("level", logging_level_decoder())
+    use meta <- decode.optional_field(
+      "_meta",
+      None,
+      decode.optional(request_meta_decoder()),
+    )
+    decode.success(actions.SetLevelRequestParams(level, meta))
+  }
+}
+
+fn request_meta_decoder() -> decode.Decoder(actions.RequestMeta) {
+  {
+    use progress_token <- decode.optional_field(
+      "progressToken",
+      None,
+      decode.optional(request_id_decoder()),
+    )
+    use extra <- decode.optional_field(
+      "extra",
+      None,
+      decode.optional(meta_decoder()),
+    )
+    decode.success(actions.RequestMeta(progress_token, extra))
+  }
+}
+
+fn notification_meta_only_decoder() -> decode.Decoder(
+  Option(actions.NotificationMeta),
+) {
+  {
+    use meta <- decode.optional_field(
+      "_meta",
+      None,
+      decode.optional(notification_meta_decoder()),
+    )
+    decode.success(meta)
+  }
+}
+
+fn notification_meta_decoder() -> decode.Decoder(actions.NotificationMeta) {
+  {
+    use extra <- decode.optional_field(
+      "extra",
+      None,
+      decode.optional(meta_decoder()),
+    )
+    decode.success(actions.NotificationMeta(extra))
+  }
+}
+
+fn task_metadata_decoder() -> decode.Decoder(actions.TaskMetadata) {
+  {
+    use ttl_ms <- decode.optional_field(
+      "ttlMs",
+      None,
+      decode.optional(decode.int),
+    )
+    decode.success(actions.TaskMetadata(ttl_ms))
+  }
+}
+
+fn completion_ref_decoder() -> decode.Decoder(actions.CompletionRef) {
+  decode.then(decode.at(["type"], decode.string), fn(kind) {
+    case kind {
+      "ref/prompt" -> {
+        use name <- decode.field("name", decode.string)
+        use title <- decode.optional_field(
+          "title",
+          None,
+          decode.optional(decode.string),
+        )
+        decode.success(actions.PromptRef(name, title))
+      }
+      "ref/resource" -> {
+        use uri <- decode.field("uri", decode.string)
+        decode.success(actions.ResourceTemplateRef(uri))
+      }
+      _ ->
+        decode.failure(
+          actions.PromptRef("", None),
+          expected: "Known completion ref type",
+        )
+    }
+  })
+}
+
+fn complete_argument_decoder() -> decode.Decoder(actions.CompleteArgument) {
+  {
+    use name <- decode.field("name", decode.string)
+    use value <- decode.field("value", decode.string)
+    decode.success(actions.CompleteArgument(name, value))
+  }
+}
+
+fn complete_context_decoder() -> decode.Decoder(actions.CompleteContext) {
+  {
+    use arguments <- decode.optional_field(
+      "arguments",
+      None,
+      decode.optional(decode.dict(decode.string, decode.string)),
+    )
+    decode.success(actions.CompleteContext(arguments))
+  }
+}
+
+fn implementation_decoder() -> decode.Decoder(actions.Implementation) {
+  {
+    use name <- decode.field("name", decode.string)
+    use version <- decode.field("version", decode.string)
+    use title <- decode.optional_field(
+      "title",
+      None,
+      decode.optional(decode.string),
+    )
+    use description <- decode.optional_field(
+      "description",
+      None,
+      decode.optional(decode.string),
+    )
+    use website_url <- decode.optional_field(
+      "websiteUrl",
+      None,
+      decode.optional(decode.string),
+    )
+    use icons <- decode.optional_field(
+      "icons",
+      [],
+      decode.list(of: icon_decoder()),
+    )
+    decode.success(actions.Implementation(
+      name: name,
+      version: version,
+      title: title,
+      description: description,
+      website_url: website_url,
+      icons: icons,
+    ))
+  }
+}
+
+fn icon_decoder() -> decode.Decoder(actions.Icon) {
+  {
+    use src <- decode.field("src", decode.string)
+    use mime_type <- decode.optional_field(
+      "mimeType",
+      None,
+      decode.optional(decode.string),
+    )
+    use sizes <- decode.optional_field(
+      "sizes",
+      [],
+      decode.list(of: decode.string),
+    )
+    use theme <- decode.optional_field(
+      "theme",
+      None,
+      decode.optional(icon_theme_decoder()),
+    )
+    decode.success(actions.Icon(src, mime_type, sizes, theme))
+  }
+}
+
+fn icon_theme_decoder() -> decode.Decoder(actions.IconTheme) {
+  decode.then(decode.string, fn(value) {
+    case value {
+      "light" -> decode.success(actions.LightTheme)
+      "dark" -> decode.success(actions.DarkTheme)
+      _ -> decode.failure(actions.LightTheme, expected: "IconTheme")
+    }
+  })
+}
+
+fn logging_level_decoder() -> decode.Decoder(actions.LoggingLevel) {
+  decode.then(decode.string, fn(value) {
+    case value {
+      "debug" -> decode.success(actions.Debug)
+      "info" -> decode.success(actions.Info)
+      "notice" -> decode.success(actions.Notice)
+      "warning" -> decode.success(actions.Warning)
+      "error" -> decode.success(actions.Error)
+      "critical" -> decode.success(actions.Critical)
+      "alert" -> decode.success(actions.Alert)
+      "emergency" -> decode.success(actions.Emergency)
+      _ -> decode.failure(actions.Info, expected: "LoggingLevel")
+    }
+  })
+}
+
+fn meta_decoder() -> decode.Decoder(actions.Meta) {
+  decode.map(value_dict_decoder(), actions.Meta)
+}
+
+fn value_dict_decoder() -> decode.Decoder(dict.Dict(String, jsonrpc.Value)) {
+  decode.dict(decode.string, value_decoder())
+}
+
+fn request_id_decoder() -> decode.Decoder(jsonrpc.RequestId) {
+  decode.one_of(decode.map(decode.string, jsonrpc.StringId), or: [
+    decode.map(decode.int, jsonrpc.IntId),
+  ])
+}
+
+fn value_decoder() -> decode.Decoder(jsonrpc.Value) {
+  use <- decode.recursive
+  decode.one_of(decode.map(decode.string, jsonrpc.VString), or: [
+    decode.map(decode.int, jsonrpc.VInt),
+    decode.map(number_decoder(), jsonrpc.VFloat),
+    decode.map(decode.bool, jsonrpc.VBool),
+    decode.map(decode.list(of: value_decoder()), jsonrpc.VArray),
+    decode.map(decode.dict(decode.string, value_decoder()), fn(fields) {
+      jsonrpc.VObject(dict.to_list(fields))
+    }),
+    null_value_decoder(),
+  ])
+}
+
+fn null_value_decoder() -> decode.Decoder(jsonrpc.Value) {
+  decode.map(decode.optional(decode.dynamic), fn(_) { jsonrpc.VNull })
+  |> decode.collapse_errors("Null")
+}
+
+fn number_decoder() -> decode.Decoder(Float) {
+  decode.one_of(decode.float, or: [decode.map(decode.int, int.to_float)])
+}
+
+fn json_error_message(error: json.DecodeError) -> String {
+  case error {
+    json.UnexpectedEndOfInput -> "Unexpected end of JSON input"
+    json.UnexpectedByte(byte) -> "Unexpected JSON byte: " <> byte
+    json.UnexpectedSequence(sequence) ->
+      "Unexpected JSON sequence: " <> sequence
+    json.UnableToDecode(errors) ->
+      case errors {
+        [] -> "Unable to decode JSON value"
+        [decode.DecodeError(expected, found, path), ..] ->
+          "Expected "
+          <> expected
+          <> ", found "
+          <> found
+          <> decode_path_suffix(path)
+      }
+  }
+}
+
+fn decode_path_suffix(path: List(String)) -> String {
+  case path {
+    [] -> ""
+    _ -> " at " <> string.join(path, ".")
+  }
+}
+
+fn prepend_field(
+  fields: List(#(String, json.Json)),
+  field: #(String, json.Json),
+) -> List(#(String, json.Json)) {
+  [field, ..fields]
+}
+
+fn append_optional(
+  fields: List(#(String, json.Json)),
+  key: String,
+  value: Option(json.Json),
+) -> List(#(String, json.Json)) {
+  case value {
+    Some(value) -> list.append(fields, [#(key, value)])
+    None -> fields
+  }
+}
+
+fn option_map(input: Option(a), fun: fn(a) -> b) -> Option(b) {
+  case input {
+    Some(value) -> Some(fun(value))
+    None -> None
+  }
+}
