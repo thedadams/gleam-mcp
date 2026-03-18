@@ -8,6 +8,14 @@ import gleam/result
 import gleam/string
 import gleam_mcp/actions
 import gleam_mcp/jsonrpc
+import gleam_mcp/mcp
+
+pub type ServerMessage {
+  ActionRequest(jsonrpc.Request(actions.ActionRequest))
+  ActionNotification(jsonrpc.Request(actions.ActionNotification))
+  UnknownRequest(id: jsonrpc.RequestId, method: String)
+  UnknownNotification(method: String)
+}
 
 pub fn encode_request(request: jsonrpc.Request(actions.ActionRequest)) -> String {
   request
@@ -28,6 +36,11 @@ pub fn decode_response(
   request: jsonrpc.Request(actions.ActionRequest),
 ) -> Result(jsonrpc.Response(actions.ActionResult), String) {
   json.parse(body, response_decoder(request))
+  |> result.map_error(json_error_message)
+}
+
+pub fn decode_server_message(body: String) -> Result(ServerMessage, String) {
+  json.parse(body, server_message_decoder())
   |> result.map_error(json_error_message)
 }
 
@@ -1065,6 +1078,399 @@ fn response_decoder(
   }
 }
 
+fn server_message_decoder() -> decode.Decoder(ServerMessage) {
+  decode.then(decode.at(["method"], decode.string), fn(method) {
+    case method {
+      method if method == mcp.method_list_roots -> list_roots_message_decoder()
+      method if method == mcp.method_create_message ->
+        create_message_message_decoder()
+      method if method == mcp.method_elicit -> elicit_message_decoder()
+      method if method == mcp.method_notify_cancelled ->
+        cancelled_notification_decoder()
+      method if method == mcp.method_notify_progress ->
+        progress_notification_decoder()
+      method if method == mcp.method_notify_resource_list_changed ->
+        resource_list_changed_notification_decoder()
+      method if method == mcp.method_notify_resource_updated ->
+        resource_updated_notification_decoder()
+      method if method == mcp.method_notify_prompts_list_changed ->
+        prompt_list_changed_notification_decoder()
+      method if method == mcp.method_notify_tools_list_changed ->
+        tool_list_changed_notification_decoder()
+      method if method == mcp.method_notify_logging_message ->
+        logging_message_notification_decoder()
+      method if method == mcp.method_notify_roots_list_changed ->
+        roots_list_changed_notification_decoder()
+      method if method == mcp.method_notify_elicitation_complete ->
+        elicitation_complete_notification_decoder()
+      method if method == mcp.method_notify_task_status ->
+        task_status_notification_decoder()
+      _ -> unknown_server_message_decoder(method)
+    }
+  })
+}
+
+fn list_roots_message_decoder() -> decode.Decoder(ServerMessage) {
+  decode_server_request_message(
+    mcp.method_list_roots,
+    {
+      use params <- decode.optional_field(
+        "params",
+        None,
+        decode.optional(request_meta_decoder()),
+      )
+      decode.success(params)
+    },
+    fn(params) { actions.RequestListRoots(params) },
+  )
+}
+
+fn create_message_message_decoder() -> decode.Decoder(ServerMessage) {
+  decode_server_request_message(
+    mcp.method_create_message,
+    {
+      use params <- decode.field(
+        "params",
+        create_message_request_params_decoder(),
+      )
+      decode.success(params)
+    },
+    fn(params) { actions.RequestCreateMessage(params) },
+  )
+}
+
+fn elicit_message_decoder() -> decode.Decoder(ServerMessage) {
+  decode_server_request_message(
+    mcp.method_elicit,
+    {
+      use params <- decode.field("params", elicit_request_params_decoder())
+      decode.success(params)
+    },
+    fn(params) { actions.RequestElicit(params) },
+  )
+}
+
+fn roots_list_changed_notification_decoder() -> decode.Decoder(ServerMessage) {
+  decode_server_notification_message(mcp.method_notify_roots_list_changed, {
+    use meta <- decode.optional_field(
+      "params",
+      None,
+      notification_meta_only_decoder(),
+    )
+    decode.success(actions.NotifyRootsListChanged(meta))
+  })
+}
+
+fn cancelled_notification_decoder() -> decode.Decoder(ServerMessage) {
+  decode_server_notification_message(mcp.method_notify_cancelled, {
+    use params <- decode.field(
+      "params",
+      cancelled_notification_params_decoder(),
+    )
+    decode.success(actions.NotifyCancelled(params))
+  })
+}
+
+fn progress_notification_decoder() -> decode.Decoder(ServerMessage) {
+  decode_server_notification_message(mcp.method_notify_progress, {
+    use params <- decode.field("params", progress_notification_params_decoder())
+    decode.success(actions.NotifyProgress(params))
+  })
+}
+
+fn resource_list_changed_notification_decoder() -> decode.Decoder(ServerMessage) {
+  decode_server_notification_message(mcp.method_notify_resource_list_changed, {
+    use meta <- decode.optional_field(
+      "params",
+      None,
+      notification_meta_only_decoder(),
+    )
+    decode.success(actions.NotifyResourceListChanged(meta))
+  })
+}
+
+fn resource_updated_notification_decoder() -> decode.Decoder(ServerMessage) {
+  decode_server_notification_message(mcp.method_notify_resource_updated, {
+    use params <- decode.field(
+      "params",
+      resource_updated_notification_params_decoder(),
+    )
+    decode.success(actions.NotifyResourceUpdated(params))
+  })
+}
+
+fn prompt_list_changed_notification_decoder() -> decode.Decoder(ServerMessage) {
+  decode_server_notification_message(mcp.method_notify_prompts_list_changed, {
+    use meta <- decode.optional_field(
+      "params",
+      None,
+      notification_meta_only_decoder(),
+    )
+    decode.success(actions.NotifyPromptListChanged(meta))
+  })
+}
+
+fn tool_list_changed_notification_decoder() -> decode.Decoder(ServerMessage) {
+  decode_server_notification_message(mcp.method_notify_tools_list_changed, {
+    use meta <- decode.optional_field(
+      "params",
+      None,
+      notification_meta_only_decoder(),
+    )
+    decode.success(actions.NotifyToolListChanged(meta))
+  })
+}
+
+fn logging_message_notification_decoder() -> decode.Decoder(ServerMessage) {
+  decode_server_notification_message(mcp.method_notify_logging_message, {
+    use params <- decode.field(
+      "params",
+      logging_message_notification_params_decoder(),
+    )
+    decode.success(actions.NotifyLoggingMessage(params))
+  })
+}
+
+fn elicitation_complete_notification_decoder() -> decode.Decoder(ServerMessage) {
+  decode_server_notification_message(mcp.method_notify_elicitation_complete, {
+    use params <- decode.field(
+      "params",
+      elicitation_complete_notification_params_decoder(),
+    )
+    decode.success(actions.NotifyElicitationComplete(params))
+  })
+}
+
+fn task_status_notification_decoder() -> decode.Decoder(ServerMessage) {
+  decode_server_notification_message(mcp.method_notify_task_status, {
+    use params <- decode.field(
+      "params",
+      task_status_notification_params_decoder(),
+    )
+    decode.success(actions.NotifyTaskStatus(params))
+  })
+}
+
+fn decode_server_notification_message(
+  _method: String,
+  params_decoder: decode.Decoder(actions.ActionNotification),
+) -> decode.Decoder(ServerMessage) {
+  decode.then(
+    {
+      use id <- decode.optional_field(
+        "id",
+        None,
+        decode.optional(request_id_decoder()),
+      )
+      decode.success(id)
+    },
+    fn(id) {
+      decode.then(params_decoder, fn(notification) {
+        let method = notification_method(notification)
+        case id {
+          Some(request_id) -> decode.success(UnknownRequest(request_id, method))
+          None ->
+            decode.success(
+              ActionNotification(jsonrpc.Notification(
+                method,
+                Some(notification),
+              )),
+            )
+        }
+      })
+    },
+  )
+}
+
+fn notification_method(notification: actions.ActionNotification) -> String {
+  case notification {
+    actions.NotifyInitialized(_) -> mcp.method_initialized
+    actions.NotifyCancelled(_) -> mcp.method_notify_cancelled
+    actions.NotifyProgress(_) -> mcp.method_notify_progress
+    actions.NotifyResourceListChanged(_) ->
+      mcp.method_notify_resource_list_changed
+    actions.NotifyResourceUpdated(_) -> mcp.method_notify_resource_updated
+    actions.NotifyPromptListChanged(_) -> mcp.method_notify_prompts_list_changed
+    actions.NotifyToolListChanged(_) -> mcp.method_notify_tools_list_changed
+    actions.NotifyLoggingMessage(_) -> mcp.method_notify_logging_message
+    actions.NotifyRootsListChanged(_) -> mcp.method_notify_roots_list_changed
+    actions.NotifyElicitationComplete(_) ->
+      mcp.method_notify_elicitation_complete
+    actions.NotifyTaskStatus(_) -> mcp.method_notify_task_status
+  }
+}
+
+fn unknown_server_message_decoder(
+  method: String,
+) -> decode.Decoder(ServerMessage) {
+  {
+    use id <- decode.optional_field(
+      "id",
+      None,
+      decode.optional(request_id_decoder()),
+    )
+    case id {
+      Some(request_id) -> decode.success(UnknownRequest(request_id, method))
+      None -> decode.success(UnknownNotification(method))
+    }
+  }
+}
+
+fn decode_server_request_message(
+  method: String,
+  params_decoder: decode.Decoder(params),
+  wrap: fn(params) -> actions.ActionRequest,
+) -> decode.Decoder(ServerMessage) {
+  decode.then(decode.at(["id"], request_id_decoder()), fn(id) {
+    decode.then(params_decoder, fn(params) {
+      decode.success(
+        ActionRequest(jsonrpc.Request(id, method, Some(wrap(params)))),
+      )
+    })
+  })
+}
+
+fn cancelled_notification_params_decoder() -> decode.Decoder(
+  actions.CancelledNotificationParams,
+) {
+  {
+    use request_id <- decode.optional_field(
+      "requestId",
+      None,
+      decode.optional(request_id_decoder()),
+    )
+    use reason <- decode.optional_field(
+      "reason",
+      None,
+      decode.optional(decode.string),
+    )
+    use meta <- decode.optional_field(
+      "_meta",
+      None,
+      decode.optional(notification_meta_decoder()),
+    )
+    decode.success(actions.CancelledNotificationParams(request_id, reason, meta))
+  }
+}
+
+fn progress_notification_params_decoder() -> decode.Decoder(
+  actions.ProgressNotificationParams,
+) {
+  {
+    use progress_token <- decode.field("progressToken", request_id_decoder())
+    use progress <- decode.field("progress", number_decoder())
+    use total <- decode.optional_field(
+      "total",
+      None,
+      decode.optional(number_decoder()),
+    )
+    use message <- decode.optional_field(
+      "message",
+      None,
+      decode.optional(decode.string),
+    )
+    use meta <- decode.optional_field(
+      "_meta",
+      None,
+      decode.optional(notification_meta_decoder()),
+    )
+    decode.success(actions.ProgressNotificationParams(
+      progress_token,
+      progress,
+      total,
+      message,
+      meta,
+    ))
+  }
+}
+
+fn resource_updated_notification_params_decoder() -> decode.Decoder(
+  actions.ResourceUpdatedNotificationParams,
+) {
+  {
+    use uri <- decode.field("uri", decode.string)
+    use meta <- decode.optional_field(
+      "_meta",
+      None,
+      decode.optional(notification_meta_decoder()),
+    )
+    decode.success(actions.ResourceUpdatedNotificationParams(uri, meta))
+  }
+}
+
+fn logging_message_notification_params_decoder() -> decode.Decoder(
+  actions.LoggingMessageNotificationParams,
+) {
+  {
+    use level <- decode.field("level", logging_level_decoder())
+    use logger <- decode.optional_field(
+      "logger",
+      None,
+      decode.optional(decode.string),
+    )
+    use data <- decode.field("data", value_decoder())
+    use meta <- decode.optional_field(
+      "_meta",
+      None,
+      decode.optional(notification_meta_decoder()),
+    )
+    decode.success(actions.LoggingMessageNotificationParams(
+      level,
+      logger,
+      data,
+      meta,
+    ))
+  }
+}
+
+fn elicitation_complete_notification_params_decoder() -> decode.Decoder(
+  actions.ElicitationCompleteNotificationParams,
+) {
+  {
+    use elicitation_id <- decode.field("elicitationId", decode.string)
+    decode.success(actions.ElicitationCompleteNotificationParams(elicitation_id))
+  }
+}
+
+fn task_status_notification_params_decoder() -> decode.Decoder(
+  actions.TaskStatusNotificationParams,
+) {
+  {
+    use task_id <- decode.field("taskId", decode.string)
+    use status <- decode.field("status", task_status_decoder())
+    use status_message <- decode.optional_field(
+      "statusMessage",
+      None,
+      decode.optional(decode.string),
+    )
+    use created_at <- decode.field("createdAt", decode.string)
+    use last_updated_at <- decode.field("lastUpdatedAt", decode.string)
+    use ttl_ms <- decode.field("ttl", decode.optional(decode.int))
+    use poll_interval_ms <- decode.optional_field(
+      "pollInterval",
+      None,
+      decode.optional(decode.int),
+    )
+    use meta <- decode.optional_field(
+      "_meta",
+      None,
+      decode.optional(notification_meta_decoder()),
+    )
+    decode.success(actions.TaskStatusNotificationParams(
+      actions.Task(
+        task_id,
+        status,
+        status_message,
+        created_at,
+        last_updated_at,
+        ttl_ms,
+        poll_interval_ms,
+      ),
+      meta,
+    ))
+  }
+}
+
 fn result_response_decoder(
   original_id: jsonrpc.RequestId,
   decoder result_decoder: decode.Decoder(actions.ActionResult),
@@ -1355,6 +1761,297 @@ fn elicit_result_decoder() -> decode.Decoder(actions.ElicitResult) {
     )
     decode.success(actions.ElicitResult(action:, content:, meta:))
   }
+}
+
+fn create_message_request_params_decoder() -> decode.Decoder(
+  actions.CreateMessageRequestParams,
+) {
+  {
+    use messages <- decode.field(
+      "messages",
+      decode.list(of: sampling_message_decoder()),
+    )
+    use model_preferences <- decode.optional_field(
+      "modelPreferences",
+      None,
+      decode.optional(model_preferences_decoder()),
+    )
+    use system_prompt <- decode.optional_field(
+      "systemPrompt",
+      None,
+      decode.optional(decode.string),
+    )
+    use include_context <- decode.optional_field(
+      "includeContext",
+      None,
+      decode.optional(include_context_decoder()),
+    )
+    use temperature <- decode.optional_field(
+      "temperature",
+      None,
+      decode.optional(number_decoder()),
+    )
+    use max_tokens <- decode.field("maxTokens", decode.int)
+    use stop_sequences <- decode.optional_field(
+      "stopSequences",
+      [],
+      decode.list(of: decode.string),
+    )
+    use metadata <- decode.optional_field(
+      "metadata",
+      None,
+      decode.optional(value_decoder()),
+    )
+    use tools <- decode.optional_field(
+      "tools",
+      [],
+      decode.list(of: tool_decoder()),
+    )
+    use tool_choice <- decode.optional_field(
+      "toolChoice",
+      None,
+      decode.optional(tool_choice_decoder()),
+    )
+    use task <- decode.optional_field(
+      "task",
+      None,
+      decode.optional(task_metadata_decoder()),
+    )
+    use meta <- decode.optional_field(
+      "_meta",
+      None,
+      decode.optional(request_meta_decoder()),
+    )
+    decode.success(actions.CreateMessageRequestParams(
+      messages: messages,
+      model_preferences: model_preferences,
+      system_prompt: system_prompt,
+      include_context: include_context,
+      temperature: temperature,
+      max_tokens: max_tokens,
+      stop_sequences: stop_sequences,
+      metadata: metadata,
+      tools: tools,
+      tool_choice: tool_choice,
+      task: task,
+      meta: meta,
+    ))
+  }
+}
+
+fn elicit_request_params_decoder() -> decode.Decoder(
+  actions.ElicitRequestParams,
+) {
+  {
+    use mode <- decode.optional_field(
+      "mode",
+      None,
+      decode.optional(decode.string),
+    )
+    case mode {
+      Some("url") ->
+        decode.map(
+          elicit_request_url_params_decoder(),
+          actions.ElicitRequestUrl,
+        )
+      _ ->
+        decode.map(
+          elicit_request_form_params_decoder(),
+          actions.ElicitRequestForm,
+        )
+    }
+  }
+}
+
+fn elicit_request_form_params_decoder() -> decode.Decoder(
+  actions.ElicitRequestFormParams,
+) {
+  {
+    use message <- decode.field("message", decode.string)
+    use requested_schema <- decode.field("requestedSchema", value_decoder())
+    use task <- decode.optional_field(
+      "task",
+      None,
+      decode.optional(task_metadata_decoder()),
+    )
+    use meta <- decode.optional_field(
+      "_meta",
+      None,
+      decode.optional(request_meta_decoder()),
+    )
+    decode.success(actions.ElicitRequestFormParams(
+      message,
+      requested_schema,
+      task,
+      meta,
+    ))
+  }
+}
+
+fn elicit_request_url_params_decoder() -> decode.Decoder(
+  actions.ElicitRequestUrlParams,
+) {
+  {
+    use message <- decode.field("message", decode.string)
+    use elicitation_id <- decode.field("elicitationId", decode.string)
+    use url <- decode.field("url", decode.string)
+    use task <- decode.optional_field(
+      "task",
+      None,
+      decode.optional(task_metadata_decoder()),
+    )
+    use meta <- decode.optional_field(
+      "_meta",
+      None,
+      decode.optional(request_meta_decoder()),
+    )
+    decode.success(actions.ElicitRequestUrlParams(
+      message,
+      elicitation_id,
+      url,
+      task,
+      meta,
+    ))
+  }
+}
+
+fn request_meta_decoder() -> decode.Decoder(actions.RequestMeta) {
+  {
+    use progress_token <- decode.optional_field(
+      "progressToken",
+      None,
+      decode.optional(request_id_decoder()),
+    )
+    use extra <- decode.optional_field(
+      "extra",
+      None,
+      decode.optional(meta_decoder()),
+    )
+    decode.success(actions.RequestMeta(progress_token, extra))
+  }
+}
+
+fn notification_meta_only_decoder() -> decode.Decoder(
+  Option(actions.NotificationMeta),
+) {
+  {
+    use meta <- decode.optional_field(
+      "_meta",
+      None,
+      decode.optional(notification_meta_decoder()),
+    )
+    decode.success(meta)
+  }
+}
+
+fn notification_meta_decoder() -> decode.Decoder(actions.NotificationMeta) {
+  {
+    use extra <- decode.optional_field(
+      "extra",
+      None,
+      decode.optional(meta_decoder()),
+    )
+    decode.success(actions.NotificationMeta(extra))
+  }
+}
+
+fn task_metadata_decoder() -> decode.Decoder(actions.TaskMetadata) {
+  {
+    use ttl_ms <- decode.optional_field(
+      "ttlMs",
+      None,
+      decode.optional(decode.int),
+    )
+    decode.success(actions.TaskMetadata(ttl_ms))
+  }
+}
+
+fn model_preferences_decoder() -> decode.Decoder(actions.ModelPreferences) {
+  {
+    use hints <- decode.optional_field(
+      "hints",
+      [],
+      decode.list(of: model_hint_decoder()),
+    )
+    use cost_priority <- decode.optional_field(
+      "costPriority",
+      None,
+      decode.optional(number_decoder()),
+    )
+    use speed_priority <- decode.optional_field(
+      "speedPriority",
+      None,
+      decode.optional(number_decoder()),
+    )
+    use intelligence_priority <- decode.optional_field(
+      "intelligencePriority",
+      None,
+      decode.optional(number_decoder()),
+    )
+    decode.success(actions.ModelPreferences(
+      hints,
+      cost_priority,
+      speed_priority,
+      intelligence_priority,
+    ))
+  }
+}
+
+fn model_hint_decoder() -> decode.Decoder(actions.ModelHint) {
+  {
+    use name <- decode.optional_field(
+      "name",
+      None,
+      decode.optional(decode.string),
+    )
+    decode.success(actions.ModelHint(name))
+  }
+}
+
+fn include_context_decoder() -> decode.Decoder(actions.IncludeContext) {
+  decode.then(decode.string, fn(value) {
+    case value {
+      "none" -> decode.success(actions.NoContext)
+      "thisServer" -> decode.success(actions.ThisServerContext)
+      "allServers" -> decode.success(actions.AllServersContext)
+      _ -> decode.failure(actions.NoContext, expected: "IncludeContext")
+    }
+  })
+}
+
+fn sampling_message_decoder() -> decode.Decoder(actions.SamplingMessage) {
+  {
+    use role <- decode.field("role", role_decoder())
+    use content <- decode.field("content", sampling_content_decoder())
+    use meta <- decode.optional_field(
+      "_meta",
+      None,
+      decode.optional(meta_decoder()),
+    )
+    decode.success(actions.SamplingMessage(role, content, meta))
+  }
+}
+
+fn tool_choice_decoder() -> decode.Decoder(actions.ToolChoice) {
+  {
+    use mode <- decode.optional_field(
+      "mode",
+      None,
+      decode.optional(tool_choice_mode_decoder()),
+    )
+    decode.success(actions.ToolChoice(mode))
+  }
+}
+
+fn tool_choice_mode_decoder() -> decode.Decoder(actions.ToolChoiceMode) {
+  decode.then(decode.string, fn(value) {
+    case value {
+      "auto" -> decode.success(actions.ToolAuto)
+      "required" -> decode.success(actions.ToolRequired)
+      "none" -> decode.success(actions.ToolNone)
+      _ -> decode.failure(actions.ToolAuto, expected: "ToolChoiceMode")
+    }
+  })
 }
 
 fn create_task_result_decoder() -> decode.Decoder(actions.CreateTaskResult) {
@@ -2284,6 +2981,22 @@ fn task_status_decoder() -> decode.Decoder(actions.TaskStatus) {
       "failed" -> decode.success(actions.Failed)
       "cancelled" -> decode.success(actions.Cancelled)
       _ -> decode.failure(actions.Working, expected: "TaskStatus")
+    }
+  })
+}
+
+fn logging_level_decoder() -> decode.Decoder(actions.LoggingLevel) {
+  decode.then(decode.string, fn(value) {
+    case value {
+      "debug" -> decode.success(actions.Debug)
+      "info" -> decode.success(actions.Info)
+      "notice" -> decode.success(actions.Notice)
+      "warning" -> decode.success(actions.Warning)
+      "error" -> decode.success(actions.Error)
+      "critical" -> decode.success(actions.Critical)
+      "alert" -> decode.success(actions.Alert)
+      "emergency" -> decode.success(actions.Emergency)
+      _ -> decode.failure(actions.Info, expected: "LoggingLevel")
     }
   })
 }

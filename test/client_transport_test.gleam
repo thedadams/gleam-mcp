@@ -21,6 +21,7 @@ pub fn transport_stdio_mode_uses_stdio_runner_test() {
       config,
       None,
       jsonrpc.latest_protocol_version,
+      capabilities.none(),
       request,
       fn(stdio_config, session_id, incoming_request) {
         should.equal(
@@ -31,7 +32,7 @@ pub fn transport_stdio_mode_uses_stdio_runner_test() {
         should.equal(session_id, None)
         transport_ok(jsonrpc.ResultResponse(jsonrpc.StringId("stdio"), Nil))
       },
-      fn(_, _, _, _) { Error(transport.UnexpectedResponse("wrong runner")) },
+      fn(_, _, _, _, _) { Error(transport.UnexpectedResponse("wrong runner")) },
     )
 
   result
@@ -50,9 +51,16 @@ pub fn transport_http_mode_uses_streamable_runner_test() {
       config,
       Some("session-1"),
       jsonrpc.latest_protocol_version,
+      capabilities.none(),
       request,
       fn(_, _, _) { Error(transport.UnexpectedResponse("wrong runner")) },
-      fn(http_config, session_id, protocol_version, incoming_request) {
+      fn(
+        http_config,
+        session_id,
+        protocol_version,
+        _capabilities,
+        incoming_request,
+      ) {
         should.equal(
           http_config,
           transport.HttpConfig("https://example.com", [], Some(5000)),
@@ -137,10 +145,10 @@ pub fn initialize_sends_requests_and_notification_test() {
             _ -> panic
           }
         },
-        streamable_request: fn(_, _, _, _) {
+        streamable_request: fn(_, _, _, _, _) {
           Error(transport.UnexpectedResponse("wrong runner"))
         },
-        streamable_notification: fn(_, _, _, _) {
+        streamable_notification: fn(_, _, _, _, _) {
           Error(transport.UnexpectedResponse("wrong runner"))
         },
       ),
@@ -162,7 +170,7 @@ pub fn initialize_persists_http_session_id_test() {
         stdio_notification: fn(_, _, _) {
           Error(transport.UnexpectedResponse("wrong runner"))
         },
-        streamable_request: fn(_, session_id, _, request) {
+        streamable_request: fn(_, session_id, _, _, request) {
           should.equal(session_id, None)
 
           case request {
@@ -179,7 +187,7 @@ pub fn initialize_persists_http_session_id_test() {
             _ -> panic
           }
         },
-        streamable_notification: fn(_, session_id, _, request) {
+        streamable_notification: fn(_, session_id, _, _, request) {
           should.equal(session_id, Some("session-1"))
 
           case request {
@@ -215,7 +223,7 @@ pub fn initialize_keeps_http_session_id_when_notification_returns_none_test() {
         stdio_notification: fn(_, _, _) {
           Error(transport.UnexpectedResponse("wrong runner"))
         },
-        streamable_request: fn(_, session_id, _, request) {
+        streamable_request: fn(_, session_id, _, _, request) {
           should.equal(session_id, None)
 
           case request {
@@ -232,7 +240,7 @@ pub fn initialize_keeps_http_session_id_when_notification_returns_none_test() {
             _ -> panic
           }
         },
-        streamable_notification: fn(_, session_id, _, request) {
+        streamable_notification: fn(_, session_id, _, _, request) {
           should.equal(session_id, Some("session-1"))
 
           case request {
@@ -274,10 +282,10 @@ pub fn initialize_returns_rpc_errors_test() {
         stdio_notification: fn(_, _, _) {
           transport_ok(jsonrpc.ResultResponse(jsonrpc.StringId("notif-1"), Nil))
         },
-        streamable_request: fn(_, _, _, _) {
+        streamable_request: fn(_, _, _, _, _) {
           Error(transport.UnexpectedResponse("wrong runner"))
         },
-        streamable_notification: fn(_, _, _, _) {
+        streamable_notification: fn(_, _, _, _, _) {
           Error(transport.UnexpectedResponse("wrong runner"))
         },
       ),
@@ -302,10 +310,10 @@ pub fn initialize_rejects_unexpected_result_variants_test() {
         stdio_notification: fn(_, _, _) {
           transport_ok(jsonrpc.ResultResponse(jsonrpc.StringId("notif-1"), Nil))
         },
-        streamable_request: fn(_, _, _, _) {
+        streamable_request: fn(_, _, _, _, _) {
           Error(transport.UnexpectedResponse("wrong runner"))
         },
-        streamable_notification: fn(_, _, _, _) {
+        streamable_notification: fn(_, _, _, _, _) {
           Error(transport.UnexpectedResponse("wrong runner"))
         },
       ),
@@ -334,10 +342,10 @@ pub fn initialize_surfaces_notification_errors_test() {
           ))
         },
         stdio_notification: fn(_, _, _) { Error(transport.TimeoutError) },
-        streamable_request: fn(_, _, _, _) {
+        streamable_request: fn(_, _, _, _, _) {
           Error(transport.UnexpectedResponse("wrong runner"))
         },
-        streamable_notification: fn(_, _, _, _) {
+        streamable_notification: fn(_, _, _, _, _) {
           Error(transport.UnexpectedResponse("wrong runner"))
         },
       ),
@@ -369,10 +377,10 @@ pub fn ping_returns_success_test() {
         stdio_notification: fn(_, _, _) {
           transport_ok(jsonrpc.ResultResponse(jsonrpc.StringId("notif-1"), Nil))
         },
-        streamable_request: fn(_, _, _, _) {
+        streamable_request: fn(_, _, _, _, _) {
           Error(transport.UnexpectedResponse("wrong runner"))
         },
-        streamable_notification: fn(_, _, _, _) {
+        streamable_notification: fn(_, _, _, _, _) {
           Error(transport.UnexpectedResponse("wrong runner"))
         },
       ),
@@ -397,10 +405,10 @@ pub fn ping_returns_rpc_errors_test() {
         stdio_notification: fn(_, _, _) {
           transport_ok(jsonrpc.ResultResponse(jsonrpc.StringId("notif-1"), Nil))
         },
-        streamable_request: fn(_, _, _, _) {
+        streamable_request: fn(_, _, _, _, _) {
           Error(transport.UnexpectedResponse("wrong runner"))
         },
-        streamable_notification: fn(_, _, _, _) {
+        streamable_notification: fn(_, _, _, _, _) {
           Error(transport.UnexpectedResponse("wrong runner"))
         },
       ),
@@ -441,10 +449,10 @@ pub fn list_tools_returns_typed_result_test() {
         stdio_notification: fn(_, _, _) {
           transport_ok(jsonrpc.ResultResponse(jsonrpc.StringId("notif-1"), Nil))
         },
-        streamable_request: fn(_, _, _, _) {
+        streamable_request: fn(_, _, _, _, _) {
           Error(transport.UnexpectedResponse("wrong runner"))
         },
-        streamable_notification: fn(_, _, _, _) {
+        streamable_notification: fn(_, _, _, _, _) {
           Error(transport.UnexpectedResponse("wrong runner"))
         },
       ),
@@ -469,10 +477,10 @@ pub fn list_tools_rejects_unexpected_result_variants_test() {
         stdio_notification: fn(_, _, _) {
           transport_ok(jsonrpc.ResultResponse(jsonrpc.StringId("notif-1"), Nil))
         },
-        streamable_request: fn(_, _, _, _) {
+        streamable_request: fn(_, _, _, _, _) {
           Error(transport.UnexpectedResponse("wrong runner"))
         },
-        streamable_notification: fn(_, _, _, _) {
+        streamable_notification: fn(_, _, _, _, _) {
           Error(transport.UnexpectedResponse("wrong runner"))
         },
       ),
@@ -516,10 +524,10 @@ pub fn set_logging_level_accepts_empty_results_test() {
         stdio_notification: fn(_, _, _) {
           transport_ok(jsonrpc.ResultResponse(jsonrpc.StringId("notif-1"), Nil))
         },
-        streamable_request: fn(_, _, _, _) {
+        streamable_request: fn(_, _, _, _, _) {
           Error(transport.UnexpectedResponse("wrong runner"))
         },
-        streamable_notification: fn(_, _, _, _) {
+        streamable_notification: fn(_, _, _, _, _) {
           Error(transport.UnexpectedResponse("wrong runner"))
         },
       ),
@@ -557,10 +565,10 @@ pub fn call_tool_accepts_regular_results_test() {
         stdio_notification: fn(_, _, _) {
           transport_ok(jsonrpc.ResultResponse(jsonrpc.StringId("notif-1"), Nil))
         },
-        streamable_request: fn(_, _, _, _) {
+        streamable_request: fn(_, _, _, _, _) {
           Error(transport.UnexpectedResponse("wrong runner"))
         },
-        streamable_notification: fn(_, _, _, _) {
+        streamable_notification: fn(_, _, _, _, _) {
           Error(transport.UnexpectedResponse("wrong runner"))
         },
       ),
@@ -587,10 +595,10 @@ pub fn call_tool_accepts_task_results_test() {
         stdio_notification: fn(_, _, _) {
           transport_ok(jsonrpc.ResultResponse(jsonrpc.StringId("notif-1"), Nil))
         },
-        streamable_request: fn(_, _, _, _) {
+        streamable_request: fn(_, _, _, _, _) {
           Error(transport.UnexpectedResponse("wrong runner"))
         },
-        streamable_notification: fn(_, _, _, _) {
+        streamable_notification: fn(_, _, _, _, _) {
           Error(transport.UnexpectedResponse("wrong runner"))
         },
       ),
@@ -636,10 +644,10 @@ pub fn progress_sends_notification_params_test() {
             _ -> panic
           }
         },
-        streamable_request: fn(_, _, _, _) {
+        streamable_request: fn(_, _, _, _, _) {
           Error(transport.UnexpectedResponse("wrong runner"))
         },
-        streamable_notification: fn(_, _, _, _) {
+        streamable_notification: fn(_, _, _, _, _) {
           Error(transport.UnexpectedResponse("wrong runner"))
         },
       ),
@@ -676,10 +684,10 @@ pub fn roots_list_changed_sends_notification_test() {
             _ -> panic
           }
         },
-        streamable_request: fn(_, _, _, _) {
+        streamable_request: fn(_, _, _, _, _) {
           Error(transport.UnexpectedResponse("wrong runner"))
         },
-        streamable_notification: fn(_, _, _, _) {
+        streamable_notification: fn(_, _, _, _, _) {
           Error(transport.UnexpectedResponse("wrong runner"))
         },
       ),

@@ -100,6 +100,39 @@ pub fn initialized(client: Client) -> #(Client, Result(Nil, ClientError)) {
   send_notification(client, mcp.method_initialized, None)
 }
 
+pub fn listen(client: Client) -> #(Client, Result(Nil, ClientError)) {
+  let Client(
+    transport_config: transport_config,
+    capabilities: capability_config,
+    protocol_version: protocol_version,
+    session_id: session_id,
+    ..,
+  ) = client
+
+  case transport_config {
+    transport.Http(http_config) ->
+      case
+        transport.streamable_http_listen(
+          http_config,
+          session_id,
+          protocol_version,
+          capability_config,
+        )
+      {
+        Ok(next_session_id) -> #(set_runtime(client, next_session_id), Ok(Nil))
+        Error(error) -> #(client, Error(Transport(error)))
+      }
+    transport.Stdio(_) -> #(
+      client,
+      Error(
+        Transport(transport.UnexpectedResponse(
+          "Listening for server-sent requests is only supported over HTTP",
+        )),
+      ),
+    )
+  }
+}
+
 pub fn list_resources(
   client: Client,
   params: Option(actions.PaginatedRequestParams),
@@ -557,9 +590,9 @@ fn send_request(
   let Client(
     transport_config: transport_config,
     runners: runners,
+    capabilities: capability_config,
     protocol_version: protocol_version,
     session_id: session_id,
-    ..,
   ) = client
 
   let transport.Runners(
@@ -573,6 +606,7 @@ fn send_request(
       transport_config,
       session_id,
       protocol_version,
+      capability_config,
       method,
       params,
       stdio_request,
@@ -595,9 +629,9 @@ fn send_notification(
   let Client(
     transport_config: transport_config,
     runners: runners,
+    capabilities: capability_config,
     protocol_version: protocol_version,
     session_id: session_id,
-    ..,
   ) = client
 
   let transport.Runners(
@@ -613,6 +647,7 @@ fn send_notification(
       transport_config,
       session_id,
       protocol_version,
+      capability_config,
       notification,
       stdio_request,
       streamable_request,
@@ -630,6 +665,7 @@ fn send(
   transport_config: transport.Config,
   session_id: Option(String),
   protocol_version: String,
+  capability_config: capabilities.Config,
   method: String,
   params: Option(action),
   stdio_request: fn(transport.StdioConfig, Option(String), Request(action)) ->
@@ -638,6 +674,7 @@ fn send(
     transport.HttpConfig,
     Option(String),
     String,
+    capabilities.Config,
     Request(action),
   ) ->
     Result(transport.TransportResponse(result), transport.TransportError),
@@ -648,6 +685,7 @@ fn send(
     transport_config,
     session_id,
     protocol_version,
+    capability_config,
     request,
     stdio_request,
     streamable_request,
@@ -658,6 +696,7 @@ fn send_message(
   transport_config: transport.Config,
   session_id: Option(String),
   protocol_version: String,
+  capability_config: capabilities.Config,
   request: Request(action),
   stdio_request: fn(transport.StdioConfig, Option(String), Request(action)) ->
     Result(transport.TransportResponse(result), transport.TransportError),
@@ -665,6 +704,7 @@ fn send_message(
     transport.HttpConfig,
     Option(String),
     String,
+    capabilities.Config,
     Request(action),
   ) ->
     Result(transport.TransportResponse(result), transport.TransportError),
@@ -673,6 +713,7 @@ fn send_message(
     transport_config,
     session_id,
     protocol_version,
+    capability_config,
     request,
     stdio_request,
     streamable_request,
