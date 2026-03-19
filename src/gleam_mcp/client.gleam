@@ -288,7 +288,7 @@ pub fn list_tools(
 pub fn call_tool(
   client: Client,
   params: actions.CallToolRequestParams,
-) -> #(Client, Result(actions.ActionResult, ClientError)) {
+) -> #(Client, Result(actions.CallToolResult, ClientError)) {
   send_request(
     client,
     mcp.method_call_tool,
@@ -296,8 +296,7 @@ pub fn call_tool(
   )
   |> expect_result("tools/call", fn(result) {
     case result {
-      actions.ResultCallTool(_) -> Some(result)
-      actions.ResultCreateTask(_) -> Some(result)
+      actions.ResultCallTool(res) -> Some(res)
       _ -> None
     }
   })
@@ -352,7 +351,7 @@ pub fn list_roots(
 pub fn create_message(
   client: Client,
   params: actions.CreateMessageRequestParams,
-) -> #(Client, Result(actions.ActionResult, ClientError)) {
+) -> #(Client, Result(actions.CreateMessageResult, ClientError)) {
   send_request(
     client,
     mcp.method_create_message,
@@ -360,8 +359,7 @@ pub fn create_message(
   )
   |> expect_result("sampling/createMessage", fn(result) {
     case result {
-      actions.ResultCreateMessage(_) -> Some(result)
-      actions.ResultCreateTask(_) -> Some(result)
+      actions.ResultCreateMessage(res) -> Some(res)
       _ -> None
     }
   })
@@ -370,12 +368,11 @@ pub fn create_message(
 pub fn elicit(
   client: Client,
   params: actions.ElicitRequestParams,
-) -> #(Client, Result(actions.ActionResult, ClientError)) {
+) -> #(Client, Result(actions.ElicitResult, ClientError)) {
   send_request(client, mcp.method_elicit, Some(actions.RequestElicit(params)))
   |> expect_result("elicitation/create", fn(result) {
     case result {
-      actions.ResultElicit(_) -> Some(result)
-      actions.ResultCreateTask(_) -> Some(result)
+      actions.ResultElicit(res) -> Some(res)
       _ -> None
     }
   })

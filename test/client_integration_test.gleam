@@ -127,10 +127,9 @@ fn basic_request_with_transport(config: transport.Config) {
     )
 
   case call_result |> should.be_ok {
-    actions.ResultCallTool(actions.CallToolResult(content:, ..)) -> {
+    actions.CallToolResult(content:, ..) -> {
       should.be_true(has_text_content(content, "Echo: hello"))
     }
-    _ -> should.fail()
   }
 }
 
@@ -270,7 +269,7 @@ pub fn elicitation_server_sent_roundtrip_http_test() {
     )
 
   case call_result {
-    Ok(actions.ResultCallTool(actions.CallToolResult(content:, ..))) ->
+    Ok(actions.CallToolResult(content:, ..)) ->
       should.be_true(has_text_content(
         content,
         "Elicited: elicited for Please provide a value for requst roundtrip-elicitation",
@@ -285,7 +284,7 @@ pub fn elicitation_server_sent_roundtrip_http_test() {
     )
 
   case call_result {
-    Ok(actions.ResultCallTool(actions.CallToolResult(content:, ..))) ->
+    Ok(actions.CallToolResult(content:, ..)) ->
       should.be_true(has_text_content(
         content,
         "Elicited: elicited for Please provide a value for requst roundtrip-elicitation-1",
@@ -339,7 +338,7 @@ pub fn sampling_server_sent_roundtrip_http_test() {
     )
 
   case call_result {
-    Ok(actions.ResultCallTool(actions.CallToolResult(content:, ..))) ->
+    Ok(actions.CallToolResult(content:, ..)) ->
       should.be_true(has_text_content(content, "Sampled: sampled value"))
     _ -> panic as string.inspect(call_result)
   }
@@ -381,7 +380,7 @@ pub fn elicitation_server_sent_roundtrip_stdio_test() {
     )
 
   case call_result {
-    Ok(actions.ResultCallTool(actions.CallToolResult(content:, ..))) ->
+    Ok(actions.CallToolResult(content:, ..)) ->
       should.be_true(has_text_content(
         content,
         "Elicited: elicited for Please provide a value for requst roundtrip-elicitation",
@@ -430,7 +429,7 @@ pub fn sampling_server_sent_roundtrip_stdio_test() {
     )
 
   case call_result {
-    Ok(actions.ResultCallTool(actions.CallToolResult(content:, ..))) ->
+    Ok(actions.CallToolResult(content:, ..)) ->
       should.be_true(has_text_content(content, "Sampled: sampled value"))
     _ -> panic as string.inspect(call_result)
   }

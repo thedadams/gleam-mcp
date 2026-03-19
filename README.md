@@ -10,9 +10,11 @@ This repository is a work in progress.
 - [x] Basic server functionality for Streamable HTTP, excluding tasks
 - [x] Basic server functionality for STDIO, excluding tasks
 - [ ] Task support for servers
+- [ ] Task support for clients
 - [ ] OAuth support for Streamable HTTP clients
 - [ ] OAuth support for Streamable HTTP servers
 - [x] Support for server sent requests for Streamable HTTP
 - [x] Support for server sent requests for STDIO
 - [ ] Support for cancellation in both directions
 - [ ] Restart HTTP GET for server-sent requests
+- [ ] Convenience functions for processing requests and responses

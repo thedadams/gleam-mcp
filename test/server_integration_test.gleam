@@ -109,7 +109,7 @@ pub fn client_can_talk_to_sdk_http_server_test() {
     )
 
   case tool_result |> should.be_ok {
-    actions.ResultCallTool(result) -> {
+    result -> {
       should.be_true(
         list.any(result.content, fn(block) {
           case block {
@@ -120,7 +120,6 @@ pub fn client_can_talk_to_sdk_http_server_test() {
         }),
       )
     }
-    _ -> should.fail()
   }
 
   let #(app_client, complete_result) =
@@ -207,7 +206,7 @@ pub fn client_can_talk_to_sdk_stdio_server_test() {
     )
 
   case tool_result |> should.be_ok {
-    actions.ResultCallTool(result) -> {
+    result -> {
       should.be_true(
         list.any(result.content, fn(block) {
           case block {
@@ -218,7 +217,6 @@ pub fn client_can_talk_to_sdk_stdio_server_test() {
         }),
       )
     }
-    _ -> should.fail()
   }
 
   let #(_, logging_result) =
