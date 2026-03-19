@@ -29,10 +29,15 @@ pub type CompletionHandler =
 pub type LoggingHandler =
   fn(actions.SetLevelRequestParams) -> Result(Nil, jsonrpc.RpcError)
 
+pub type HeaderAuthorization {
+  HeaderAuthorization(header: String, validate: fn(String) -> Bool)
+}
+
 pub opaque type Server {
   Server(
     implementation: actions.Implementation,
     instructions: Option(String),
+    authorization: Option(HeaderAuthorization),
     tools: List(RegisteredTool),
     resources: List(RegisteredResource),
     resource_templates: List(RegisteredResourceTemplate),
@@ -62,12 +67,13 @@ type RegisteredPrompt {
 }
 
 pub fn new(implementation: actions.Implementation) -> Server {
-  Server(implementation, None, [], [], [], [], None, None)
+  Server(implementation, None, None, [], [], [], [], None, None)
 }
 
 pub fn with_instructions(server: Server, instructions: String) -> Server {
   let Server(
     implementation: implementation,
+    authorization: authorization,
     tools: tools,
     resources: resources,
     resource_templates: resource_templates,
@@ -80,6 +86,7 @@ pub fn with_instructions(server: Server, instructions: String) -> Server {
   Server(
     implementation,
     Some(instructions),
+    authorization,
     tools,
     resources,
     resource_templates,
@@ -87,6 +94,41 @@ pub fn with_instructions(server: Server, instructions: String) -> Server {
     completion_handler,
     logging_handler,
   )
+}
+
+pub fn with_header_authorization(
+  server: Server,
+  header: String,
+  validate: fn(String) -> Bool,
+) -> Server {
+  let Server(
+    implementation: implementation,
+    instructions: instructions,
+    tools: tools,
+    resources: resources,
+    resource_templates: resource_templates,
+    prompts: prompts,
+    completion_handler: completion_handler,
+    logging_handler: logging_handler,
+    ..,
+  ) = server
+
+  Server(
+    implementation,
+    instructions,
+    Some(HeaderAuthorization(header, validate)),
+    tools,
+    resources,
+    resource_templates,
+    prompts,
+    completion_handler,
+    logging_handler,
+  )
+}
+
+pub fn header_authorization(server: Server) -> Option(HeaderAuthorization) {
+  let Server(authorization: authorization, ..) = server
+  authorization
 }
 
 pub fn add_tool(
@@ -112,6 +154,7 @@ pub fn add_tool(
   let Server(
     implementation: server_info,
     instructions: instructions,
+    authorization: authorization,
     tools: tools,
     resources: resources,
     resource_templates: resource_templates,
@@ -123,6 +166,7 @@ pub fn add_tool(
   Server(
     server_info,
     instructions,
+    authorization,
     [RegisteredTool(tool, implementation), ..tools],
     resources,
     resource_templates,
@@ -156,6 +200,7 @@ pub fn add_resource(
   let Server(
     implementation: server_info,
     instructions: instructions,
+    authorization: authorization,
     tools: tools,
     resources: resources,
     resource_templates: resource_templates,
@@ -167,6 +212,7 @@ pub fn add_resource(
   Server(
     server_info,
     instructions,
+    authorization,
     tools,
     [RegisteredResource(resource, implementation), ..resources],
     resource_templates,
@@ -199,6 +245,7 @@ pub fn add_resource_template(
   let Server(
     implementation: server_info,
     instructions: instructions,
+    authorization: authorization,
     tools: tools,
     resources: resources,
     resource_templates: resource_templates,
@@ -210,6 +257,7 @@ pub fn add_resource_template(
   Server(
     server_info,
     instructions,
+    authorization,
     tools,
     resources,
     [
@@ -242,6 +290,7 @@ pub fn add_prompt(
   let Server(
     implementation: server_info,
     instructions: instructions,
+    authorization: authorization,
     tools: tools,
     resources: resources,
     resource_templates: resource_templates,
@@ -253,6 +302,7 @@ pub fn add_prompt(
   Server(
     server_info,
     instructions,
+    authorization,
     tools,
     resources,
     resource_templates,
@@ -269,6 +319,7 @@ pub fn set_completion_handler(
   let Server(
     implementation: implementation,
     instructions: instructions,
+    authorization: authorization,
     tools: tools,
     resources: resources,
     resource_templates: resource_templates,
@@ -280,6 +331,7 @@ pub fn set_completion_handler(
   Server(
     implementation,
     instructions,
+    authorization,
     tools,
     resources,
     resource_templates,
@@ -293,6 +345,7 @@ pub fn set_logging_handler(server: Server, handler: LoggingHandler) -> Server {
   let Server(
     implementation: implementation,
     instructions: instructions,
+    authorization: authorization,
     tools: tools,
     resources: resources,
     resource_templates: resource_templates,
@@ -304,6 +357,7 @@ pub fn set_logging_handler(server: Server, handler: LoggingHandler) -> Server {
   Server(
     implementation,
     instructions,
+    authorization,
     tools,
     resources,
     resource_templates,

@@ -3,7 +3,7 @@ import gleam/bytes_tree
 import gleam/http
 import gleam/http/request
 import gleam/http/response
-import gleam/option.{Some}
+import gleam/option.{None, Some}
 import gleam/string
 import gleam_mcp/jsonrpc
 import gleam_mcp/server
@@ -33,11 +33,30 @@ fn handle(
   req: request.Request(mist.Connection),
   max_body_bytes: Int,
 ) -> response.Response(mist.ResponseData) {
-  let request.Request(method: method, ..) = req
+  case authorize_request(server, req) {
+    False -> plain_response(401, "Unauthorized")
+    True -> {
+      let request.Request(method: method, ..) = req
 
-  case method {
-    http.Post -> handle_post(server, req, max_body_bytes)
-    _ -> plain_response(405, "Method Not Allowed")
+      case method {
+        http.Post -> handle_post(server, req, max_body_bytes)
+        _ -> plain_response(405, "Method Not Allowed")
+      }
+    }
+  }
+}
+
+fn authorize_request(
+  server: server.Server,
+  req: request.Request(mist.Connection),
+) -> Bool {
+  case server.header_authorization(server) {
+    None -> True
+    Some(server.HeaderAuthorization(header, validate)) ->
+      case request.get_header(req, header) {
+        Ok(value) -> validate(value)
+        Error(_) -> False
+      }
   }
 }
 

@@ -3,12 +3,18 @@ import gleam/int
 import gleam/option.{None}
 import gleam_mcp/actions
 import gleam_mcp/examples/example_server
+import gleam_mcp/server
 import gleam_mcp/server/streamable_http
 import mist
 
 pub fn start_http_server() -> String {
+  start_http_server_with_server(example_server.sample_server())
+}
+
+pub fn start_http_server_with_server(app_server: server.Server) -> String {
   let reply_to = process.new_subject()
-  let _pid = process.spawn(fn() { start_http_server_process(reply_to) })
+  let _pid =
+    process.spawn(fn() { start_http_server_process(reply_to, app_server) })
 
   case process.receive(reply_to, 1000) {
     Ok(port) -> "http://127.0.0.1:" <> int.to_string(port) <> "/mcp"
@@ -27,9 +33,12 @@ pub fn sample_client_info() -> actions.Implementation {
   )
 }
 
-fn start_http_server_process(reply_to: process.Subject(Int)) {
+fn start_http_server_process(
+  reply_to: process.Subject(Int),
+  app_server: server.Server,
+) {
   let builder =
-    mist.new(streamable_http.handler(example_server.sample_server()))
+    mist.new(streamable_http.handler(app_server))
     |> mist.bind("127.0.0.1")
     |> mist.port(0)
     |> mist.after_start(fn(port, _, _) { process.send(reply_to, port) })

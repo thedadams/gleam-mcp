@@ -6,7 +6,9 @@ import gleam_mcp/actions
 import gleam_mcp/client
 import gleam_mcp/client/capabilities
 import gleam_mcp/client/transport
+import gleam_mcp/examples/example_server
 import gleam_mcp/jsonrpc
+import gleam_mcp/server
 import gleeunit
 import gleeunit/should
 import server_test_support
@@ -225,4 +227,56 @@ pub fn client_can_talk_to_sdk_stdio_server_test() {
       actions.SetLevelRequestParams(actions.Info, None),
     )
   logging_result |> should.equal(Ok(Nil))
+}
+
+pub fn http_server_rejects_requests_with_invalid_authorization_header_test() {
+  let base_url =
+    server_test_support.start_http_server_with_server(authorized_server(
+      "x-api-key",
+      "secret",
+    ))
+
+  let app_client =
+    client.new(
+      transport.Http(transport.HttpConfig(base_url, [], Some(5000))),
+      capabilities.none(),
+    )
+
+  case client.initialize(app_client, server_test_support.sample_client_info()) {
+    Error(client.Transport(transport.HttpError(message))) ->
+      should.be_true(string.contains(message, "status 401"))
+    _ -> should.fail()
+  }
+}
+
+pub fn http_server_accepts_requests_with_valid_authorization_header_test() {
+  let base_url =
+    server_test_support.start_http_server_with_server(authorized_server(
+      "x-api-key",
+      "secret",
+    ))
+
+  let app_client =
+    client.new(
+      transport.Http(transport.HttpConfig(
+        base_url,
+        [#("x-api-key", "secret")],
+        Some(5000),
+      )),
+      capabilities.none(),
+    )
+
+  let #(_, initialized) = case
+    client.initialize(app_client, server_test_support.sample_client_info())
+  {
+    Ok(value) -> value
+    Error(error) -> panic as string.inspect(error)
+  }
+
+  should.equal(initialized.server_info.name, "gleam-mcp-test-server")
+}
+
+fn authorized_server(header: String, token: String) -> server.Server {
+  example_server.sample_server()
+  |> server.with_header_authorization(header, fn(value) { value == token })
 }
