@@ -64,13 +64,21 @@ pub type TransportResponse(result) {
 
 pub type Runners {
   Runners(
-    stdio_request: fn(StdioConfig, Option(String), Request(ActionRequest)) ->
+    stdio_request: fn(
+      StdioConfig,
+      Option(String),
+      capabilities.Config,
+      Request(ActionRequest),
+    ) ->
       Result(TransportResponse(ActionResult), TransportError),
     stdio_notification: fn(
       StdioConfig,
       Option(String),
+      capabilities.Config,
       Request(ActionNotification),
     ) ->
+      Result(TransportResponse(Nil), TransportError),
+    stdio_listen: fn(StdioConfig, Option(String), capabilities.Config) ->
       Result(TransportResponse(Nil), TransportError),
     streamable_request: fn(
       HttpConfig,
@@ -95,11 +103,26 @@ pub fn default_runners() -> Runners {
   let manager = stdio_manager.start()
 
   Runners(
-    stdio_request: fn(config, session_id, message) {
-      stdio_process_request(manager, config, session_id, message)
+    stdio_request: fn(config, session_id, capability_config, message) {
+      stdio_process_request(
+        manager,
+        config,
+        session_id,
+        capability_config,
+        message,
+      )
     },
-    stdio_notification: fn(config, session_id, message) {
-      stdio_process_notification(manager, config, session_id, message)
+    stdio_notification: fn(config, session_id, capability_config, message) {
+      stdio_process_notification(
+        manager,
+        config,
+        session_id,
+        capability_config,
+        message,
+      )
+    },
+    stdio_listen: fn(config, session_id, capability_config) {
+      stdio_listen(manager, config, session_id, capability_config)
     },
     streamable_request: fn(
       config,
@@ -143,7 +166,12 @@ pub fn send_request(
   protocol_version: String,
   capability_config: capabilities.Config,
   request: Request(action),
-  stdio_request: fn(StdioConfig, Option(String), Request(action)) ->
+  stdio_request: fn(
+    StdioConfig,
+    Option(String),
+    capabilities.Config,
+    Request(action),
+  ) ->
     Result(TransportResponse(action_result), TransportError),
   streamable_request: fn(
     HttpConfig,
@@ -155,7 +183,8 @@ pub fn send_request(
     Result(TransportResponse(action_result), TransportError),
 ) -> Result(TransportResponse(action_result), TransportError) {
   case config {
-    Stdio(stdio_config) -> stdio_request(stdio_config, session_id, request)
+    Stdio(stdio_config) ->
+      stdio_request(stdio_config, session_id, capability_config, request)
     Http(http_config) ->
       streamable_request(
         http_config,
@@ -171,6 +200,7 @@ fn stdio_process_request(
   manager: stdio_manager.Manager,
   config: StdioConfig,
   session_id: Option(String),
+  capability_config: capabilities.Config,
   message: Request(ActionRequest),
 ) -> Result(TransportResponse(ActionResult), TransportError) {
   use #(response_payload, next_session_id) <- result.try(
@@ -178,6 +208,7 @@ fn stdio_process_request(
       manager,
       to_stdio_manager_config(config),
       session_id,
+      capability_config,
       client_codec.encode_request(message),
     )
     |> result.map_error(map_stdio_error),
@@ -194,13 +225,33 @@ fn stdio_process_notification(
   manager: stdio_manager.Manager,
   config: StdioConfig,
   session_id: Option(String),
+  capability_config: capabilities.Config,
   message: Request(ActionNotification),
 ) -> Result(TransportResponse(Nil), TransportError) {
   stdio_manager.notification(
     manager,
     to_stdio_manager_config(config),
     session_id,
+    capability_config,
     client_codec.encode_notification(message),
+  )
+  |> result.map_error(map_stdio_error)
+  |> result.map(fn(next_session_id) {
+    TransportResponse(response: jsonrpc_ok(), session_id: next_session_id)
+  })
+}
+
+fn stdio_listen(
+  manager: stdio_manager.Manager,
+  config: StdioConfig,
+  session_id: Option(String),
+  capability_config: capabilities.Config,
+) -> Result(TransportResponse(Nil), TransportError) {
+  stdio_manager.listen(
+    manager,
+    to_stdio_manager_config(config),
+    session_id,
+    capability_config,
   )
   |> result.map_error(map_stdio_error)
   |> result.map(fn(next_session_id) {

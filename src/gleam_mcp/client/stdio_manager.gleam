@@ -2,10 +2,15 @@ import envoy
 import gleam/bit_array
 import gleam/dict
 import gleam/erlang/process
+import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
+import gleam_mcp/client/capabilities
+import gleam_mcp/client/codec as client_codec
+import gleam_mcp/jsonrpc
+import gleam_mcp/server/codec as server_codec
 import sceall
 import youid/uuid
 
@@ -27,13 +32,21 @@ type Command {
   Request(
     config: Config,
     session_id: Option(String),
+    capability_config: capabilities.Config,
     payload: String,
     reply_to: process.Subject(Result(#(String, Option(String)), String)),
   )
   Notification(
     config: Config,
     session_id: Option(String),
+    capability_config: capabilities.Config,
     payload: String,
+    reply_to: process.Subject(Result(Option(String), String)),
+  )
+  Listen(
+    config: Config,
+    session_id: Option(String),
+    capability_config: capabilities.Config,
     reply_to: process.Subject(Result(Option(String), String)),
   )
 }
@@ -46,10 +59,16 @@ type SessionCommand {
   PerformRequest(
     payload: String,
     timeout: Int,
+    capability_config: capabilities.Config,
     reply_to: process.Subject(Result(String, String)),
   )
   PerformNotification(
     payload: String,
+    capability_config: capabilities.Config,
+    reply_to: process.Subject(Result(Nil, String)),
+  )
+  PerformListen(
+    capability_config: capabilities.Config,
     reply_to: process.Subject(Result(Nil, String)),
   )
 }
@@ -57,6 +76,18 @@ type SessionCommand {
 type SessionEvent {
   SessionEvent(SessionCommand)
   PortEvent(sceall.ProgramMessage)
+}
+
+type PendingRequest {
+  PendingRequest(
+    reply_to: process.Subject(Result(String, String)),
+    timeout: Int,
+    capability_config: capabilities.Config,
+  )
+}
+
+type Listener {
+  Listener(capability_config: capabilities.Config)
 }
 
 pub fn start() -> Manager {
@@ -79,6 +110,7 @@ pub fn request(
   manager: Manager,
   config: Config,
   session_id: Option(String),
+  capability_config: capabilities.Config,
   payload: String,
 ) -> Result(#(String, Option(String)), String) {
   let Manager(subject: manager_subject) = manager
@@ -88,6 +120,7 @@ pub fn request(
     Request(
       config: config,
       session_id: session_id,
+      capability_config: capability_config,
       payload: payload,
       reply_to: reply_to,
     ),
@@ -103,6 +136,7 @@ pub fn notification(
   manager: Manager,
   config: Config,
   session_id: Option(String),
+  capability_config: capabilities.Config,
   payload: String,
 ) -> Result(Option(String), String) {
   let Manager(subject: manager_subject) = manager
@@ -112,7 +146,32 @@ pub fn notification(
     Notification(
       config: config,
       session_id: session_id,
+      capability_config: capability_config,
       payload: payload,
+      reply_to: reply_to,
+    ),
+  )
+
+  case process.receive(reply_to, manager_timeout_ms(config)) {
+    Ok(response) -> response
+    Error(Nil) -> Error("timeout")
+  }
+}
+
+pub fn listen(
+  manager: Manager,
+  config: Config,
+  session_id: Option(String),
+  capability_config: capabilities.Config,
+) -> Result(Option(String), String) {
+  let Manager(subject: manager_subject) = manager
+  let reply_to = process.new_subject()
+  process.send(
+    manager_subject,
+    Listen(
+      config: config,
+      session_id: session_id,
+      capability_config: capability_config,
       reply_to: reply_to,
     ),
   )
@@ -125,15 +184,33 @@ pub fn notification(
 
 fn loop(subject: process.Subject(Command), sessions: dict.Dict(String, Session)) {
   case process.receive_forever(subject) {
-    Request(config:, session_id:, payload:, reply_to:) -> {
+    Request(config:, session_id:, capability_config:, payload:, reply_to:) -> {
       let #(next_sessions, response) =
-        perform_request(sessions, config, session_id, payload)
+        perform_request(
+          sessions,
+          config,
+          session_id,
+          capability_config,
+          payload,
+        )
       process.send(reply_to, response)
       loop(subject, next_sessions)
     }
-    Notification(config:, session_id:, payload:, reply_to:) -> {
+    Notification(config:, session_id:, capability_config:, payload:, reply_to:) -> {
       let #(next_sessions, response) =
-        perform_notification(sessions, config, session_id, payload)
+        perform_notification(
+          sessions,
+          config,
+          session_id,
+          capability_config,
+          payload,
+        )
+      process.send(reply_to, response)
+      loop(subject, next_sessions)
+    }
+    Listen(config:, session_id:, capability_config:, reply_to:) -> {
+      let #(next_sessions, response) =
+        perform_listen(sessions, config, session_id, capability_config)
       process.send(reply_to, response)
       loop(subject, next_sessions)
     }
@@ -144,6 +221,7 @@ fn perform_request(
   sessions: dict.Dict(String, Session),
   config: Config,
   session_id: Option(String),
+  capability_config: capabilities.Config,
   payload: String,
 ) -> #(dict.Dict(String, Session), Result(#(String, Option(String)), String)) {
   case ensure_session(sessions, config, session_id) {
@@ -153,7 +231,7 @@ fn perform_request(
       let reply_to = process.new_subject()
       process.send(
         session_subject,
-        PerformRequest(payload, timeout_ms(config), reply_to),
+        PerformRequest(payload, timeout_ms(config), capability_config, reply_to),
       )
 
       case process.receive(reply_to, timeout_ms(config) + 100) {
@@ -179,6 +257,7 @@ fn perform_notification(
   sessions: dict.Dict(String, Session),
   config: Config,
   session_id: Option(String),
+  capability_config: capabilities.Config,
   payload: String,
 ) -> #(dict.Dict(String, Session), Result(Option(String), String)) {
   case ensure_session(sessions, config, session_id) {
@@ -186,7 +265,39 @@ fn perform_notification(
       let assert Ok(Session(subject: session_subject)) =
         dict.get(next_sessions, ensured_session_id)
       let reply_to = process.new_subject()
-      process.send(session_subject, PerformNotification(payload, reply_to))
+      process.send(
+        session_subject,
+        PerformNotification(payload, capability_config, reply_to),
+      )
+
+      case process.receive(reply_to, timeout_ms(config) + 100) {
+        Ok(Ok(Nil)) -> #(next_sessions, Ok(Some(ensured_session_id)))
+        Ok(Error(error)) -> #(
+          dict.delete(next_sessions, ensured_session_id),
+          Error(error),
+        )
+        Error(Nil) -> #(
+          dict.delete(next_sessions, ensured_session_id),
+          Error("timeout"),
+        )
+      }
+    }
+    Error(error) -> #(sessions, Error(error))
+  }
+}
+
+fn perform_listen(
+  sessions: dict.Dict(String, Session),
+  config: Config,
+  session_id: Option(String),
+  capability_config: capabilities.Config,
+) -> #(dict.Dict(String, Session), Result(Option(String), String)) {
+  case ensure_session(sessions, config, session_id) {
+    Ok(#(next_sessions, ensured_session_id)) -> {
+      let assert Ok(Session(subject: session_subject)) =
+        dict.get(next_sessions, ensured_session_id)
+      let reply_to = process.new_subject()
+      process.send(session_subject, PerformListen(capability_config, reply_to))
 
       case process.receive(reply_to, timeout_ms(config) + 100) {
         Ok(Ok(Nil)) -> #(next_sessions, Ok(Some(ensured_session_id)))
@@ -244,7 +355,7 @@ fn session_worker(
   case start_program(config) {
     Ok(handle) -> {
       process.send(ready_to, Ok(subject))
-      session_loop(subject, handle, <<>>)
+      session_loop(subject, handle, <<>>, None, None)
     }
     Error(error) -> process.send(ready_to, Error(error))
   }
@@ -279,51 +390,112 @@ fn session_loop(
   subject: process.Subject(SessionCommand),
   handle: sceall.ProgramHandle,
   buffer: BitArray,
+  pending: Option(PendingRequest),
+  listener: Option(Listener),
 ) {
   let selector =
     process.new_selector()
     |> process.select_map(subject, SessionEvent)
     |> sceall.select(handle, PortEvent)
 
-  case process.selector_receive_forever(selector) {
-    SessionEvent(PerformRequest(payload, timeout, reply_to)) -> {
-      case sceall.send(handle, bit_array.from_string(payload <> "\n")) {
-        Ok(Nil) ->
-          case read_line(subject, handle, buffer, timeout) {
-            Ok(#(line, next_buffer)) -> {
-              process.send(reply_to, Ok(line))
-              session_loop(subject, handle, next_buffer)
-            }
-            Error(error) -> process.send(reply_to, Error(error))
+  let event = case pending {
+    Some(PendingRequest(timeout:, ..)) ->
+      process.selector_receive(selector, timeout)
+    None -> process.selector_receive_forever(selector) |> Ok
+  }
+
+  case event {
+    Error(Nil) -> notify_pending_error(pending, "timeout")
+    Ok(SessionEvent(PerformRequest(
+      payload,
+      timeout,
+      capability_config,
+      reply_to,
+    ))) ->
+      case pending {
+        Some(_) -> {
+          process.send(reply_to, Error("Stdio transport is busy"))
+          session_loop(subject, handle, buffer, pending, listener)
+        }
+        None ->
+          case sceall.send(handle, bit_array.from_string(payload <> "\n")) {
+            Ok(Nil) ->
+              session_loop(
+                subject,
+                handle,
+                buffer,
+                Some(PendingRequest(reply_to, timeout, capability_config)),
+                listener,
+              )
+            Error(_) ->
+              process.send(reply_to, Error("Stdio transport process exited"))
           }
-        Error(_) ->
-          process.send(reply_to, Error("Stdio transport process exited"))
       }
-    }
-    SessionEvent(PerformNotification(payload, reply_to)) -> {
+    Ok(SessionEvent(PerformNotification(payload, _capability_config, reply_to))) ->
       case sceall.send(handle, bit_array.from_string(payload <> "\n")) {
         Ok(Nil) -> {
           process.send(reply_to, Ok(Nil))
-          session_loop(subject, handle, buffer)
+          session_loop(subject, handle, buffer, pending, listener)
         }
         Error(_) ->
           process.send(reply_to, Error("Stdio transport process exited"))
       }
+    Ok(SessionEvent(PerformListen(capability_config, reply_to))) ->
+      case listener {
+        Some(_) -> {
+          process.send(
+            reply_to,
+            Error("Stdio transport listener already active"),
+          )
+          session_loop(subject, handle, buffer, pending, listener)
+        }
+        None -> {
+          process.send(reply_to, Ok(Nil))
+          session_loop(
+            subject,
+            handle,
+            buffer,
+            pending,
+            Some(Listener(capability_config)),
+          )
+        }
+      }
+    Ok(PortEvent(sceall.Data(_, data))) ->
+      case
+        process_output(
+          subject,
+          handle,
+          bit_array.append(to: buffer, suffix: data),
+          pending,
+          listener,
+        )
+      {
+        Ok(#(next_buffer, next_pending, next_listener)) ->
+          session_loop(
+            subject,
+            handle,
+            next_buffer,
+            next_pending,
+            next_listener,
+          )
+        Error(error) -> notify_pending_error(pending, error)
+      }
+    Ok(PortEvent(sceall.Exited(_, _))) -> {
+      notify_pending_error(pending, "Stdio transport process exited")
     }
-    PortEvent(sceall.Data(_, data)) -> {
-      session_loop(subject, handle, bit_array.append(to: buffer, suffix: data))
-    }
-    PortEvent(sceall.Exited(_, _)) -> Nil
   }
 }
 
-fn read_line(
+fn process_output(
   subject: process.Subject(SessionCommand),
   handle: sceall.ProgramHandle,
   buffer: BitArray,
-  timeout: Int,
-) -> Result(#(String, BitArray), String) {
+  pending: Option(PendingRequest),
+  listener: Option(Listener),
+) -> Result(#(BitArray, Option(PendingRequest), Option(Listener)), String) {
+  let _ = subject
   case split_line(buffer) {
+    Error(Nil) -> Ok(#(buffer, pending, listener))
     Ok(#(line_data, rest)) -> {
       use line <- result.try(
         bit_array.to_string(line_data)
@@ -331,46 +503,102 @@ fn read_line(
           "Stdio transport process emitted invalid UTF-8"
         }),
       )
-
       let line = trim_carriage_return(line)
-      case string.starts_with(string.trim(line), "{") {
-        True ->
-          case looks_like_jsonrpc_response(line) {
-            True -> Ok(#(line, rest))
-            False -> read_line(subject, handle, rest, timeout)
-          }
-        False -> read_line(subject, handle, rest, timeout)
-      }
-    }
-    Error(Nil) -> {
-      let selector =
-        process.new_selector()
-        |> process.select_map(subject, SessionEvent)
-        |> sceall.select(handle, PortEvent)
-
-      case process.selector_receive(selector, timeout) {
-        Ok(PortEvent(sceall.Data(_, data))) -> {
-          read_line(
-            subject,
-            handle,
-            bit_array.append(to: buffer, suffix: data),
-            timeout,
-          )
-        }
-        Ok(PortEvent(sceall.Exited(_, _))) ->
-          Error("Stdio transport process exited")
-        Ok(SessionEvent(PerformRequest(_, _, reply_to))) -> {
-          process.send(reply_to, Error("Stdio transport is busy"))
-          read_line(subject, handle, buffer, timeout)
-        }
-        Ok(SessionEvent(PerformNotification(_, reply_to))) -> {
-          process.send(reply_to, Error("Stdio transport is busy"))
-          read_line(subject, handle, buffer, timeout)
-        }
-        Error(Nil) -> Error("timeout")
-      }
+      use #(next_pending, next_listener) <- result.try(process_line(
+        handle,
+        line,
+        pending,
+        listener,
+      ))
+      process_output(subject, handle, rest, next_pending, next_listener)
     }
   }
+}
+
+fn process_line(
+  handle: sceall.ProgramHandle,
+  line: String,
+  pending: Option(PendingRequest),
+  listener: Option(Listener),
+) -> Result(#(Option(PendingRequest), Option(Listener)), String) {
+  case string.starts_with(string.trim(line), "{") {
+    False -> Ok(#(pending, listener))
+    True ->
+      case looks_like_jsonrpc_response(line), pending {
+        True, Some(PendingRequest(reply_to:, ..)) -> {
+          process.send(reply_to, Ok(line))
+          Ok(#(None, listener))
+        }
+        _, _ -> handle_server_message(handle, line, pending, listener)
+      }
+  }
+}
+
+fn handle_server_message(
+  handle: sceall.ProgramHandle,
+  line: String,
+  pending: Option(PendingRequest),
+  listener: Option(Listener),
+) -> Result(#(Option(PendingRequest), Option(Listener)), String) {
+  let capability_config = case pending, listener {
+    Some(PendingRequest(capability_config:, ..)), _ -> capability_config
+    None, Some(Listener(capability_config: capability_config)) ->
+      capability_config
+    None, None -> capabilities.none()
+  }
+
+  case client_codec.decode_server_message(line) {
+    Ok(client_codec.ActionRequest(request)) ->
+      case
+        capabilities.handle_request(capability_config, request)
+        |> result.map_error(rpc_error_message)
+      {
+        Ok(response) ->
+          send_server_message(handle, server_codec.encode_response(response))
+          |> result.map(fn(_) { #(pending, listener) })
+        Error(error) -> Error(error)
+      }
+    Ok(client_codec.ActionNotification(notification)) ->
+      capabilities.handle_notification(capability_config, notification)
+      |> result.map_error(rpc_error_message)
+      |> result.map(fn(_) { #(pending, listener) })
+    Ok(client_codec.UnknownRequest(id, method)) ->
+      send_server_message(
+        handle,
+        server_codec.encode_response(jsonrpc.ErrorResponse(
+          Some(id),
+          jsonrpc.method_not_found_error(method),
+        )),
+      )
+      |> result.map(fn(_) { #(pending, listener) })
+    Ok(client_codec.UnknownNotification(_)) -> Ok(#(pending, listener))
+    Error(_) -> Ok(#(pending, listener))
+  }
+}
+
+fn send_server_message(
+  handle: sceall.ProgramHandle,
+  payload: String,
+) -> Result(Nil, String) {
+  sceall.send(handle, bit_array.from_string(payload <> "\n"))
+  |> result.map_error(fn(_) { "Stdio transport process exited" })
+}
+
+fn notify_pending_error(pending: Option(PendingRequest), error: String) {
+  case pending {
+    Some(PendingRequest(reply_to:, ..)) -> process.send(reply_to, Error(error))
+    None -> Nil
+  }
+}
+
+fn rpc_error_message(error: jsonrpc.RpcError) -> String {
+  let jsonrpc.RpcError(code, message, _) = error
+  string.concat([
+    "Stdio server request failed with code ",
+    int.to_string(code),
+    ": ",
+    message,
+  ])
 }
 
 fn split_line(buffer: BitArray) -> Result(#(BitArray, BitArray), Nil) {

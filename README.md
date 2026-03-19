@@ -13,6 +13,6 @@ This repository is a work in progress.
 - [ ] OAuth support for Streamable HTTP clients
 - [ ] OAuth support for Streamable HTTP servers
 - [x] Support for server sent requests for Streamable HTTP
-- [ ] Support for server sent requests for STDIO
+- [x] Support for server sent requests for STDIO
 - [ ] Support for cancellation in both directions
 - [ ] Restart HTTP GET for server-sent requests

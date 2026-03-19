@@ -1,3 +1,4 @@
+import gleam/erlang/process
 import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam_mcp/actions.{
@@ -107,10 +108,10 @@ pub fn listen(client: Client) -> #(Client, Result(Nil, ClientError)) {
 fn listen_forever(client: Client) -> Result(Nil, ClientError) {
   let Client(
     transport_config: transport_config,
+    runners: runners,
     capabilities: capability_config,
     protocol_version: protocol_version,
     session_id: session_id,
-    ..,
   ) = client
 
   case transport_config {
@@ -127,12 +128,18 @@ fn listen_forever(client: Client) -> Result(Nil, ClientError) {
           listen_forever(set_runtime(client, next_session_id))
         Error(error) -> Error(Transport(error))
       }
-    transport.Stdio(_) ->
-      Error(
-        Transport(transport.UnexpectedResponse(
-          "Listening for server-sent requests is only supported over HTTP",
-        )),
-      )
+    transport.Stdio(stdio_config) -> {
+      let transport.Runners(stdio_listen: stdio_listen, ..) = runners
+      case stdio_listen(stdio_config, session_id, capability_config) {
+        Ok(transport.TransportResponse(session_id: next_session_id, ..)) -> {
+          let _ = set_runtime(client, next_session_id)
+          case process.sleep_forever() {
+            _ -> Ok(Nil)
+          }
+        }
+        Error(error) -> Error(Transport(error))
+      }
+    }
   }
 }
 
@@ -671,7 +678,12 @@ fn send(
   capability_config: capabilities.Config,
   method: String,
   params: Option(action),
-  stdio_request: fn(transport.StdioConfig, Option(String), Request(action)) ->
+  stdio_request: fn(
+    transport.StdioConfig,
+    Option(String),
+    capabilities.Config,
+    Request(action),
+  ) ->
     Result(transport.TransportResponse(result), transport.TransportError),
   streamable_request: fn(
     transport.HttpConfig,
@@ -701,7 +713,12 @@ fn send_message(
   protocol_version: String,
   capability_config: capabilities.Config,
   request: Request(action),
-  stdio_request: fn(transport.StdioConfig, Option(String), Request(action)) ->
+  stdio_request: fn(
+    transport.StdioConfig,
+    Option(String),
+    capabilities.Config,
+    Request(action),
+  ) ->
     Result(transport.TransportResponse(result), transport.TransportError),
   streamable_request: fn(
     transport.HttpConfig,

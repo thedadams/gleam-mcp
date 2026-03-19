@@ -345,6 +345,97 @@ pub fn sampling_server_sent_roundtrip_http_test() {
   }
 }
 
+pub fn elicitation_server_sent_roundtrip_stdio_test() {
+  let capability_config =
+    capabilities.none()
+    |> capabilities.with_elicit_form(fn(param) {
+      Ok(
+        capabilities.Elicit(actions.ElicitResult(
+          actions.ElicitAccept,
+          Some(
+            dict.from_list([
+              #(
+                "answer",
+                actions.ElicitString("elicited for " <> param.message),
+              ),
+            ]),
+          ),
+          None,
+        )),
+      )
+    })
+
+  let client =
+    client.new(
+      client_integration_support.local_server_sent_stdio_transport(),
+      capability_config,
+    )
+  let #(client, _) = initialize_client(client)
+  let _ = spawn_listener(client)
+  process.sleep(100)
+
+  let #(_, call_result) =
+    client.call_tool(
+      client,
+      actions.CallToolRequestParams("roundtrip-elicitation", None, None, None),
+    )
+
+  case call_result {
+    Ok(actions.ResultCallTool(actions.CallToolResult(content:, ..))) ->
+      should.be_true(has_text_content(
+        content,
+        "Elicited: elicited for Please provide a value for requst roundtrip-elicitation",
+      ))
+    _ -> panic as string.inspect(call_result)
+  }
+}
+
+pub fn sampling_server_sent_roundtrip_stdio_test() {
+  let capability_config =
+    capabilities.none()
+    |> capabilities.with_create_message(fn(_) {
+      Ok(
+        capabilities.CreateMessage(actions.CreateMessageResult(
+          message: actions.SamplingMessage(
+            actions.Assistant,
+            actions.SingleSamplingContent(
+              actions.SamplingText(actions.TextContent(
+                "sampled value",
+                None,
+                None,
+              )),
+            ),
+            None,
+          ),
+          model: "integration-test-model",
+          stop_reason: None,
+          meta: None,
+        )),
+      )
+    })
+
+  let client =
+    client.new(
+      client_integration_support.local_server_sent_stdio_transport(),
+      capability_config,
+    )
+  let #(client, _) = initialize_client(client)
+  let _ = spawn_listener(client)
+  process.sleep(100)
+
+  let #(_, call_result) =
+    client.call_tool(
+      client,
+      actions.CallToolRequestParams("roundtrip-sampling", None, None, None),
+    )
+
+  case call_result {
+    Ok(actions.ResultCallTool(actions.CallToolResult(content:, ..))) ->
+      should.be_true(has_text_content(content, "Sampled: sampled value"))
+    _ -> panic as string.inspect(call_result)
+  }
+}
+
 fn initialize_client(
   created: client.Client,
 ) -> #(client.Client, actions.InitializeResult) {
