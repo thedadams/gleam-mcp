@@ -9,8 +9,8 @@ This repository is a work in progress.
 - [x] Basic client functionality for Stdio, including running a process and sending/receiving messages
 - [x] Basic server functionality for Streamable HTTP, excluding tasks
 - [x] Basic server functionality for STDIO, excluding tasks
-- [ ] Task support for servers
-- [ ] Task support for clients
+- [x] Task support for servers
+- [x] Task support for clients
 - [ ] OAuth support for Streamable HTTP clients
 - [ ] OAuth support for Streamable HTTP servers
 - [x] Support for server sent requests for Streamable HTTP

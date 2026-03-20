@@ -4,6 +4,7 @@ import gleam_mcp/client/capabilities
 import gleam_mcp/client/codec
 import gleam_mcp/jsonrpc
 import gleam_mcp/mcp
+import gleam_mcp/task_store
 import gleeunit
 import gleeunit/should
 
@@ -84,6 +85,7 @@ pub fn handle_server_sent_roots_request_test() {
       notify_roots_list_changed: None,
       notify_elicitation_complete: None,
       notify_task_status: None,
+      task_store: task_store.new(),
       create_message: None,
       sampling_tools: None,
       sampling_context: None,
@@ -128,6 +130,7 @@ pub fn handle_server_sent_sampling_request_test() {
       notify_roots_list_changed: None,
       notify_elicitation_complete: None,
       notify_task_status: None,
+      task_store: task_store.new(),
       create_message: Some(fn(_) {
         Ok(
           capabilities.CreateMessage(actions.CreateMessageResult(
@@ -186,6 +189,102 @@ pub fn handle_server_sent_sampling_request_test() {
   }
 }
 
+pub fn handle_server_sent_sampling_task_request_test() {
+  let config =
+    capabilities.none()
+    |> capabilities.with_create_message(fn(_) {
+      Ok(
+        capabilities.CreateMessage(actions.CreateMessageResult(
+          message: actions.SamplingMessage(
+            actions.Assistant,
+            actions.SingleSamplingContent(
+              actions.SamplingText(actions.TextContent("Hi back", None, None)),
+            ),
+            None,
+          ),
+          model: "test-model",
+          stop_reason: None,
+          meta: None,
+        )),
+      )
+    })
+
+  let params =
+    actions.CreateMessageRequestParams(
+      messages: [],
+      model_preferences: None,
+      system_prompt: None,
+      include_context: None,
+      temperature: None,
+      max_tokens: 64,
+      stop_sequences: [],
+      metadata: None,
+      tools: [],
+      tool_choice: None,
+      task: Some(actions.TaskMetadata(Some(1000))),
+      meta: None,
+    )
+
+  let task_id = case
+    capabilities.handle_request(
+      config,
+      jsonrpc.Request(
+        jsonrpc.StringId("req-2"),
+        mcp.method_create_message,
+        Some(actions.RequestCreateMessage(params)),
+      ),
+    )
+    |> should.be_ok
+  {
+    jsonrpc.ResultResponse(
+      _,
+      actions.ResultCreateTask(actions.CreateTaskResult(task:, ..)),
+    ) -> task.task_id
+    _ -> panic
+  }
+
+  let get_result =
+    capabilities.handle_request(
+      config,
+      jsonrpc.Request(
+        jsonrpc.StringId("req-3"),
+        mcp.method_get_task,
+        Some(actions.RequestGetTask(actions.TaskIdParams(task_id))),
+      ),
+    )
+    |> should.be_ok
+
+  case get_result {
+    jsonrpc.ResultResponse(
+      _,
+      actions.ResultGetTask(actions.GetTaskResult(task:, ..)),
+    ) -> should.equal(task.status, actions.Completed)
+    _ -> should.fail()
+  }
+
+  let result =
+    capabilities.handle_request(
+      config,
+      jsonrpc.Request(
+        jsonrpc.StringId("req-4"),
+        mcp.method_get_task_result,
+        Some(actions.RequestGetTaskResult(actions.TaskIdParams(task_id))),
+      ),
+    )
+    |> should.be_ok
+
+  case result {
+    jsonrpc.ResultResponse(
+      _,
+      actions.ResultTaskResult(actions.TaskCreateMessage(actions.CreateMessageResult(
+        model:,
+        ..,
+      ))),
+    ) -> should.equal(model, "test-model")
+    _ -> should.fail()
+  }
+}
+
 pub fn handle_server_sent_roots_notification_test() {
   let config =
     capabilities.Config(
@@ -200,6 +299,7 @@ pub fn handle_server_sent_roots_notification_test() {
       notify_roots_list_changed: Some(fn() { Ok(Nil) }),
       notify_elicitation_complete: None,
       notify_task_status: None,
+      task_store: task_store.new(),
       create_message: None,
       sampling_tools: None,
       sampling_context: None,
@@ -261,6 +361,7 @@ pub fn handle_server_sent_logging_notification_test() {
       notify_roots_list_changed: None,
       notify_elicitation_complete: None,
       notify_task_status: None,
+      task_store: task_store.new(),
       create_message: None,
       sampling_tools: None,
       sampling_context: None,
@@ -315,6 +416,7 @@ pub fn handle_server_sent_task_status_notification_test() {
         should.equal(meta, None)
         Ok(Nil)
       }),
+      task_store: task_store.new(),
       create_message: None,
       sampling_tools: None,
       sampling_context: None,

@@ -8,6 +8,7 @@ pub fn infer(
   has_prompts has_prompts: Bool,
   has_completion has_completion: Bool,
   has_logging has_logging: Bool,
+  has_tasks has_tasks: Bool,
 ) -> actions.ServerCapabilities {
   actions.ServerCapabilities(
     experimental: None,
@@ -29,7 +30,19 @@ pub fn infer(
       True -> Some(actions.ServerToolsCapabilities(list_changed: None))
       False -> None
     },
-    tasks: None,
+    tasks: case has_tasks {
+      True ->
+        Some(actions.ServerTasksCapabilities(
+          list: Some(jsonrpc.VObject([])),
+          cancel: Some(jsonrpc.VObject([])),
+          requests: Some(
+            actions.ServerTaskRequestCapabilities(
+              tools_call: Some(jsonrpc.VObject([])),
+            ),
+          ),
+        ))
+      False -> None
+    },
   )
 }
 

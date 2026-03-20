@@ -56,7 +56,8 @@ pub fn initialize_infers_capabilities_test() {
       prompts |> should.be_some
       resources |> should.be_some
       tools |> should.be_some
-      tasks |> should.be_none
+      let _ = tasks |> should.be_some
+      Nil
     }
     _ -> should.fail()
   }
@@ -285,6 +286,169 @@ pub fn missing_completion_handler_returns_method_not_found_test() {
   case response {
     jsonrpc.ErrorResponse(Some(jsonrpc.StringId("complete")), error) ->
       should.equal(error.code, jsonrpc.method_not_found_error_code)
+    _ -> should.fail()
+  }
+}
+
+pub fn task_backed_tool_calls_can_be_polled_test() {
+  let sample_server = example_server.sample_server()
+  let #(_, create_response) =
+    server.handle_request(
+      sample_server,
+      jsonrpc.Request(
+        jsonrpc.StringId("task-create"),
+        mcp.method_call_tool,
+        Some(
+          actions.RequestCallTool(actions.CallToolRequestParams(
+            "echo",
+            Some(dict.from_list([#("message", jsonrpc.VString("hello"))])),
+            Some(actions.TaskMetadata(Some(1000))),
+            None,
+          )),
+        ),
+      ),
+    )
+
+  let task = case create_response {
+    jsonrpc.ResultResponse(
+      _,
+      actions.ResultCreateTask(actions.CreateTaskResult(task: task, ..)),
+    ) -> task
+    _ -> panic as string.inspect(create_response)
+  }
+
+  should.equal(task.status, actions.Working)
+
+  let #(_, list_response) =
+    server.handle_request(
+      sample_server,
+      jsonrpc.Request(
+        jsonrpc.StringId("task-list"),
+        mcp.method_list_tasks,
+        Some(
+          actions.RequestListTasks(actions.PaginatedRequestParams(None, None)),
+        ),
+      ),
+    )
+
+  case list_response {
+    jsonrpc.ResultResponse(_, actions.ResultListTasks(result)) ->
+      should.be_true(
+        list.any(result.tasks, fn(entry) { entry.task_id == task.task_id }),
+      )
+    _ -> should.fail()
+  }
+
+  let #(_, get_response) =
+    server.handle_request(
+      sample_server,
+      jsonrpc.Request(
+        jsonrpc.StringId("task-get"),
+        mcp.method_get_task,
+        Some(actions.RequestGetTask(actions.TaskIdParams(task.task_id))),
+      ),
+    )
+
+  case get_response {
+    jsonrpc.ResultResponse(
+      _,
+      actions.ResultGetTask(actions.GetTaskResult(task:, ..)),
+    ) -> should.equal(task.status, actions.Completed)
+    _ -> should.fail()
+  }
+
+  let #(_, result_response) =
+    server.handle_request(
+      sample_server,
+      jsonrpc.Request(
+        jsonrpc.StringId("task-result"),
+        mcp.method_get_task_result,
+        Some(actions.RequestGetTaskResult(actions.TaskIdParams(task.task_id))),
+      ),
+    )
+
+  case result_response {
+    jsonrpc.ResultResponse(
+      _,
+      actions.ResultTaskResult(actions.TaskCallTool(actions.CallToolResult(
+        content:,
+        ..,
+      ))),
+    ) ->
+      should.be_true(
+        list.any(content, fn(block) {
+          case block {
+            actions.TextBlock(actions.TextContent(text:, ..)) ->
+              text == "Echo: hello"
+            _ -> False
+          }
+        }),
+      )
+    _ -> should.fail()
+  }
+}
+
+pub fn task_backed_tool_calls_can_be_cancelled_test() {
+  let sample_server = example_server.sample_server()
+  let #(_, create_response) =
+    server.handle_request(
+      sample_server,
+      jsonrpc.Request(
+        jsonrpc.StringId("task-create"),
+        mcp.method_call_tool,
+        Some(
+          actions.RequestCallTool(actions.CallToolRequestParams(
+            "echo",
+            Some(dict.from_list([#("message", jsonrpc.VString("hello"))])),
+            Some(actions.TaskMetadata(Some(1000))),
+            None,
+          )),
+        ),
+      ),
+    )
+
+  let task_id = case create_response {
+    jsonrpc.ResultResponse(
+      _,
+      actions.ResultCreateTask(actions.CreateTaskResult(
+        task: actions.Task(task_id:, ..),
+        ..,
+      )),
+    ) -> task_id
+    _ -> panic as string.inspect(create_response)
+  }
+
+  let #(_, cancel_response) =
+    server.handle_request(
+      sample_server,
+      jsonrpc.Request(
+        jsonrpc.StringId("task-cancel"),
+        mcp.method_cancel_task,
+        Some(actions.RequestCancelTask(actions.TaskIdParams(task_id))),
+      ),
+    )
+
+  case cancel_response {
+    jsonrpc.ResultResponse(
+      _,
+      actions.ResultCancelTask(actions.CancelTaskResult(task:, ..)),
+    ) -> should.equal(task.status, actions.Cancelled)
+    _ -> should.fail()
+  }
+
+  let #(_, result_response) =
+    server.handle_request(
+      sample_server,
+      jsonrpc.Request(
+        jsonrpc.StringId("task-result"),
+        mcp.method_get_task_result,
+        Some(actions.RequestGetTaskResult(actions.TaskIdParams(task_id))),
+      ),
+    )
+
+  case result_response {
+    jsonrpc.ErrorResponse(Some(jsonrpc.StringId("task-result")), error) ->
+      should.equal(error.code, jsonrpc.invalid_params_error_code)
     _ -> should.fail()
   }
 }

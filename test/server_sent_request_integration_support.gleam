@@ -19,6 +19,7 @@ import mist
 pub type InteractionKind {
   Elicitation
   Sampling
+  SamplingTask
 }
 
 type BrokerMessage {
@@ -278,9 +279,13 @@ fn tool_call_response(
   broker: process.Subject(BrokerMessage),
   id: jsonrpc.RequestId,
 ) -> response.Response(mist.ResponseData) {
-  let response_text = case process.call(broker, 5000, PopClientResponse) {
-    Ok(value) -> value
-    Error(Nil) -> "Timed out waiting for client response"
+  let response_text = case kind {
+    SamplingTask -> task_roundtrip_response_text(broker)
+    _ ->
+      case process.call(broker, 5000, PopClientResponse) {
+        Ok(value) -> value
+        Error(Nil) -> "Timed out waiting for client response"
+      }
   }
 
   json_response(
@@ -324,6 +329,7 @@ fn initialize_result() -> actions.ActionResult {
       has_prompts: False,
       has_completion: False,
       has_logging: False,
+      has_tasks: False,
     ),
     server_info: actions.Implementation(
       name: "server-sent-request-test-server",
@@ -392,7 +398,7 @@ fn interaction_request(
           ),
         ),
       )
-    Sampling ->
+    Sampling | SamplingTask ->
       jsonrpc.Request(
         jsonrpc.StringId("sample-1"),
         mcp.method_create_message,
@@ -420,7 +426,10 @@ fn interaction_request(
             metadata: None,
             tools: [],
             tool_choice: None,
-            task: None,
+            task: case kind {
+              SamplingTask -> Some(actions.TaskMetadata(Some(1000)))
+              _ -> None
+            },
             meta: None,
           )),
         ),
@@ -435,6 +444,7 @@ fn decode_client_response(
   case kind {
     Elicitation -> extract_json_string(body, "answer")
     Sampling -> extract_json_string(body, "text")
+    SamplingTask -> Error(Nil)
   }
 }
 
@@ -455,6 +465,7 @@ fn tool_name(kind: InteractionKind) -> String {
   case kind {
     Elicitation -> "roundtrip-elicitation"
     Sampling -> "roundtrip-sampling"
+    SamplingTask -> "roundtrip-sampling-task"
   }
 }
 
@@ -462,7 +473,64 @@ fn result_prefix(kind: InteractionKind) -> String {
   case kind {
     Elicitation -> "Elicited: "
     Sampling -> "Sampled: "
+    SamplingTask -> "Task sampled: "
   }
+}
+
+fn task_roundtrip_response_text(
+  broker: process.Subject(BrokerMessage),
+) -> String {
+  let created = case process.call(broker, 5000, PopClientResponse) {
+    Ok(value) -> value
+    Error(Nil) -> "Timed out waiting for client task creation"
+  }
+
+  case extract_json_string(created, "taskId") {
+    Ok(task_id) -> {
+      process.send(
+        broker,
+        PushListenerRequest(
+          task_get_request(task_id) |> client_codec.encode_request,
+        ),
+      )
+      let _ = process.call(broker, 5000, PopClientResponse)
+
+      process.send(
+        broker,
+        PushListenerRequest(
+          task_result_request(task_id) |> client_codec.encode_request,
+        ),
+      )
+
+      case process.call(broker, 5000, PopClientResponse) {
+        Ok(value) ->
+          case extract_json_string(value, "text") {
+            Ok(text) -> text
+            Error(Nil) -> value
+          }
+        Error(Nil) -> "Timed out waiting for client task result"
+      }
+    }
+    Error(Nil) -> created
+  }
+}
+
+fn task_get_request(task_id: String) -> jsonrpc.Request(actions.ActionRequest) {
+  jsonrpc.Request(
+    jsonrpc.StringId("task-get-1"),
+    mcp.method_get_task,
+    Some(actions.RequestGetTask(actions.TaskIdParams(task_id))),
+  )
+}
+
+fn task_result_request(
+  task_id: String,
+) -> jsonrpc.Request(actions.ActionRequest) {
+  jsonrpc.Request(
+    jsonrpc.StringId("task-result-1"),
+    mcp.method_get_task_result,
+    Some(actions.RequestGetTaskResult(actions.TaskIdParams(task_id))),
+  )
 }
 
 fn sse_response(payload: String) -> response.Response(mist.ResponseData) {

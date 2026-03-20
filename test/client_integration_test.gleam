@@ -3,6 +3,7 @@ import gleam/dict
 import gleam/erlang/process
 import gleam/list
 import gleam/option.{None, Some}
+import gleam/result
 import gleam/string
 import gleam_mcp/actions
 import gleam_mcp/client
@@ -127,9 +128,10 @@ fn basic_request_with_transport(config: transport.Config) {
     )
 
   case call_result |> should.be_ok {
-    actions.CallToolResult(content:, ..) -> {
+    actions.CallTool(actions.CallToolResult(content:, ..)) -> {
       should.be_true(has_text_content(content, "Echo: hello"))
     }
+    actions.CallToolTask(_) -> should.fail()
   }
 }
 
@@ -187,6 +189,20 @@ pub fn list_tasks_request_stdio_test() {
   )
 }
 
+pub fn simulate_research_query_runs_as_task_http_test() {
+  option.map(
+    client_integration_support.http_transport(),
+    simulate_research_query_runs_as_task_with_transport,
+  )
+}
+
+pub fn simulate_research_query_runs_as_task_stdio_test() {
+  option.map(
+    client_integration_support.stdio_transport(),
+    simulate_research_query_runs_as_task_with_transport,
+  )
+}
+
 fn list_tasks_request_with_transport_test(config: transport.Config) {
   let client = client.new(config, capabilities.none())
   let #(client, _) = initialize_client(client)
@@ -228,6 +244,58 @@ fn test_task_for_transport(config: transport.Config) {
   let _ = cancel_result |> should.be_error
 }
 
+fn simulate_research_query_runs_as_task_with_transport(config: transport.Config) {
+  let client = client.new(config, capabilities.none())
+  let #(client, _) = initialize_client(client)
+
+  let #(client, tools_result) = client.list_tools(client, None)
+  let tools = tools_result |> should.be_ok
+  let actions.ListToolsResult(tools: listed_tools, ..) = tools
+  should.be_true(has_task_required_tool(listed_tools, "simulate-research-query"))
+
+  let #(client, call_result) =
+    client.call_tool(
+      client,
+      actions.CallToolRequestParams(
+        "simulate-research-query",
+        Some(
+          dict.from_list([
+            #("topic", jsonrpc.VString("mcp tasks over http transport")),
+            #("ambiguous", jsonrpc.VBool(False)),
+          ]),
+        ),
+        Some(actions.TaskMetadata(Some(10_000))),
+        None,
+      ),
+    )
+
+  let task_id = case call_result |> should.be_ok {
+    actions.CallToolTask(actions.CreateTaskResult(task:, ..)) -> task.task_id
+    _ -> panic as string.inspect(call_result)
+  }
+
+  let #(client, completed_task) = wait_for_completed_task(client, task_id, 8)
+  should.equal(completed_task.status, actions.Completed)
+
+  let #(_, task_result) =
+    client.get_task_result(client, actions.TaskIdParams(task_id))
+
+  case task_result |> should.be_ok {
+    actions.TaskCallTool(actions.CallToolResult(content:, ..)) -> {
+      should.be_true(has_text_content_containing(content, "# Research Report:"))
+      should.be_true(has_text_content_containing(
+        content,
+        "mcp tasks over http transport",
+      ))
+      should.be_true(has_text_content_containing(
+        content,
+        "This is a simulated research report from the Everything MCP Server.",
+      ))
+    }
+    _ -> should.fail()
+  }
+}
+
 pub fn elicitation_server_sent_roundtrip_http_test() {
   let config =
     transport.Http(transport.HttpConfig(
@@ -259,7 +327,7 @@ pub fn elicitation_server_sent_roundtrip_http_test() {
 
   let client = client.new(config, capability_config)
   let #(client, _) = initialize_client(client)
-  let _ = spawn_listener(client)
+  let _ = spawn_http_listener_once(client)
   process.sleep(100)
 
   let #(_, call_result) =
@@ -269,13 +337,16 @@ pub fn elicitation_server_sent_roundtrip_http_test() {
     )
 
   case call_result {
-    Ok(actions.CallToolResult(content:, ..)) ->
+    Ok(actions.CallTool(actions.CallToolResult(content:, ..))) ->
       should.be_true(has_text_content(
         content,
         "Elicited: elicited for Please provide a value for requst roundtrip-elicitation",
       ))
     _ -> panic as string.inspect(call_result)
   }
+
+  let _ = spawn_http_listener_once(client)
+  process.sleep(100)
 
   let #(_, call_result) =
     client.call_tool(
@@ -284,7 +355,7 @@ pub fn elicitation_server_sent_roundtrip_http_test() {
     )
 
   case call_result {
-    Ok(actions.CallToolResult(content:, ..)) ->
+    Ok(actions.CallTool(actions.CallToolResult(content:, ..))) ->
       should.be_true(has_text_content(
         content,
         "Elicited: elicited for Please provide a value for requst roundtrip-elicitation-1",
@@ -328,7 +399,7 @@ pub fn sampling_server_sent_roundtrip_http_test() {
 
   let client = client.new(config, capability_config)
   let #(client, _) = initialize_client(client)
-  let _ = spawn_listener(client)
+  let _ = spawn_http_listener_once(client)
   process.sleep(100)
 
   let #(_, call_result) =
@@ -338,7 +409,7 @@ pub fn sampling_server_sent_roundtrip_http_test() {
     )
 
   case call_result {
-    Ok(actions.CallToolResult(content:, ..)) ->
+    Ok(actions.CallTool(actions.CallToolResult(content:, ..))) ->
       should.be_true(has_text_content(content, "Sampled: sampled value"))
     _ -> panic as string.inspect(call_result)
   }
@@ -380,7 +451,7 @@ pub fn elicitation_server_sent_roundtrip_stdio_test() {
     )
 
   case call_result {
-    Ok(actions.CallToolResult(content:, ..)) ->
+    Ok(actions.CallTool(actions.CallToolResult(content:, ..))) ->
       should.be_true(has_text_content(
         content,
         "Elicited: elicited for Please provide a value for requst roundtrip-elicitation",
@@ -429,7 +500,7 @@ pub fn sampling_server_sent_roundtrip_stdio_test() {
     )
 
   case call_result {
-    Ok(actions.CallToolResult(content:, ..)) ->
+    Ok(actions.CallTool(actions.CallToolResult(content:, ..))) ->
       should.be_true(has_text_content(content, "Sampled: sampled value"))
     _ -> panic as string.inspect(call_result)
   }
@@ -465,6 +536,69 @@ fn spawn_listener(
       process.send(reply_to, result)
     })
   reply_to
+}
+
+fn spawn_http_listener_once(
+  listening_client: client.Client,
+) -> process.Subject(Result(Nil, client.ClientError)) {
+  let reply_to = process.new_subject()
+  let _ =
+    process.spawn(fn() {
+      let result = case listening_client {
+        client.Client(
+          transport_config: transport.Http(http_config),
+          capabilities: capability_config,
+          protocol_version: protocol_version,
+          session_id: session_id,
+          ..,
+        ) ->
+          transport.streamable_http_listen(
+            http_config,
+            session_id,
+            protocol_version,
+            capability_config,
+          )
+          |> result.map(fn(_) { Nil })
+          |> result.map_error(client.Transport)
+        _ ->
+          Error(
+            client.Transport(transport.ProcessError("Expected HTTP transport")),
+          )
+      }
+
+      process.send(reply_to, result)
+    })
+  reply_to
+}
+
+fn wait_for_completed_task(
+  current_client: client.Client,
+  task_id: String,
+  attempts_left: Int,
+) -> #(client.Client, actions.Task) {
+  case attempts_left {
+    0 -> panic as "Timed out waiting for task completion"
+    _ -> {
+      let #(next_client, task_result) =
+        client.get_task(current_client, actions.TaskIdParams(task_id))
+      let task = task_result |> should.be_ok
+
+      case task.task.status {
+        actions.Completed -> #(next_client, task.task)
+        actions.Failed -> panic as "Task failed before returning a result"
+        actions.Cancelled -> panic as "Task was cancelled before completion"
+        actions.Working | actions.InputRequired -> {
+          let poll_interval_ms = case task.task.poll_interval_ms {
+            Some(value) -> value
+            None -> 1000
+          }
+
+          process.sleep(poll_interval_ms)
+          wait_for_completed_task(next_client, task_id, attempts_left - 1)
+        }
+      }
+    }
+  }
 }
 
 fn has_resource_template(
@@ -518,6 +652,21 @@ fn has_tool(tools: List(actions.Tool), name: String) -> Bool {
   })
 }
 
+fn has_task_required_tool(tools: List(actions.Tool), name: String) -> Bool {
+  list.any(tools, fn(tool) {
+    case tool {
+      actions.Tool(
+        name: tool_name,
+        execution: Some(actions.ToolExecution(task_support: Some(
+          actions.TaskRequired,
+        ))),
+        ..,
+      ) -> tool_name == name
+      _ -> False
+    }
+  })
+}
+
 fn has_text_content(
   content: List(actions.ContentBlock),
   expected_text: String,
@@ -525,6 +674,19 @@ fn has_text_content(
   list.any(content, fn(block) {
     case block {
       actions.TextBlock(actions.TextContent(text:, ..)) -> text == expected_text
+      _ -> False
+    }
+  })
+}
+
+fn has_text_content_containing(
+  content: List(actions.ContentBlock),
+  expected_text: String,
+) -> Bool {
+  list.any(content, fn(block) {
+    case block {
+      actions.TextBlock(actions.TextContent(text:, ..)) ->
+        string.contains(text, expected_text)
       _ -> False
     }
   })

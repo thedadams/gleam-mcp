@@ -111,9 +111,9 @@ pub fn client_can_talk_to_sdk_http_server_test() {
     )
 
   case tool_result |> should.be_ok {
-    result -> {
+    actions.CallTool(actions.CallToolResult(content:, ..)) -> {
       should.be_true(
-        list.any(result.content, fn(block) {
+        list.any(content, fn(block) {
           case block {
             actions.TextBlock(actions.TextContent(text:, ..)) ->
               text == "Echo: hello"
@@ -122,6 +122,7 @@ pub fn client_can_talk_to_sdk_http_server_test() {
         }),
       )
     }
+    actions.CallToolTask(_) -> should.fail()
   }
 
   let #(app_client, complete_result) =
@@ -208,9 +209,9 @@ pub fn client_can_talk_to_sdk_stdio_server_test() {
     )
 
   case tool_result |> should.be_ok {
-    result -> {
+    actions.CallTool(actions.CallToolResult(content:, ..)) -> {
       should.be_true(
-        list.any(result.content, fn(block) {
+        list.any(content, fn(block) {
           case block {
             actions.TextBlock(actions.TextContent(text:, ..)) ->
               text == "Echo: hello"
@@ -219,6 +220,7 @@ pub fn client_can_talk_to_sdk_stdio_server_test() {
         }),
       )
     }
+    actions.CallToolTask(_) -> should.fail()
   }
 
   let #(_, logging_result) =
@@ -227,6 +229,28 @@ pub fn client_can_talk_to_sdk_stdio_server_test() {
       actions.SetLevelRequestParams(actions.Info, None),
     )
   logging_result |> should.equal(Ok(Nil))
+}
+
+pub fn client_can_roundtrip_task_backed_tool_calls_over_http_test() {
+  task_backed_tool_roundtrip_with_transport(
+    transport.Http(transport.HttpConfig(
+      server_test_support.start_http_server(),
+      [],
+      Some(5000),
+    )),
+  )
+}
+
+pub fn client_can_roundtrip_task_backed_tool_calls_over_stdio_test() {
+  task_backed_tool_roundtrip_with_transport(
+    transport.Stdio(transport.StdioConfig(
+      "gleam",
+      ["run", "-m", "gleam_mcp/examples/example_server"],
+      [],
+      None,
+      Some(5000),
+    )),
+  )
 }
 
 pub fn http_server_rejects_requests_with_invalid_authorization_header_test() {
@@ -279,4 +303,60 @@ pub fn http_server_accepts_requests_with_valid_authorization_header_test() {
 fn authorized_server(header: String, token: String) -> server.Server {
   example_server.sample_server()
   |> server.with_header_authorization(header, fn(value) { value == token })
+}
+
+fn task_backed_tool_roundtrip_with_transport(config: transport.Config) {
+  let app_client = client.new(config, capabilities.none())
+  let #(app_client, _) = case
+    client.initialize(app_client, server_test_support.sample_client_info())
+  {
+    Ok(value) -> value
+    Error(error) -> panic as string.inspect(error)
+  }
+
+  let #(app_client, call_result) =
+    client.call_tool(
+      app_client,
+      actions.CallToolRequestParams(
+        "echo",
+        Some(dict.from_list([#("message", jsonrpc.VString("hello task"))])),
+        Some(actions.TaskMetadata(Some(1000))),
+        None,
+      ),
+    )
+
+  let task_id = case call_result |> should.be_ok {
+    actions.CallToolTask(actions.CreateTaskResult(task:, ..)) -> task.task_id
+    _ -> panic as string.inspect(call_result)
+  }
+
+  let #(app_client, list_result) =
+    client.list_tasks(
+      app_client,
+      Some(actions.PaginatedRequestParams(None, None)),
+    )
+  let listed = list_result |> should.be_ok
+  should.be_true(list.any(listed.tasks, fn(task) { task.task_id == task_id }))
+
+  let #(app_client, get_result) =
+    client.get_task(app_client, actions.TaskIdParams(task_id))
+  let task = get_result |> should.be_ok
+  should.equal(task.task.status, actions.Completed)
+
+  let #(_, result_response) =
+    client.get_task_result(app_client, actions.TaskIdParams(task_id))
+
+  case result_response |> should.be_ok {
+    actions.TaskCallTool(actions.CallToolResult(content:, ..)) ->
+      should.be_true(
+        list.any(content, fn(block) {
+          case block {
+            actions.TextBlock(actions.TextContent(text:, ..)) ->
+              text == "Echo: hello task"
+            _ -> False
+          }
+        }),
+      )
+    _ -> should.fail()
+  }
 }

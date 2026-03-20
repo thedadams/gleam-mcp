@@ -6,6 +6,10 @@ pub type Meta {
   Meta(fields: Dict(String, Value))
 }
 
+pub type RelatedTask {
+  RelatedTask(task_id: String)
+}
+
 pub type RequestMeta {
   RequestMeta(progress_token: Option(RequestId), extra: Option(Meta))
 }
@@ -81,7 +85,7 @@ pub type ActionResult {
   ResultElicit(ElicitResult)
   ResultCreateTask(CreateTaskResult)
   ResultGetTask(GetTaskResult)
-  ResultTaskPayload(TaskPayloadResult)
+  ResultTaskResult(TaskResult)
   ResultCancelTask(CancelTaskResult)
   ResultListTasks(ListTasksResult)
 }
@@ -474,6 +478,11 @@ pub type CallToolResult {
   )
 }
 
+pub type CallToolResponse {
+  CallTool(CallToolResult)
+  CallToolTask(CreateTaskResult)
+}
+
 pub type TaskStatus {
   Working
   InputRequired
@@ -506,8 +515,10 @@ pub type GetTaskResult {
   GetTaskResult(task: Task, meta: Option(Meta))
 }
 
-pub type TaskPayloadResult {
-  TaskPayloadResult(payload: Dict(String, Value), meta: Option(Meta))
+pub type TaskResult {
+  TaskCallTool(CallToolResult)
+  TaskCreateMessage(CreateMessageResult)
+  TaskElicit(ElicitResult)
 }
 
 pub type CancelTaskResult {
@@ -550,6 +561,11 @@ pub type CreateMessageRequestParams {
     task: Option(TaskMetadata),
     meta: Option(RequestMeta),
   )
+}
+
+pub type CreateMessageResponse {
+  CreateMessage(CreateMessageResult)
+  CreateMessageTask(CreateTaskResult)
 }
 
 pub type ModelPreferences {
@@ -671,6 +687,11 @@ pub type ListRootsResult {
 pub type ElicitRequestParams {
   ElicitRequestForm(ElicitRequestFormParams)
   ElicitRequestUrl(ElicitRequestUrlParams)
+}
+
+pub type ElicitResponse {
+  Elicit(ElicitResult)
+  ElicitTask(CreateTaskResult)
 }
 
 pub type ElicitRequestFormParams {

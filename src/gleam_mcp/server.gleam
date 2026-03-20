@@ -7,6 +7,7 @@ import gleam_mcp/actions
 import gleam_mcp/jsonrpc
 import gleam_mcp/mcp
 import gleam_mcp/server/capabilities
+import gleam_mcp/task_store
 
 pub type ToolHandler =
   fn(Option(Dict(String, jsonrpc.Value))) ->
@@ -38,6 +39,7 @@ pub opaque type Server {
     implementation: actions.Implementation,
     instructions: Option(String),
     authorization: Option(HeaderAuthorization),
+    task_store: task_store.Store,
     tools: List(RegisteredTool),
     resources: List(RegisteredResource),
     resource_templates: List(RegisteredResourceTemplate),
@@ -67,13 +69,25 @@ type RegisteredPrompt {
 }
 
 pub fn new(implementation: actions.Implementation) -> Server {
-  Server(implementation, None, None, [], [], [], [], None, None)
+  Server(
+    implementation,
+    None,
+    None,
+    task_store.new(),
+    [],
+    [],
+    [],
+    [],
+    None,
+    None,
+  )
 }
 
 pub fn with_instructions(server: Server, instructions: String) -> Server {
   let Server(
     implementation: implementation,
     authorization: authorization,
+    task_store: tasks,
     tools: tools,
     resources: resources,
     resource_templates: resource_templates,
@@ -87,6 +101,7 @@ pub fn with_instructions(server: Server, instructions: String) -> Server {
     implementation,
     Some(instructions),
     authorization,
+    tasks,
     tools,
     resources,
     resource_templates,
@@ -104,6 +119,7 @@ pub fn with_header_authorization(
   let Server(
     implementation: implementation,
     instructions: instructions,
+    task_store: tasks,
     tools: tools,
     resources: resources,
     resource_templates: resource_templates,
@@ -117,6 +133,7 @@ pub fn with_header_authorization(
     implementation,
     instructions,
     Some(HeaderAuthorization(header, validate)),
+    tasks,
     tools,
     resources,
     resource_templates,
@@ -144,7 +161,7 @@ pub fn add_tool(
       title: None,
       description: Some(description),
       input_schema: input_schema,
-      execution: None,
+      execution: Some(actions.ToolExecution(Some(actions.TaskOptional))),
       output_schema: None,
       annotations: None,
       icons: [],
@@ -155,6 +172,7 @@ pub fn add_tool(
     implementation: server_info,
     instructions: instructions,
     authorization: authorization,
+    task_store: tasks,
     tools: tools,
     resources: resources,
     resource_templates: resource_templates,
@@ -167,6 +185,7 @@ pub fn add_tool(
     server_info,
     instructions,
     authorization,
+    tasks,
     [RegisteredTool(tool, implementation), ..tools],
     resources,
     resource_templates,
@@ -201,6 +220,7 @@ pub fn add_resource(
     implementation: server_info,
     instructions: instructions,
     authorization: authorization,
+    task_store: tasks,
     tools: tools,
     resources: resources,
     resource_templates: resource_templates,
@@ -213,6 +233,7 @@ pub fn add_resource(
     server_info,
     instructions,
     authorization,
+    tasks,
     tools,
     [RegisteredResource(resource, implementation), ..resources],
     resource_templates,
@@ -246,6 +267,7 @@ pub fn add_resource_template(
     implementation: server_info,
     instructions: instructions,
     authorization: authorization,
+    task_store: tasks,
     tools: tools,
     resources: resources,
     resource_templates: resource_templates,
@@ -258,6 +280,7 @@ pub fn add_resource_template(
     server_info,
     instructions,
     authorization,
+    tasks,
     tools,
     resources,
     [
@@ -291,6 +314,7 @@ pub fn add_prompt(
     implementation: server_info,
     instructions: instructions,
     authorization: authorization,
+    task_store: tasks,
     tools: tools,
     resources: resources,
     resource_templates: resource_templates,
@@ -303,6 +327,7 @@ pub fn add_prompt(
     server_info,
     instructions,
     authorization,
+    tasks,
     tools,
     resources,
     resource_templates,
@@ -320,6 +345,7 @@ pub fn set_completion_handler(
     implementation: implementation,
     instructions: instructions,
     authorization: authorization,
+    task_store: tasks,
     tools: tools,
     resources: resources,
     resource_templates: resource_templates,
@@ -332,6 +358,7 @@ pub fn set_completion_handler(
     implementation,
     instructions,
     authorization,
+    tasks,
     tools,
     resources,
     resource_templates,
@@ -346,6 +373,7 @@ pub fn set_logging_handler(server: Server, handler: LoggingHandler) -> Server {
     implementation: implementation,
     instructions: instructions,
     authorization: authorization,
+    task_store: tasks,
     tools: tools,
     resources: resources,
     resource_templates: resource_templates,
@@ -358,6 +386,7 @@ pub fn set_logging_handler(server: Server, handler: LoggingHandler) -> Server {
     implementation,
     instructions,
     authorization,
+    tasks,
     tools,
     resources,
     resource_templates,
@@ -441,14 +470,11 @@ fn dispatch_request(
       Error(jsonrpc.method_not_found_error(mcp.method_create_message))
     actions.RequestElicit(_) ->
       Error(jsonrpc.method_not_found_error(mcp.method_elicit))
-    actions.RequestListTasks(_) ->
-      Error(jsonrpc.method_not_found_error(mcp.method_list_tasks))
-    actions.RequestGetTask(_) ->
-      Error(jsonrpc.method_not_found_error(mcp.method_get_task))
-    actions.RequestGetTaskResult(_) ->
-      Error(jsonrpc.method_not_found_error(mcp.method_get_task_result))
-    actions.RequestCancelTask(_) ->
-      Error(jsonrpc.method_not_found_error(mcp.method_cancel_task))
+    actions.RequestListTasks(params) -> Ok(list_tasks_result(server, params))
+    actions.RequestGetTask(params) -> get_task_result(server, params)
+    actions.RequestGetTaskResult(params) ->
+      get_task_payload_result(server, params)
+    actions.RequestCancelTask(params) -> cancel_task_result(server, params)
   }
 }
 
@@ -470,6 +496,7 @@ fn initialization_result(server: Server) -> actions.ActionResult {
         Some(_) -> True
         None -> False
       },
+      has_tasks: server.tools != [],
     ),
     server_info: implementation,
     instructions: instructions,
@@ -595,13 +622,62 @@ fn call_tool_result(
   server: Server,
   params: actions.CallToolRequestParams,
 ) -> Result(actions.ActionResult, jsonrpc.RpcError) {
-  let actions.CallToolRequestParams(name, arguments, _, _) = params
+  let actions.CallToolRequestParams(name, arguments, task, _) = params
 
   case find_tool(server.tools, name) {
     Ok(RegisteredTool(handler:, ..)) ->
-      handler(arguments) |> result.map(actions.ResultCallTool)
+      case task {
+        Some(actions.TaskMetadata(ttl_ms)) -> {
+          let outcome = handler(arguments) |> result.map(actions.TaskCallTool)
+          let created = task_store.create(server.task_store, outcome, ttl_ms)
+          Ok(actions.ResultCreateTask(actions.CreateTaskResult(created, None)))
+        }
+        None -> handler(arguments) |> result.map(actions.ResultCallTool)
+      }
     Error(Nil) -> Error(jsonrpc.invalid_params_error("Unknown tool: " <> name))
   }
+}
+
+fn list_tasks_result(
+  server: Server,
+  _params: actions.PaginatedRequestParams,
+) -> actions.ActionResult {
+  actions.ResultListTasks(actions.ListTasksResult(
+    tasks: task_store.list(server.task_store),
+    page: actions.Page(None),
+    meta: None,
+  ))
+}
+
+fn get_task_result(
+  server: Server,
+  params: actions.TaskIdParams,
+) -> Result(actions.ActionResult, jsonrpc.RpcError) {
+  let actions.TaskIdParams(task_id) = params
+  task_store.get(server.task_store, task_id)
+  |> result.map(fn(task) {
+    actions.ResultGetTask(actions.GetTaskResult(task, None))
+  })
+}
+
+fn get_task_payload_result(
+  server: Server,
+  params: actions.TaskIdParams,
+) -> Result(actions.ActionResult, jsonrpc.RpcError) {
+  let actions.TaskIdParams(task_id) = params
+  task_store.result(server.task_store, task_id)
+  |> result.map(actions.ResultTaskResult)
+}
+
+fn cancel_task_result(
+  server: Server,
+  params: actions.TaskIdParams,
+) -> Result(actions.ActionResult, jsonrpc.RpcError) {
+  let actions.TaskIdParams(task_id) = params
+  task_store.cancel(server.task_store, task_id)
+  |> result.map(fn(task) {
+    actions.ResultCancelTask(actions.CancelTaskResult(task, None))
+  })
 }
 
 fn complete_result(

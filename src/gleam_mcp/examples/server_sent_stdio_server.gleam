@@ -180,6 +180,7 @@ fn initialize_result() -> actions.ActionResult {
       has_prompts: False,
       has_completion: False,
       has_logging: False,
+      has_tasks: False,
     ),
     server_info: actions.Implementation(
       name: "server-sent-stdio-test-server",

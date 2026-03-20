@@ -288,7 +288,7 @@ pub fn list_tools(
 pub fn call_tool(
   client: Client,
   params: actions.CallToolRequestParams,
-) -> #(Client, Result(actions.CallToolResult, ClientError)) {
+) -> #(Client, Result(actions.CallToolResponse, ClientError)) {
   send_request(
     client,
     mcp.method_call_tool,
@@ -296,7 +296,8 @@ pub fn call_tool(
   )
   |> expect_result("tools/call", fn(result) {
     case result {
-      actions.ResultCallTool(res) -> Some(res)
+      actions.ResultCallTool(res) -> Some(actions.CallTool(res))
+      actions.ResultCreateTask(res) -> Some(actions.CallToolTask(res))
       _ -> None
     }
   })
@@ -351,7 +352,7 @@ pub fn list_roots(
 pub fn create_message(
   client: Client,
   params: actions.CreateMessageRequestParams,
-) -> #(Client, Result(actions.CreateMessageResult, ClientError)) {
+) -> #(Client, Result(actions.CreateMessageResponse, ClientError)) {
   send_request(
     client,
     mcp.method_create_message,
@@ -359,7 +360,8 @@ pub fn create_message(
   )
   |> expect_result("sampling/createMessage", fn(result) {
     case result {
-      actions.ResultCreateMessage(res) -> Some(res)
+      actions.ResultCreateMessage(res) -> Some(actions.CreateMessage(res))
+      actions.ResultCreateTask(res) -> Some(actions.CreateMessageTask(res))
       _ -> None
     }
   })
@@ -368,11 +370,12 @@ pub fn create_message(
 pub fn elicit(
   client: Client,
   params: actions.ElicitRequestParams,
-) -> #(Client, Result(actions.ElicitResult, ClientError)) {
+) -> #(Client, Result(actions.ElicitResponse, ClientError)) {
   send_request(client, mcp.method_elicit, Some(actions.RequestElicit(params)))
   |> expect_result("elicitation/create", fn(result) {
     case result {
-      actions.ResultElicit(res) -> Some(res)
+      actions.ResultElicit(res) -> Some(actions.Elicit(res))
+      actions.ResultCreateTask(res) -> Some(actions.ElicitTask(res))
       _ -> None
     }
   })
@@ -419,7 +422,7 @@ pub fn get_task(
 pub fn get_task_result(
   client: Client,
   params: actions.TaskIdParams,
-) -> #(Client, Result(actions.TaskPayloadResult, ClientError)) {
+) -> #(Client, Result(actions.TaskResult, ClientError)) {
   send_request(
     client,
     mcp.method_get_task_result,
@@ -427,7 +430,7 @@ pub fn get_task_result(
   )
   |> expect_result("tasks/result", fn(result) {
     case result {
-      actions.ResultTaskPayload(value) -> Some(value)
+      actions.ResultTaskResult(value) -> Some(value)
       _ -> None
     }
   })

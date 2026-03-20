@@ -94,3 +94,89 @@ pub fn decode_response_parses_error_response_test() {
     )),
   )
 }
+
+pub fn encode_request_serializes_task_augmented_tool_call_test() {
+  let request =
+    jsonrpc.Request(
+      jsonrpc.StringId("req-2"),
+      "tools/call",
+      Some(
+        actions.RequestCallTool(actions.CallToolRequestParams(
+          "weather",
+          None,
+          Some(actions.TaskMetadata(Some(60_000))),
+          None,
+        )),
+      ),
+    )
+
+  codec.encode_request(request)
+  |> should.equal(
+    "{\"id\":\"req-2\",\"jsonrpc\":\"2.0\",\"method\":\"tools/call\",\"params\":{\"name\":\"weather\",\"task\":{\"ttl\":60000}}}",
+  )
+}
+
+pub fn decode_response_parses_create_task_result_test() {
+  let request =
+    jsonrpc.Request(
+      jsonrpc.StringId("req-3"),
+      "tools/call",
+      Some(
+        actions.RequestCallTool(actions.CallToolRequestParams(
+          "weather",
+          None,
+          Some(actions.TaskMetadata(Some(1000))),
+          None,
+        )),
+      ),
+    )
+
+  codec.decode_response(
+    "{\"jsonrpc\":\"2.0\",\"id\":\"req-3\",\"result\":{\"task\":{\"taskId\":\"task-1\",\"status\":\"working\",\"createdAt\":\"2026-03-20T00:00:00Z\",\"lastUpdatedAt\":\"2026-03-20T00:00:00Z\",\"ttl\":1000,\"pollInterval\":100}}}",
+    request,
+  )
+  |> should.equal(
+    Ok(jsonrpc.ResultResponse(
+      jsonrpc.StringId("req-3"),
+      actions.ResultCreateTask(actions.CreateTaskResult(
+        task: actions.Task(
+          task_id: "task-1",
+          status: actions.Working,
+          status_message: None,
+          created_at: "2026-03-20T00:00:00Z",
+          last_updated_at: "2026-03-20T00:00:00Z",
+          ttl_ms: Some(1000),
+          poll_interval_ms: Some(100),
+        ),
+        meta: None,
+      )),
+    )),
+  )
+}
+
+pub fn decode_response_parses_task_result_test() {
+  let request =
+    jsonrpc.Request(
+      jsonrpc.StringId("req-4"),
+      "tasks/result",
+      Some(actions.RequestGetTaskResult(actions.TaskIdParams("task-1"))),
+    )
+
+  codec.decode_response(
+    "{\"jsonrpc\":\"2.0\",\"id\":\"req-4\",\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"done\"}],\"isError\":false}}",
+    request,
+  )
+  |> should.equal(
+    Ok(jsonrpc.ResultResponse(
+      jsonrpc.StringId("req-4"),
+      actions.ResultTaskResult(
+        actions.TaskCallTool(actions.CallToolResult(
+          content: [actions.TextBlock(actions.TextContent("done", None, None))],
+          structured_content: None,
+          is_error: Some(False),
+          meta: None,
+        )),
+      ),
+    )),
+  )
+}

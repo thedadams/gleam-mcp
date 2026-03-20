@@ -650,7 +650,7 @@ fn encode_task_metadata(metadata: actions.TaskMetadata) -> json.Json {
   let actions.TaskMetadata(ttl_ms) = metadata
 
   []
-  |> append_optional("ttlMs", option_map(ttl_ms, json.int))
+  |> append_optional("ttl", option_map(ttl_ms, json.int))
   |> json.object
 }
 
@@ -1085,6 +1085,12 @@ fn server_message_decoder() -> decode.Decoder(ServerMessage) {
       method if method == mcp.method_create_message ->
         create_message_message_decoder()
       method if method == mcp.method_elicit -> elicit_message_decoder()
+      method if method == mcp.method_list_tasks -> list_tasks_message_decoder()
+      method if method == mcp.method_get_task -> get_task_message_decoder()
+      method if method == mcp.method_get_task_result ->
+        get_task_result_message_decoder()
+      method if method == mcp.method_cancel_task ->
+        cancel_task_message_decoder()
       method if method == mcp.method_notify_cancelled ->
         cancelled_notification_decoder()
       method if method == mcp.method_notify_progress ->
@@ -1147,6 +1153,54 @@ fn elicit_message_decoder() -> decode.Decoder(ServerMessage) {
       decode.success(params)
     },
     fn(params) { actions.RequestElicit(params) },
+  )
+}
+
+fn list_tasks_message_decoder() -> decode.Decoder(ServerMessage) {
+  decode_server_request_message(
+    mcp.method_list_tasks,
+    {
+      use params <- decode.optional_field(
+        "params",
+        actions.PaginatedRequestParams(None, None),
+        paginated_request_params_decoder(),
+      )
+      decode.success(params)
+    },
+    fn(params) { actions.RequestListTasks(params) },
+  )
+}
+
+fn get_task_message_decoder() -> decode.Decoder(ServerMessage) {
+  decode_server_request_message(
+    mcp.method_get_task,
+    {
+      use params <- decode.field("params", task_id_params_decoder())
+      decode.success(params)
+    },
+    fn(params) { actions.RequestGetTask(params) },
+  )
+}
+
+fn get_task_result_message_decoder() -> decode.Decoder(ServerMessage) {
+  decode_server_request_message(
+    mcp.method_get_task_result,
+    {
+      use params <- decode.field("params", task_id_params_decoder())
+      decode.success(params)
+    },
+    fn(params) { actions.RequestGetTaskResult(params) },
+  )
+}
+
+fn cancel_task_message_decoder() -> decode.Decoder(ServerMessage) {
+  decode_server_request_message(
+    mcp.method_cancel_task,
+    {
+      use params <- decode.field("params", task_id_params_decoder())
+      decode.success(params)
+    },
+    fn(params) { actions.RequestCancelTask(params) },
   )
 }
 
@@ -1554,7 +1608,7 @@ fn action_result_decoder(
     actions.RequestGetTask(_) ->
       decode.map(get_task_result_decoder(), actions.ResultGetTask)
     actions.RequestGetTaskResult(_) ->
-      decode.map(task_payload_result_decoder(), actions.ResultTaskPayload)
+      decode.map(task_result_decoder(), actions.ResultTaskResult)
     actions.RequestCancelTask(_) ->
       decode.map(cancel_task_result_decoder(), actions.ResultCancelTask)
   }
@@ -1724,8 +1778,7 @@ fn create_message_result_decoder() -> decode.Decoder(
   actions.CreateMessageResult,
 ) {
   {
-    use role <- decode.field("role", role_decoder())
-    use content <- decode.field("content", sampling_content_decoder())
+    use message <- decode.field("message", sampling_message_decoder())
     use model <- decode.field("model", decode.string)
     use stop_reason <- decode.optional_field(
       "stopReason",
@@ -1738,7 +1791,7 @@ fn create_message_result_decoder() -> decode.Decoder(
       decode.optional(meta_decoder()),
     )
     decode.success(actions.CreateMessageResult(
-      message: actions.SamplingMessage(role, content, None),
+      message: message,
       model: model,
       stop_reason: stop_reason,
       meta: meta,
@@ -1836,6 +1889,24 @@ fn create_message_request_params_decoder() -> decode.Decoder(
       task: task,
       meta: meta,
     ))
+  }
+}
+
+fn paginated_request_params_decoder() -> decode.Decoder(
+  actions.PaginatedRequestParams,
+) {
+  {
+    use cursor <- decode.optional_field(
+      "cursor",
+      None,
+      decode.optional(decode.map(decode.string, actions.Cursor)),
+    )
+    use meta <- decode.optional_field(
+      "_meta",
+      None,
+      decode.optional(request_meta_decoder()),
+    )
+    decode.success(actions.PaginatedRequestParams(cursor, meta))
   }
 }
 
@@ -1958,11 +2029,18 @@ fn notification_meta_decoder() -> decode.Decoder(actions.NotificationMeta) {
 fn task_metadata_decoder() -> decode.Decoder(actions.TaskMetadata) {
   {
     use ttl_ms <- decode.optional_field(
-      "ttlMs",
+      "ttl",
       None,
       decode.optional(decode.int),
     )
     decode.success(actions.TaskMetadata(ttl_ms))
+  }
+}
+
+fn task_id_params_decoder() -> decode.Decoder(actions.TaskIdParams) {
+  {
+    use task_id <- decode.field("taskId", decode.string)
+    decode.success(actions.TaskIdParams(task_id))
   }
 }
 
@@ -2056,36 +2134,12 @@ fn tool_choice_mode_decoder() -> decode.Decoder(actions.ToolChoiceMode) {
 
 fn create_task_result_decoder() -> decode.Decoder(actions.CreateTaskResult) {
   {
-    use task_id <- decode.field("taskId", decode.string)
-    use status <- decode.field("status", task_status_decoder())
-    use status_message <- decode.optional_field(
-      "statusMessage",
-      None,
-      decode.optional(decode.string),
-    )
-    use created_at <- decode.field("createdAt", decode.string)
-    use last_updated_at <- decode.field("lastUpdatedAt", decode.string)
-    use ttl_ms <- decode.field("ttl", decode.optional(decode.int))
-    use poll_interval_ms <- decode.optional_field(
-      "pollInterval",
-      None,
-      decode.optional(decode.int),
-    )
+    use task <- decode.field("task", task_decoder())
     use meta <- decode.optional_field(
       "_meta",
       None,
       decode.optional(meta_decoder()),
     )
-    let task =
-      actions.Task(
-        task_id,
-        status,
-        status_message,
-        created_at,
-        last_updated_at,
-        ttl_ms,
-        poll_interval_ms,
-      )
     decode.success(actions.CreateTaskResult(task:, meta:))
   }
 }
@@ -2134,10 +2188,14 @@ fn get_task_result_decoder() -> decode.Decoder(actions.GetTaskResult) {
   }
 }
 
-fn task_payload_result_decoder() -> decode.Decoder(actions.TaskPayloadResult) {
-  decode.map(value_dict_decoder(), fn(payload) {
-    actions.TaskPayloadResult(payload:, meta: None)
-  })
+fn task_result_decoder() -> decode.Decoder(actions.TaskResult) {
+  decode.one_of(
+    decode.map(call_tool_result_decoder(), actions.TaskCallTool),
+    or: [
+      decode.map(create_message_result_decoder(), actions.TaskCreateMessage),
+      decode.map(elicit_result_decoder(), actions.TaskElicit),
+    ],
+  )
 }
 
 fn cancel_task_result_decoder() -> decode.Decoder(actions.CancelTaskResult) {
@@ -2358,11 +2416,14 @@ fn server_task_request_capabilities_decoder() -> decode.Decoder(
   actions.ServerTaskRequestCapabilities,
 ) {
   {
-    use tools_call <- decode.optional_field(
-      "tools",
-      None,
-      decode.optional(value_decoder()),
-    )
+    use tools_call <- decode.optional_field("tools", None, {
+      use call <- decode.optional_field(
+        "call",
+        None,
+        decode.optional(value_decoder()),
+      )
+      decode.success(call)
+    })
     decode.success(actions.ServerTaskRequestCapabilities(tools_call: tools_call))
   }
 }

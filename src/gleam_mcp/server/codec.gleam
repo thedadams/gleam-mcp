@@ -39,6 +39,10 @@ fn message_decoder() -> decode.Decoder(Message) {
       "prompts/get" -> get_prompt_message_decoder()
       "tools/list" -> list_tools_message_decoder()
       "tools/call" -> call_tool_message_decoder()
+      "tasks/list" -> list_tasks_message_decoder()
+      "tasks/get" -> get_task_message_decoder()
+      "tasks/result" -> get_task_result_message_decoder()
+      "tasks/cancel" -> cancel_task_message_decoder()
       "completion/complete" -> complete_message_decoder()
       "logging/setLevel" -> set_logging_level_message_decoder()
       "notifications/initialized" -> initialized_notification_decoder()
@@ -180,6 +184,54 @@ fn complete_message_decoder() -> decode.Decoder(Message) {
   )
 }
 
+fn list_tasks_message_decoder() -> decode.Decoder(Message) {
+  decode_request_message(
+    mcp.method_list_tasks,
+    {
+      use params <- decode.optional_field(
+        "params",
+        actions.PaginatedRequestParams(None, None),
+        paginated_request_params_decoder(),
+      )
+      decode.success(params)
+    },
+    fn(params) { actions.RequestListTasks(params) },
+  )
+}
+
+fn get_task_message_decoder() -> decode.Decoder(Message) {
+  decode_request_message(
+    mcp.method_get_task,
+    {
+      use params <- decode.field("params", task_id_params_decoder())
+      decode.success(params)
+    },
+    fn(params) { actions.RequestGetTask(params) },
+  )
+}
+
+fn get_task_result_message_decoder() -> decode.Decoder(Message) {
+  decode_request_message(
+    mcp.method_get_task_result,
+    {
+      use params <- decode.field("params", task_id_params_decoder())
+      decode.success(params)
+    },
+    fn(params) { actions.RequestGetTaskResult(params) },
+  )
+}
+
+fn cancel_task_message_decoder() -> decode.Decoder(Message) {
+  decode_request_message(
+    mcp.method_cancel_task,
+    {
+      use params <- decode.field("params", task_id_params_decoder())
+      decode.success(params)
+    },
+    fn(params) { actions.RequestCancelTask(params) },
+  )
+}
+
 fn set_logging_level_message_decoder() -> decode.Decoder(Message) {
   decode_request_message(
     mcp.method_set_logging_level,
@@ -276,14 +328,14 @@ fn encode_action_result(result: actions.ActionResult) -> json.Json {
     actions.ResultListTools(value) -> encode_list_tools_result(value)
     actions.ResultCallTool(value) -> encode_call_tool_result(value)
     actions.ResultComplete(value) -> encode_complete_result(value)
-    actions.ResultCreateTask(_) -> json.object([])
+    actions.ResultCreateTask(value) -> encode_create_task_result(value)
     actions.ResultListRoots(_) -> json.object([])
     actions.ResultCreateMessage(value) -> encode_create_message_result(value)
     actions.ResultElicit(value) -> encode_elicit_result(value)
-    actions.ResultGetTask(_) -> json.object([])
-    actions.ResultTaskPayload(_) -> json.object([])
-    actions.ResultCancelTask(_) -> json.object([])
-    actions.ResultListTasks(_) -> json.object([])
+    actions.ResultGetTask(value) -> encode_get_task_result(value)
+    actions.ResultTaskResult(value) -> encode_task_result(value)
+    actions.ResultCancelTask(value) -> encode_cancel_task_result(value)
+    actions.ResultListTasks(value) -> encode_list_tasks_result(value)
   }
 }
 
@@ -407,7 +459,10 @@ fn encode_server_task_request_capabilities(
 ) -> json.Json {
   let actions.ServerTaskRequestCapabilities(tools_call) = capabilities
   []
-  |> append_optional("tools", option_map(tools_call, encode_value))
+  |> append_optional("tools", case tools_call {
+    Some(value) -> Some(json.object([#("call", encode_value(value))]))
+    None -> None
+  })
   |> json.object
 }
 
@@ -491,6 +546,43 @@ fn encode_call_tool_result(result: actions.CallToolResult) -> json.Json {
 fn encode_complete_result(result: actions.CompleteResult) -> json.Json {
   let actions.CompleteResult(completion, meta) = result
   [#("completion", encode_completion_values(completion))]
+  |> append_optional("_meta", option_map(meta, encode_meta))
+  |> json.object
+}
+
+fn encode_create_task_result(result: actions.CreateTaskResult) -> json.Json {
+  let actions.CreateTaskResult(task, meta) = result
+  [#("task", encode_task(task))]
+  |> append_optional("_meta", option_map(meta, encode_meta))
+  |> json.object
+}
+
+fn encode_get_task_result(result: actions.GetTaskResult) -> json.Json {
+  let actions.GetTaskResult(task, meta) = result
+  task_fields(task)
+  |> append_optional("_meta", option_map(meta, encode_meta))
+  |> json.object
+}
+
+fn encode_task_result(result: actions.TaskResult) -> json.Json {
+  case result {
+    actions.TaskCallTool(value) -> encode_call_tool_result(value)
+    actions.TaskCreateMessage(value) -> encode_create_message_result(value)
+    actions.TaskElicit(value) -> encode_elicit_result(value)
+  }
+}
+
+fn encode_cancel_task_result(result: actions.CancelTaskResult) -> json.Json {
+  let actions.CancelTaskResult(task, meta) = result
+  task_fields(task)
+  |> append_optional("_meta", option_map(meta, encode_meta))
+  |> json.object
+}
+
+fn encode_list_tasks_result(result: actions.ListTasksResult) -> json.Json {
+  let actions.ListTasksResult(tasks, page, meta) = result
+  [#("tasks", json.array(tasks, encode_task))]
+  |> append_page(page)
   |> append_optional("_meta", option_map(meta, encode_meta))
   |> json.object
 }
@@ -916,6 +1008,42 @@ fn encode_cursor(cursor: actions.Cursor) -> json.Json {
   json.string(value)
 }
 
+fn encode_task(task: actions.Task) -> json.Json {
+  task_fields(task) |> json.object
+}
+
+fn encode_task_status(status: actions.TaskStatus) -> json.Json {
+  case status {
+    actions.Working -> json.string("working")
+    actions.InputRequired -> json.string("input_required")
+    actions.Completed -> json.string("completed")
+    actions.Failed -> json.string("failed")
+    actions.Cancelled -> json.string("cancelled")
+  }
+}
+
+fn task_fields(task: actions.Task) -> List(#(String, json.Json)) {
+  let actions.Task(
+    task_id,
+    status,
+    status_message,
+    created_at,
+    last_updated_at,
+    ttl_ms,
+    poll_interval_ms,
+  ) = task
+
+  [
+    #("taskId", json.string(task_id)),
+    #("status", encode_task_status(status)),
+    #("createdAt", json.string(created_at)),
+    #("lastUpdatedAt", json.string(last_updated_at)),
+    #("ttl", json.nullable(ttl_ms, json.int)),
+  ]
+  |> append_optional("statusMessage", option_map(status_message, json.string))
+  |> append_optional("pollInterval", option_map(poll_interval_ms, json.int))
+}
+
 fn encode_error(error: jsonrpc.RpcError) -> json.Json {
   let jsonrpc.RpcError(code, message, data) = error
   [#("code", json.int(code)), #("message", json.string(message))]
@@ -1112,16 +1240,22 @@ fn client_task_request_capabilities_decoder() -> decode.Decoder(
   actions.ClientTaskRequestCapabilities,
 ) {
   {
-    use sampling_create_message <- decode.optional_field(
-      "sampling/createMessage",
-      None,
-      decode.optional(value_decoder()),
-    )
-    use elicitation_create <- decode.optional_field(
-      "elicitation/create",
-      None,
-      decode.optional(value_decoder()),
-    )
+    use sampling_create_message <- decode.optional_field("sampling", None, {
+      use create_message <- decode.optional_field(
+        "createMessage",
+        None,
+        decode.optional(value_decoder()),
+      )
+      decode.success(create_message)
+    })
+    use elicitation_create <- decode.optional_field("elicitation", None, {
+      use create <- decode.optional_field(
+        "create",
+        None,
+        decode.optional(value_decoder()),
+      )
+      decode.success(create)
+    })
     decode.success(actions.ClientTaskRequestCapabilities(
       sampling_create_message,
       elicitation_create,
@@ -1281,11 +1415,18 @@ fn notification_meta_decoder() -> decode.Decoder(actions.NotificationMeta) {
 fn task_metadata_decoder() -> decode.Decoder(actions.TaskMetadata) {
   {
     use ttl_ms <- decode.optional_field(
-      "ttlMs",
+      "ttl",
       None,
       decode.optional(decode.int),
     )
     decode.success(actions.TaskMetadata(ttl_ms))
+  }
+}
+
+fn task_id_params_decoder() -> decode.Decoder(actions.TaskIdParams) {
+  {
+    use task_id <- decode.field("taskId", decode.string)
+    decode.success(actions.TaskIdParams(task_id))
   }
 }
 

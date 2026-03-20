@@ -11,6 +11,7 @@ import gleam_mcp/jsonrpc.{
   type Request, type Response, type RpcError, type Value, VObject,
 }
 import gleam_mcp/mcp
+import gleam_mcp/task_store
 
 pub type Root {
   Root(uri: String, name: Option(String), meta: Option(Value))
@@ -53,6 +54,7 @@ pub type Config {
     notify_task_status: Option(
       fn(actions.TaskStatusNotificationParams) -> Result(Nil, RpcError),
     ),
+    task_store: task_store.Store,
     create_message: Option(
       fn(actions.CreateMessageRequestParams) ->
         Result(CreateMessageHandlerResult, RpcError),
@@ -83,6 +85,7 @@ pub fn none() -> Config {
     None,
     None,
     None,
+    task_store.new(),
     None,
     None,
     None,
@@ -106,6 +109,7 @@ pub fn with_list_roots(
     notify_roots_list_changed: notify_roots_list_changed,
     notify_elicitation_complete: notify_elicitation_complete,
     notify_task_status: notify_task_status,
+    task_store: tasks,
     create_message: create_message,
     sampling_tools: sampling_tools,
     sampling_context: sampling_context,
@@ -126,6 +130,7 @@ pub fn with_list_roots(
     notify_roots_list_changed,
     notify_elicitation_complete,
     notify_task_status,
+    tasks,
     create_message,
     sampling_tools,
     sampling_context,
@@ -343,6 +348,7 @@ pub fn with_create_message(
     notify_roots_list_changed: notify_roots_list_changed,
     notify_elicitation_complete: notify_elicitation_complete,
     notify_task_status: notify_task_status,
+    task_store: tasks,
     sampling_tools: sampling_tools,
     sampling_context: sampling_context,
     elicit_form: elicit_form,
@@ -362,6 +368,7 @@ pub fn with_create_message(
     notify_roots_list_changed,
     notify_elicitation_complete,
     notify_task_status,
+    tasks,
     Some(handler),
     sampling_tools,
     sampling_context,
@@ -386,6 +393,7 @@ pub fn with_sampling_tools(
     notify_roots_list_changed: notify_roots_list_changed,
     notify_elicitation_complete: notify_elicitation_complete,
     notify_task_status: notify_task_status,
+    task_store: tasks,
     create_message: create_message,
     sampling_context: sampling_context,
     elicit_form: elicit_form,
@@ -405,6 +413,7 @@ pub fn with_sampling_tools(
     notify_roots_list_changed,
     notify_elicitation_complete,
     notify_task_status,
+    tasks,
     create_message,
     Some(handler),
     sampling_context,
@@ -429,6 +438,7 @@ pub fn with_sampling_context(
     notify_roots_list_changed: notify_roots_list_changed,
     notify_elicitation_complete: notify_elicitation_complete,
     notify_task_status: notify_task_status,
+    task_store: tasks,
     create_message: create_message,
     sampling_tools: sampling_tools,
     elicit_form: elicit_form,
@@ -448,6 +458,7 @@ pub fn with_sampling_context(
     notify_roots_list_changed,
     notify_elicitation_complete,
     notify_task_status,
+    tasks,
     create_message,
     sampling_tools,
     Some(handler),
@@ -473,6 +484,7 @@ pub fn with_elicit_form(
     notify_roots_list_changed: notify_roots_list_changed,
     notify_elicitation_complete: notify_elicitation_complete,
     notify_task_status: notify_task_status,
+    task_store: tasks,
     create_message: create_message,
     sampling_tools: sampling_tools,
     sampling_context: sampling_context,
@@ -492,6 +504,7 @@ pub fn with_elicit_form(
     notify_roots_list_changed,
     notify_elicitation_complete,
     notify_task_status,
+    tasks,
     create_message,
     sampling_tools,
     sampling_context,
@@ -517,6 +530,7 @@ pub fn with_elicit_url(
     notify_roots_list_changed: notify_roots_list_changed,
     notify_elicitation_complete: notify_elicitation_complete,
     notify_task_status: notify_task_status,
+    task_store: tasks,
     create_message: create_message,
     sampling_tools: sampling_tools,
     sampling_context: sampling_context,
@@ -536,6 +550,7 @@ pub fn with_elicit_url(
     notify_roots_list_changed,
     notify_elicitation_complete,
     notify_task_status,
+    tasks,
     create_message,
     sampling_tools,
     sampling_context,
@@ -557,6 +572,7 @@ pub fn to_initialize_capabilities(config: Config) -> ClientCapabilities {
     notify_roots_list_changed: notify_roots_list_changed,
     notify_elicitation_complete: _,
     notify_task_status: _,
+    task_store: _,
     create_message: create_message,
     sampling_tools: sampling_tools,
     sampling_context: sampling_context,
@@ -613,7 +629,27 @@ pub fn to_initialize_capabilities(config: Config) -> ClientCapabilities {
     roots: roots,
     sampling: sampling,
     elicitation: elicitation,
-    tasks: None,
+    tasks: case create_message, elicit_form, elicit_url {
+      None, None, None -> None
+      _, _, _ ->
+        Some(actions.ClientTasksCapabilities(
+          list: Some(VObject([])),
+          cancel: Some(VObject([])),
+          requests: Some(
+            actions.ClientTaskRequestCapabilities(
+              sampling_create_message: case create_message {
+                Some(_) -> Some(VObject([]))
+                None -> None
+              },
+              elicitation_create: case elicit_form, elicit_url {
+                Some(_), _ -> Some(VObject([]))
+                _, Some(_) -> Some(VObject([]))
+                None, None -> None
+              },
+            ),
+          ),
+        ))
+    },
   )
 }
 
@@ -699,6 +735,11 @@ fn dispatch_request(
     actions.RequestCreateMessage(params) ->
       create_message_result(config, id, params)
     actions.RequestElicit(params) -> elicit_result(config, id, params)
+    actions.RequestListTasks(_) -> Ok(list_tasks_result(config, id))
+    actions.RequestGetTask(params) -> get_task_result(config, id, params)
+    actions.RequestGetTaskResult(params) ->
+      get_task_payload_result(config, id, params)
+    actions.RequestCancelTask(params) -> cancel_task_result(config, id, params)
     _ ->
       Ok(jsonrpc.ErrorResponse(Some(id), jsonrpc.method_not_found_error(method)))
   }
@@ -736,14 +777,26 @@ fn create_message_result(
   id: jsonrpc.RequestId,
   params: actions.CreateMessageRequestParams,
 ) -> Result(Response(ActionResult), RpcError) {
-  let Config(create_message: create_message, ..) = config
+  let Config(create_message: create_message, task_store: tasks, ..) = config
 
   case create_message {
     Some(handler) ->
       handler(params)
       |> result.map(fn(result) {
         jsonrpc.ResultResponse(id, case result {
-          CreateMessage(value) -> actions.ResultCreateMessage(value)
+          CreateMessage(value) ->
+            case params.task {
+              Some(actions.TaskMetadata(ttl_ms)) ->
+                actions.ResultCreateTask(actions.CreateTaskResult(
+                  task_store.create(
+                    tasks,
+                    Ok(actions.TaskCreateMessage(value)),
+                    ttl_ms,
+                  ),
+                  None,
+                ))
+              None -> actions.ResultCreateMessage(value)
+            }
           CreateMessageTask(value) -> actions.ResultCreateTask(value)
         })
       })
@@ -760,7 +813,12 @@ fn elicit_result(
   id: jsonrpc.RequestId,
   params: actions.ElicitRequestParams,
 ) -> Result(Response(ActionResult), RpcError) {
-  let Config(elicit_form: elicit_form, elicit_url: elicit_url, ..) = config
+  let Config(
+    elicit_form: elicit_form,
+    elicit_url: elicit_url,
+    task_store: tasks,
+    ..,
+  ) = config
 
   let handler_result = case params {
     actions.ElicitRequestForm(form) ->
@@ -778,9 +836,81 @@ fn elicit_result(
   handler_result
   |> result.map(fn(result) {
     jsonrpc.ResultResponse(id, case result {
-      Elicit(value) -> actions.ResultElicit(value)
+      Elicit(value) ->
+        case task_ttl(params) {
+          Some(ttl_ms) ->
+            actions.ResultCreateTask(actions.CreateTaskResult(
+              task_store.create(
+                tasks,
+                Ok(actions.TaskElicit(value)),
+                Some(ttl_ms),
+              ),
+              None,
+            ))
+          None -> actions.ResultElicit(value)
+        }
       ElicitTask(value) -> actions.ResultCreateTask(value)
     })
+  })
+}
+
+fn list_tasks_result(
+  config: Config,
+  id: jsonrpc.RequestId,
+) -> Response(ActionResult) {
+  let Config(task_store: tasks, ..) = config
+  jsonrpc.ResultResponse(
+    id,
+    actions.ResultListTasks(actions.ListTasksResult(
+      tasks: task_store.list(tasks),
+      page: actions.Page(None),
+      meta: None,
+    )),
+  )
+}
+
+fn get_task_result(
+  config: Config,
+  id: jsonrpc.RequestId,
+  params: actions.TaskIdParams,
+) -> Result(Response(ActionResult), RpcError) {
+  let Config(task_store: tasks, ..) = config
+  let actions.TaskIdParams(task_id) = params
+  task_store.get(tasks, task_id)
+  |> result.map(fn(task) {
+    jsonrpc.ResultResponse(
+      id,
+      actions.ResultGetTask(actions.GetTaskResult(task, None)),
+    )
+  })
+}
+
+fn get_task_payload_result(
+  config: Config,
+  id: jsonrpc.RequestId,
+  params: actions.TaskIdParams,
+) -> Result(Response(ActionResult), RpcError) {
+  let Config(task_store: tasks, ..) = config
+  let actions.TaskIdParams(task_id) = params
+  task_store.result(tasks, task_id)
+  |> result.map(fn(task_result) {
+    jsonrpc.ResultResponse(id, actions.ResultTaskResult(task_result))
+  })
+}
+
+fn cancel_task_result(
+  config: Config,
+  id: jsonrpc.RequestId,
+  params: actions.TaskIdParams,
+) -> Result(Response(ActionResult), RpcError) {
+  let Config(task_store: tasks, ..) = config
+  let actions.TaskIdParams(task_id) = params
+  task_store.cancel(tasks, task_id)
+  |> result.map(fn(task) {
+    jsonrpc.ResultResponse(
+      id,
+      actions.ResultCancelTask(actions.CancelTaskResult(task, None)),
+    )
   })
 }
 
@@ -833,6 +963,7 @@ fn update_callbacks(
     notify_roots_list_changed: current_notify_roots_list_changed,
     notify_elicitation_complete: current_notify_elicitation_complete,
     notify_task_status: current_notify_task_status,
+    task_store: task_store,
     create_message: create_message,
     sampling_tools: sampling_tools,
     sampling_context: sampling_context,
@@ -864,12 +995,27 @@ fn update_callbacks(
       current_notify_elicitation_complete,
     ),
     choose_callback(notify_task_status, current_notify_task_status),
+    task_store,
     create_message,
     sampling_tools,
     sampling_context,
     elicit_form,
     elicit_url,
   )
+}
+
+fn task_ttl(params: actions.ElicitRequestParams) -> Option(Int) {
+  case params {
+    actions.ElicitRequestForm(actions.ElicitRequestFormParams(
+      task: Some(actions.TaskMetadata(ttl_ms)),
+      ..,
+    )) -> ttl_ms
+    actions.ElicitRequestUrl(actions.ElicitRequestUrlParams(
+      task: Some(actions.TaskMetadata(ttl_ms)),
+      ..,
+    )) -> ttl_ms
+    _ -> None
+  }
 }
 
 fn run_callback(

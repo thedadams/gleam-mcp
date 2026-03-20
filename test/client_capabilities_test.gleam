@@ -2,6 +2,7 @@ import gleam/option.{None, Some}
 import gleam_mcp/actions
 import gleam_mcp/client/capabilities
 import gleam_mcp/jsonrpc.{VObject}
+import gleam_mcp/task_store
 import gleeunit
 import gleeunit/should
 
@@ -70,6 +71,51 @@ pub fn helper_builders_enable_sampling_capabilities_test() {
   )
 }
 
+pub fn task_capabilities_are_reported_for_request_handlers_test() {
+  let config =
+    capabilities.none()
+    |> capabilities.with_create_message(fn(_) {
+      Ok(
+        capabilities.CreateMessage(actions.CreateMessageResult(
+          message: actions.SamplingMessage(
+            actions.Assistant,
+            actions.SingleSamplingContent(
+              actions.SamplingText(actions.TextContent("ok", None, None)),
+            ),
+            None,
+          ),
+          model: "demo",
+          stop_reason: None,
+          meta: None,
+        )),
+      )
+    })
+    |> capabilities.with_elicit_form(fn(_) {
+      Ok(
+        capabilities.Elicit(actions.ElicitResult(
+          actions.ElicitAccept,
+          None,
+          None,
+        )),
+      )
+    })
+
+  let actions.ClientCapabilities(tasks: tasks, ..) =
+    capabilities.to_initialize_capabilities(config)
+
+  tasks
+  |> should.equal(
+    Some(actions.ClientTasksCapabilities(
+      list: Some(VObject([])),
+      cancel: Some(VObject([])),
+      requests: Some(actions.ClientTaskRequestCapabilities(
+        sampling_create_message: Some(VObject([])),
+        elicitation_create: Some(VObject([])),
+      )),
+    )),
+  )
+}
+
 pub fn roots_capability_is_disabled_without_list_roots_test() {
   let config =
     capabilities.Config(
@@ -84,6 +130,7 @@ pub fn roots_capability_is_disabled_without_list_roots_test() {
       notify_roots_list_changed: Some(fn() { Ok(Nil) }),
       notify_elicitation_complete: None,
       notify_task_status: None,
+      task_store: task_store.new(),
       create_message: None,
       sampling_tools: None,
       sampling_context: None,
@@ -110,6 +157,7 @@ pub fn sampling_capability_reports_available_handlers_test() {
       notify_roots_list_changed: None,
       notify_elicitation_complete: None,
       notify_task_status: None,
+      task_store: task_store.new(),
       create_message: None,
       sampling_tools: Some(fn(_) { Ok(Nil) }),
       sampling_context: None,
@@ -143,6 +191,7 @@ pub fn elicitation_capability_reports_available_handlers_test() {
       notify_roots_list_changed: None,
       notify_elicitation_complete: None,
       notify_task_status: None,
+      task_store: task_store.new(),
       create_message: None,
       sampling_tools: None,
       sampling_context: None,
