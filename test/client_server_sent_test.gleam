@@ -67,6 +67,49 @@ pub fn decode_server_sent_sampling_request_test() {
   )
 }
 
+pub fn decode_server_sent_sampling_response_test() {
+  let request =
+    jsonrpc.Request(
+      jsonrpc.StringId("req-2"),
+      mcp.method_create_message,
+      Some(
+        actions.ServerRequestCreateMessage(actions.CreateMessageRequestParams(
+          messages: [
+            actions.SamplingMessage(
+              actions.User,
+              actions.SingleSamplingContent(
+                actions.SamplingText(actions.TextContent("Hello", None, None)),
+              ),
+              None,
+            ),
+          ],
+          model_preferences: None,
+          system_prompt: None,
+          include_context: None,
+          temperature: None,
+          max_tokens: 64,
+          stop_sequences: [],
+          metadata: None,
+          tools: [],
+          tool_choice: None,
+          task: None,
+          meta: None,
+        )),
+      ),
+    )
+
+  let assert Ok(jsonrpc.ResultResponse(
+    _,
+    actions.ServerResultCreateMessage(actions.CreateMessageResult(model:, ..)),
+  )) =
+    codec.decode_server_response(
+      "{\"jsonrpc\":\"2.0\",\"id\":\"req-2\",\"result\":{\"model\":\"inspector-model\",\"stopReason\":\"endTurn\",\"role\":\"assistant\",\"content\":{\"type\":\"text\",\"text\":\"Hi back\"}}}",
+      request,
+    )
+
+  should.equal(model, "inspector-model")
+}
+
 pub fn handle_server_sent_roots_request_test() {
   let config =
     capabilities.Config(

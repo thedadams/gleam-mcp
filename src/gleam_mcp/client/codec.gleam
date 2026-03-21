@@ -1742,16 +1742,27 @@ fn server_action_result_decoder(
     actions.ServerRequestPing(_) -> server_empty_result_decoder()
     actions.ServerRequestListRoots(_) ->
       decode.map(list_roots_result_decoder(), actions.ServerResultListRoots)
-    actions.ServerRequestCreateMessage(_) ->
-      decode.one_of(
-        decode.map(create_task_result_decoder(), actions.ServerResultCreateTask),
-        or: [
+    actions.ServerRequestCreateMessage(params) ->
+      case params.task {
+        Some(_) ->
+          decode.one_of(
+            decode.map(
+              create_message_result_decoder(),
+              actions.ServerResultCreateMessage,
+            ),
+            or: [
+              decode.map(
+                create_task_result_decoder(),
+                actions.ServerResultCreateTask,
+              ),
+            ],
+          )
+        None ->
           decode.map(
             create_message_result_decoder(),
             actions.ServerResultCreateMessage,
-          ),
-        ],
-      )
+          )
+      }
     actions.ServerRequestElicit(_) ->
       decode.one_of(
         decode.map(create_task_result_decoder(), actions.ServerResultCreateTask),
@@ -1933,6 +1944,47 @@ fn list_roots_result_decoder() -> decode.Decoder(actions.ListRootsResult) {
 }
 
 fn create_message_result_decoder() -> decode.Decoder(
+  actions.CreateMessageResult,
+) {
+  decode.one_of(legacy_create_message_result_decoder(), or: [
+    standard_create_message_result_decoder(),
+  ])
+}
+
+fn standard_create_message_result_decoder() -> decode.Decoder(
+  actions.CreateMessageResult,
+) {
+  {
+    use role <- decode.field("role", role_decoder())
+    use content <- decode.field(
+      "content",
+      sampling_message_content_block_decoder(),
+    )
+    use model <- decode.field("model", decode.string)
+    use stop_reason <- decode.optional_field(
+      "stopReason",
+      None,
+      decode.optional(decode.string),
+    )
+    use meta <- decode.optional_field(
+      "_meta",
+      None,
+      decode.optional(meta_decoder()),
+    )
+    decode.success(actions.CreateMessageResult(
+      message: actions.SamplingMessage(
+        role,
+        actions.SingleSamplingContent(content),
+        None,
+      ),
+      model: model,
+      stop_reason: stop_reason,
+      meta: meta,
+    ))
+  }
+}
+
+fn legacy_create_message_result_decoder() -> decode.Decoder(
   actions.CreateMessageResult,
 ) {
   {

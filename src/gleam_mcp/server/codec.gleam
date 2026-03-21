@@ -644,8 +644,17 @@ fn encode_create_message_result(
   result: actions.CreateMessageResult,
 ) -> json.Json {
   let actions.CreateMessageResult(message, model, stop_reason, meta) = result
+  let actions.SamplingMessage(role, content, _) = message
+  let content = case content {
+    actions.SingleSamplingContent(block) -> block
+    actions.MultipleSamplingContent([block, ..]) -> block
+    actions.MultipleSamplingContent([]) ->
+      actions.SamplingText(actions.TextContent("", None, None))
+  }
+
   [
-    #("message", encode_sampling_message(message)),
+    #("role", encode_role(role)),
+    #("content", encode_sampling_message_content_block(content)),
     #("model", json.string(model)),
   ]
   |> append_optional("stopReason", option_map(stop_reason, json.string))
@@ -659,22 +668,6 @@ fn encode_elicit_result(result: actions.ElicitResult) -> json.Json {
   |> append_optional("content", option_map(content, encode_elicit_content))
   |> append_optional("_meta", option_map(meta, encode_meta))
   |> json.object
-}
-
-fn encode_sampling_message(message: actions.SamplingMessage) -> json.Json {
-  let actions.SamplingMessage(role, content, meta) = message
-  [#("role", encode_role(role)), #("content", encode_sampling_content(content))]
-  |> append_optional("_meta", option_map(meta, encode_meta))
-  |> json.object
-}
-
-fn encode_sampling_content(content: actions.SamplingContent) -> json.Json {
-  case content {
-    actions.SingleSamplingContent(block) ->
-      encode_sampling_message_content_block(block)
-    actions.MultipleSamplingContent(blocks) ->
-      json.array(blocks, encode_sampling_message_content_block)
-  }
 }
 
 fn encode_sampling_message_content_block(

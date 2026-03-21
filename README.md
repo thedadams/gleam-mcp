@@ -19,3 +19,4 @@ This repository is a work in progress.
 - [ ] Restart HTTP GET for server-sent requests
 - [ ] Convenience functions for processing requests and responses
 - [ ] Separate ActionRequests into client and server requests, and ActionResponses into client and server responses
+- [ ] Ensure proper errors are returned from the streamable HTTP server when the session ID is not sent with non-initialization requests, and when the session ID is invalid
