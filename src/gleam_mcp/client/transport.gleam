@@ -8,7 +8,7 @@ import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
 import gleam_mcp/actions.{
-  type ActionNotification, type ActionRequest, type ActionResult,
+  type ActionNotification, type ClientActionRequest, type ClientActionResult,
 }
 import gleam_mcp/client/capabilities
 import gleam_mcp/client/codec as client_codec
@@ -68,9 +68,9 @@ pub type Runners {
       StdioConfig,
       Option(String),
       capabilities.Config,
-      Request(ActionRequest),
+      Request(ClientActionRequest),
     ) ->
-      Result(TransportResponse(ActionResult), TransportError),
+      Result(TransportResponse(ClientActionResult), TransportError),
     stdio_notification: fn(
       StdioConfig,
       Option(String),
@@ -85,9 +85,9 @@ pub type Runners {
       Option(String),
       String,
       capabilities.Config,
-      Request(ActionRequest),
+      Request(ClientActionRequest),
     ) ->
-      Result(TransportResponse(ActionResult), TransportError),
+      Result(TransportResponse(ClientActionResult), TransportError),
     streamable_notification: fn(
       HttpConfig,
       Option(String),
@@ -201,8 +201,8 @@ fn stdio_process_request(
   config: StdioConfig,
   session_id: Option(String),
   capability_config: capabilities.Config,
-  message: Request(ActionRequest),
-) -> Result(TransportResponse(ActionResult), TransportError) {
+  message: Request(ClientActionRequest),
+) -> Result(TransportResponse(ClientActionResult), TransportError) {
   use #(response_payload, next_session_id) <- result.try(
     stdio_manager.request(
       manager,
@@ -565,7 +565,7 @@ fn process_server_message(
   payload: String,
 ) -> Result(Nil, TransportError) {
   case client_codec.decode_server_message(payload) {
-    Ok(client_codec.ActionRequest(request)) ->
+    Ok(client_codec.ServerActionRequest(request)) ->
       case
         capabilities.handle_request(capability_config, request)
         |> result.map_error(rpc_error_to_transport_error)
@@ -575,7 +575,7 @@ fn process_server_message(
             config,
             session_id,
             protocol_version,
-            server_codec.encode_response(response),
+            server_codec.encode_server_response(response),
           )
         Error(error) -> Error(error)
       }
@@ -587,7 +587,7 @@ fn process_server_message(
         config,
         session_id,
         protocol_version,
-        server_codec.encode_response(jsonrpc.ErrorResponse(
+        server_codec.encode_server_response(jsonrpc.ErrorResponse(
           Some(id),
           jsonrpc.method_not_found_error(method),
         )),

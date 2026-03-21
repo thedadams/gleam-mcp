@@ -15,7 +15,7 @@ pub fn encode_request_serializes_initialize_test() {
       jsonrpc.StringId("req-1"),
       "initialize",
       Some(
-        actions.RequestInitialize(actions.InitializeRequestParams(
+        actions.ClientRequestInitialize(actions.InitializeRequestParams(
           protocol_version: jsonrpc.latest_protocol_version,
           capabilities: actions.ClientCapabilities(None, None, None, None, None),
           client_info: actions.Implementation(
@@ -54,7 +54,7 @@ pub fn decode_response_parses_call_tool_result_test() {
       jsonrpc.StringId("req-1"),
       "tools/call",
       Some(
-        actions.RequestCallTool(actions.CallToolRequestParams(
+        actions.ClientRequestCallTool(actions.CallToolRequestParams(
           "weather",
           None,
           None,
@@ -70,7 +70,7 @@ pub fn decode_response_parses_call_tool_result_test() {
   |> should.equal(
     Ok(jsonrpc.ResultResponse(
       jsonrpc.StringId("req-1"),
-      actions.ResultCallTool(actions.CallToolResult(
+      actions.ClientResultCallTool(actions.CallToolResult(
         content: [actions.TextBlock(actions.TextContent("Sunny", None, None))],
         structured_content: None,
         is_error: Some(False),
@@ -101,7 +101,7 @@ pub fn encode_request_serializes_task_augmented_tool_call_test() {
       jsonrpc.StringId("req-2"),
       "tools/call",
       Some(
-        actions.RequestCallTool(actions.CallToolRequestParams(
+        actions.ClientRequestCallTool(actions.CallToolRequestParams(
           "weather",
           None,
           Some(actions.TaskMetadata(Some(60_000))),
@@ -122,7 +122,7 @@ pub fn decode_response_parses_create_task_result_test() {
       jsonrpc.StringId("req-3"),
       "tools/call",
       Some(
-        actions.RequestCallTool(actions.CallToolRequestParams(
+        actions.ClientRequestCallTool(actions.CallToolRequestParams(
           "weather",
           None,
           Some(actions.TaskMetadata(Some(1000))),
@@ -138,7 +138,7 @@ pub fn decode_response_parses_create_task_result_test() {
   |> should.equal(
     Ok(jsonrpc.ResultResponse(
       jsonrpc.StringId("req-3"),
-      actions.ResultCreateTask(actions.CreateTaskResult(
+      actions.ClientResultCreateTask(actions.CreateTaskResult(
         task: actions.Task(
           task_id: "task-1",
           status: actions.Working,
@@ -159,7 +159,7 @@ pub fn decode_response_parses_task_result_test() {
     jsonrpc.Request(
       jsonrpc.StringId("req-4"),
       "tasks/result",
-      Some(actions.RequestGetTaskResult(actions.TaskIdParams("task-1"))),
+      Some(actions.ClientRequestGetTaskResult(actions.TaskIdParams("task-1"))),
     )
 
   codec.decode_response(
@@ -169,7 +169,7 @@ pub fn decode_response_parses_task_result_test() {
   |> should.equal(
     Ok(jsonrpc.ResultResponse(
       jsonrpc.StringId("req-4"),
-      actions.ResultTaskResult(
+      actions.ClientResultTaskResult(
         actions.TaskCallTool(actions.CallToolResult(
           content: [actions.TextBlock(actions.TextContent("done", None, None))],
           structured_content: None,

@@ -106,7 +106,7 @@ pub fn initialize_sends_requests_and_notification_test() {
       transport.Runners(
         stdio_request: fn(_, _, _, request) {
           case request {
-            jsonrpc.Request(_, method, Some(actions.RequestInitialize(params))) -> {
+            jsonrpc.Request(_, method, Some(actions.ClientRequestInitialize(params))) -> {
               should.equal(method, mcp.method_initialize)
               let actions.InitializeRequestParams(
                 request_protocol_version,
@@ -126,7 +126,7 @@ pub fn initialize_sends_requests_and_notification_test() {
               should.equal(request_meta, None)
               transport_ok(jsonrpc.ResultResponse(
                 jsonrpc.StringId("req-1"),
-                actions.ResultInitialize(sample_initialize_result()),
+                actions.ClientResultInitialize(sample_initialize_result()),
               ))
             }
             _ -> panic
@@ -180,12 +180,12 @@ pub fn initialize_persists_http_session_id_test() {
           should.equal(session_id, None)
 
           case request {
-            jsonrpc.Request(_, method, Some(actions.RequestInitialize(_))) -> {
+            jsonrpc.Request(_, method, Some(actions.ClientRequestInitialize(_))) -> {
               should.equal(method, mcp.method_initialize)
               Ok(transport.TransportResponse(
                 response: jsonrpc.ResultResponse(
                   jsonrpc.StringId("req-1"),
-                  actions.ResultInitialize(sample_initialize_result()),
+                  actions.ClientResultInitialize(sample_initialize_result()),
                 ),
                 session_id: Some("session-1"),
               ))
@@ -236,12 +236,12 @@ pub fn initialize_keeps_http_session_id_when_notification_returns_none_test() {
           should.equal(session_id, None)
 
           case request {
-            jsonrpc.Request(_, method, Some(actions.RequestInitialize(_))) -> {
+            jsonrpc.Request(_, method, Some(actions.ClientRequestInitialize(_))) -> {
               should.equal(method, mcp.method_initialize)
               Ok(transport.TransportResponse(
                 response: jsonrpc.ResultResponse(
                   jsonrpc.StringId("req-1"),
-                  actions.ResultInitialize(sample_initialize_result()),
+                  actions.ClientResultInitialize(sample_initialize_result()),
                 ),
                 session_id: Some("session-1"),
               ))
@@ -316,7 +316,7 @@ pub fn initialize_rejects_unexpected_result_variants_test() {
         stdio_request: fn(_, _, _, _) {
           transport_ok(jsonrpc.ResultResponse(
             jsonrpc.StringId("req-1"),
-            actions.ResultEmpty(None),
+            actions.ClientResultEmpty(None),
           ))
         },
         stdio_notification: fn(_, _, _, _) {
@@ -353,7 +353,7 @@ pub fn initialize_surfaces_notification_errors_test() {
         stdio_request: fn(_, _, _, _) {
           transport_ok(jsonrpc.ResultResponse(
             jsonrpc.StringId("req-1"),
-            actions.ResultInitialize(sample_initialize_result()),
+            actions.ClientResultInitialize(sample_initialize_result()),
           ))
         },
         stdio_notification: fn(_, _, _, _) { Error(transport.TimeoutError) },
@@ -386,7 +386,7 @@ pub fn ping_returns_success_test() {
               should.equal(params, None)
               transport_ok(jsonrpc.ResultResponse(
                 jsonrpc.StringId("req-1"),
-                actions.ResultEmpty(None),
+                actions.ClientResultEmpty(None),
               ))
             }
             _ -> panic
@@ -458,13 +458,13 @@ pub fn list_tools_returns_typed_result_test() {
             jsonrpc.Request(
               _,
               method,
-              Some(actions.RequestListTools(request_params)),
+              Some(actions.ClientRequestListTools(request_params)),
             ) -> {
               should.equal(method, mcp.method_list_tools)
               should.equal(request_params, params)
               transport_ok(jsonrpc.ResultResponse(
                 jsonrpc.StringId("req-1"),
-                actions.ResultListTools(expected),
+                actions.ClientResultListTools(expected),
               ))
             }
             _ -> panic
@@ -498,7 +498,7 @@ pub fn list_tools_rejects_unexpected_result_variants_test() {
         stdio_request: fn(_, _, _, _) {
           transport_ok(jsonrpc.ResultResponse(
             jsonrpc.StringId("req-1"),
-            actions.ResultEmpty(None),
+            actions.ClientResultEmpty(None),
           ))
         },
         stdio_notification: fn(_, _, _, _) {
@@ -539,13 +539,13 @@ pub fn set_logging_level_accepts_empty_results_test() {
             jsonrpc.Request(
               _,
               method,
-              Some(actions.RequestSetLoggingLevel(request_params)),
+              Some(actions.ClientRequestSetLoggingLevel(request_params)),
             ) -> {
               should.equal(method, mcp.method_set_logging_level)
               should.equal(request_params, params)
               transport_ok(jsonrpc.ResultResponse(
                 jsonrpc.StringId("req-1"),
-                actions.ResultEmpty(None),
+                actions.ClientResultEmpty(None),
               ))
             }
             _ -> panic
@@ -583,13 +583,13 @@ pub fn call_tool_accepts_regular_results_test() {
             jsonrpc.Request(
               _,
               method,
-              Some(actions.RequestCallTool(request_params)),
+              Some(actions.ClientRequestCallTool(request_params)),
             ) -> {
               should.equal(method, mcp.method_call_tool)
               should.equal(request_params, params)
               transport_ok(jsonrpc.ResultResponse(
                 jsonrpc.StringId("req-1"),
-                actions.ResultCallTool(expected),
+                actions.ClientResultCallTool(expected),
               ))
             }
             _ -> panic
@@ -625,7 +625,7 @@ pub fn call_tool_accepts_task_results_test() {
         stdio_request: fn(_, _, _, _) {
           transport_ok(jsonrpc.ResultResponse(
             jsonrpc.StringId("req-1"),
-            actions.ResultCreateTask(expected),
+            actions.ClientResultCreateTask(expected),
           ))
         },
         stdio_notification: fn(_, _, _, _) {
@@ -664,7 +664,7 @@ pub fn progress_sends_notification_params_test() {
         stdio_request: fn(_, _, _, _) {
           transport_ok(jsonrpc.ResultResponse(
             jsonrpc.StringId("req-1"),
-            actions.ResultEmpty(None),
+            actions.ClientResultEmpty(None),
           ))
         },
         stdio_notification: fn(_, _, _, request) {
@@ -708,7 +708,7 @@ pub fn roots_list_changed_sends_notification_test() {
         stdio_request: fn(_, _, _, _) {
           transport_ok(jsonrpc.ResultResponse(
             jsonrpc.StringId("req-1"),
-            actions.ResultEmpty(None),
+            actions.ClientResultEmpty(None),
           ))
         },
         stdio_notification: fn(_, _, _, request) {

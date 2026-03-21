@@ -84,7 +84,7 @@ fn handle_message(
   body: String,
 ) -> response.Response(mist.ResponseData) {
   case codec.decode_message(body) {
-    Ok(codec.ActionRequest(message)) -> {
+    Ok(codec.ClientActionRequest(message)) -> {
       let #(_, rpc_response) = server.handle_request(server, message)
       json_response(200, codec.encode_response(rpc_response))
     }

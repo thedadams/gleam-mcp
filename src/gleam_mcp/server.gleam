@@ -398,8 +398,8 @@ pub fn set_logging_handler(server: Server, handler: LoggingHandler) -> Server {
 
 pub fn handle_request(
   server: Server,
-  request: jsonrpc.Request(actions.ActionRequest),
-) -> #(Server, jsonrpc.Response(actions.ActionResult)) {
+  request: jsonrpc.Request(actions.ClientActionRequest),
+) -> #(Server, jsonrpc.Response(actions.ClientActionResult)) {
   case request {
     jsonrpc.Request(id, _method, Some(action)) ->
       case dispatch_request(server, action) {
@@ -444,45 +444,42 @@ pub fn handle_notification(
 
 fn dispatch_request(
   server: Server,
-  action: actions.ActionRequest,
-) -> Result(actions.ActionResult, jsonrpc.RpcError) {
+  action: actions.ClientActionRequest,
+) -> Result(actions.ClientActionResult, jsonrpc.RpcError) {
   case action {
-    actions.RequestInitialize(_) -> Ok(initialization_result(server))
-    actions.RequestPing(_) -> Ok(actions.ResultEmpty(None))
-    actions.RequestListResources(_) -> Ok(list_resources_result(server))
-    actions.RequestListResourceTemplates(_) ->
+    actions.ClientRequestInitialize(_) -> Ok(initialization_result(server))
+    actions.ClientRequestPing(_) -> Ok(actions.ClientResultEmpty(None))
+    actions.ClientRequestListResources(_) -> Ok(list_resources_result(server))
+    actions.ClientRequestListResourceTemplates(_) ->
       Ok(list_resource_templates_result(server))
-    actions.RequestReadResource(params) -> read_resource_result(server, params)
-    actions.RequestSubscribeResource(_) ->
+    actions.ClientRequestReadResource(params) ->
+      read_resource_result(server, params)
+    actions.ClientRequestSubscribeResource(_) ->
       Error(jsonrpc.method_not_found_error(mcp.method_subscribe_resource))
-    actions.RequestUnsubscribeResource(_) ->
+    actions.ClientRequestUnsubscribeResource(_) ->
       Error(jsonrpc.method_not_found_error(mcp.method_unsubscribe_resource))
-    actions.RequestListPrompts(_) -> Ok(list_prompts_result(server))
-    actions.RequestGetPrompt(params) -> get_prompt_result(server, params)
-    actions.RequestListTools(_) -> Ok(list_tools_result(server))
-    actions.RequestCallTool(params) -> call_tool_result(server, params)
-    actions.RequestComplete(params) -> complete_result(server, params)
-    actions.RequestSetLoggingLevel(params) ->
+    actions.ClientRequestListPrompts(_) -> Ok(list_prompts_result(server))
+    actions.ClientRequestGetPrompt(params) -> get_prompt_result(server, params)
+    actions.ClientRequestListTools(_) -> Ok(list_tools_result(server))
+    actions.ClientRequestCallTool(params) -> call_tool_result(server, params)
+    actions.ClientRequestComplete(params) -> complete_result(server, params)
+    actions.ClientRequestSetLoggingLevel(params) ->
       set_logging_level_result(server, params)
-    actions.RequestListRoots(_) ->
-      Error(jsonrpc.method_not_found_error(mcp.method_list_roots))
-    actions.RequestCreateMessage(_) ->
-      Error(jsonrpc.method_not_found_error(mcp.method_create_message))
-    actions.RequestElicit(_) ->
-      Error(jsonrpc.method_not_found_error(mcp.method_elicit))
-    actions.RequestListTasks(params) -> Ok(list_tasks_result(server, params))
-    actions.RequestGetTask(params) -> get_task_result(server, params)
-    actions.RequestGetTaskResult(params) ->
+    actions.ClientRequestListTasks(params) ->
+      Ok(list_tasks_result(server, params))
+    actions.ClientRequestGetTask(params) -> get_task_result(server, params)
+    actions.ClientRequestGetTaskResult(params) ->
       get_task_payload_result(server, params)
-    actions.RequestCancelTask(params) -> cancel_task_result(server, params)
+    actions.ClientRequestCancelTask(params) ->
+      cancel_task_result(server, params)
   }
 }
 
-fn initialization_result(server: Server) -> actions.ActionResult {
+fn initialization_result(server: Server) -> actions.ClientActionResult {
   let Server(implementation: implementation, instructions: instructions, ..) =
     server
 
-  actions.ResultInitialize(actions.InitializeResult(
+  actions.ClientResultInitialize(actions.InitializeResult(
     protocol_version: jsonrpc.latest_protocol_version,
     capabilities: capabilities.infer(
       has_tools: server.tools != [],
@@ -504,7 +501,7 @@ fn initialization_result(server: Server) -> actions.ActionResult {
   ))
 }
 
-fn list_resources_result(server: Server) -> actions.ActionResult {
+fn list_resources_result(server: Server) -> actions.ClientActionResult {
   let Server(resources: resources, ..) = server
   let listed =
     resources
@@ -514,14 +511,14 @@ fn list_resources_result(server: Server) -> actions.ActionResult {
       resource
     })
 
-  actions.ResultListResources(actions.ListResourcesResult(
+  actions.ClientResultListResources(actions.ListResourcesResult(
     resources: listed,
     page: actions.Page(None),
     meta: None,
   ))
 }
 
-fn list_resource_templates_result(server: Server) -> actions.ActionResult {
+fn list_resource_templates_result(server: Server) -> actions.ClientActionResult {
   let Server(resource_templates: resource_templates, ..) = server
   let listed =
     resource_templates
@@ -531,7 +528,7 @@ fn list_resource_templates_result(server: Server) -> actions.ActionResult {
       resource_template
     })
 
-  actions.ResultListResourceTemplates(actions.ListResourceTemplatesResult(
+  actions.ClientResultListResourceTemplates(actions.ListResourceTemplatesResult(
     resource_templates: listed,
     page: actions.Page(None),
     meta: None,
@@ -541,14 +538,14 @@ fn list_resource_templates_result(server: Server) -> actions.ActionResult {
 fn read_resource_result(
   server: Server,
   params: actions.ReadResourceRequestParams,
-) -> Result(actions.ActionResult, jsonrpc.RpcError) {
+) -> Result(actions.ClientActionResult, jsonrpc.RpcError) {
   let actions.ReadResourceRequestParams(uri, _) = params
 
   case find_resource(server.resources, uri) {
     Ok(RegisteredResource(handler:, ..)) ->
       handler()
       |> result.map(fn(contents) {
-        actions.ResultReadResource(actions.ReadResourceResult(
+        actions.ClientResultReadResource(actions.ReadResourceResult(
           contents:,
           meta: None,
         ))
@@ -558,7 +555,7 @@ fn read_resource_result(
         Ok(RegisteredResourceTemplate(handler:, ..)) ->
           handler(uri)
           |> result.map(fn(contents) {
-            actions.ResultReadResource(actions.ReadResourceResult(
+            actions.ClientResultReadResource(actions.ReadResourceResult(
               contents:,
               meta: None,
             ))
@@ -569,7 +566,7 @@ fn read_resource_result(
   }
 }
 
-fn list_prompts_result(server: Server) -> actions.ActionResult {
+fn list_prompts_result(server: Server) -> actions.ClientActionResult {
   let Server(prompts: prompts, ..) = server
   let listed =
     prompts
@@ -579,7 +576,7 @@ fn list_prompts_result(server: Server) -> actions.ActionResult {
       prompt
     })
 
-  actions.ResultListPrompts(actions.ListPromptsResult(
+  actions.ClientResultListPrompts(actions.ListPromptsResult(
     prompts: listed,
     page: actions.Page(None),
     meta: None,
@@ -589,19 +586,19 @@ fn list_prompts_result(server: Server) -> actions.ActionResult {
 fn get_prompt_result(
   server: Server,
   params: actions.GetPromptRequestParams,
-) -> Result(actions.ActionResult, jsonrpc.RpcError) {
+) -> Result(actions.ClientActionResult, jsonrpc.RpcError) {
   let actions.GetPromptRequestParams(name, arguments, _) = params
 
   case find_prompt(server.prompts, name) {
     Ok(RegisteredPrompt(handler:, ..)) ->
       handler(arguments)
-      |> result.map(actions.ResultGetPrompt)
+      |> result.map(actions.ClientResultGetPrompt)
     Error(Nil) ->
       Error(jsonrpc.invalid_params_error("Unknown prompt: " <> name))
   }
 }
 
-fn list_tools_result(server: Server) -> actions.ActionResult {
+fn list_tools_result(server: Server) -> actions.ClientActionResult {
   let Server(tools: tools, ..) = server
   let listed =
     tools
@@ -611,7 +608,7 @@ fn list_tools_result(server: Server) -> actions.ActionResult {
       tool
     })
 
-  actions.ResultListTools(actions.ListToolsResult(
+  actions.ClientResultListTools(actions.ListToolsResult(
     tools: listed,
     page: actions.Page(None),
     meta: None,
@@ -621,7 +618,7 @@ fn list_tools_result(server: Server) -> actions.ActionResult {
 fn call_tool_result(
   server: Server,
   params: actions.CallToolRequestParams,
-) -> Result(actions.ActionResult, jsonrpc.RpcError) {
+) -> Result(actions.ClientActionResult, jsonrpc.RpcError) {
   let actions.CallToolRequestParams(name, arguments, task, _) = params
 
   case find_tool(server.tools, name) {
@@ -630,9 +627,14 @@ fn call_tool_result(
         Some(actions.TaskMetadata(ttl_ms)) -> {
           let outcome = handler(arguments) |> result.map(actions.TaskCallTool)
           let created = task_store.create(server.task_store, outcome, ttl_ms)
-          Ok(actions.ResultCreateTask(actions.CreateTaskResult(created, None)))
+          Ok(
+            actions.ClientResultCreateTask(actions.CreateTaskResult(
+              created,
+              None,
+            )),
+          )
         }
-        None -> handler(arguments) |> result.map(actions.ResultCallTool)
+        None -> handler(arguments) |> result.map(actions.ClientResultCallTool)
       }
     Error(Nil) -> Error(jsonrpc.invalid_params_error("Unknown tool: " <> name))
   }
@@ -641,8 +643,8 @@ fn call_tool_result(
 fn list_tasks_result(
   server: Server,
   _params: actions.PaginatedRequestParams,
-) -> actions.ActionResult {
-  actions.ResultListTasks(actions.ListTasksResult(
+) -> actions.ClientActionResult {
+  actions.ClientResultListTasks(actions.ListTasksResult(
     tasks: task_store.list(server.task_store),
     page: actions.Page(None),
     meta: None,
@@ -652,40 +654,40 @@ fn list_tasks_result(
 fn get_task_result(
   server: Server,
   params: actions.TaskIdParams,
-) -> Result(actions.ActionResult, jsonrpc.RpcError) {
+) -> Result(actions.ClientActionResult, jsonrpc.RpcError) {
   let actions.TaskIdParams(task_id) = params
   task_store.get(server.task_store, task_id)
   |> result.map(fn(task) {
-    actions.ResultGetTask(actions.GetTaskResult(task, None))
+    actions.ClientResultGetTask(actions.GetTaskResult(task, None))
   })
 }
 
 fn get_task_payload_result(
   server: Server,
   params: actions.TaskIdParams,
-) -> Result(actions.ActionResult, jsonrpc.RpcError) {
+) -> Result(actions.ClientActionResult, jsonrpc.RpcError) {
   let actions.TaskIdParams(task_id) = params
   task_store.result(server.task_store, task_id)
-  |> result.map(actions.ResultTaskResult)
+  |> result.map(actions.ClientResultTaskResult)
 }
 
 fn cancel_task_result(
   server: Server,
   params: actions.TaskIdParams,
-) -> Result(actions.ActionResult, jsonrpc.RpcError) {
+) -> Result(actions.ClientActionResult, jsonrpc.RpcError) {
   let actions.TaskIdParams(task_id) = params
   task_store.cancel(server.task_store, task_id)
   |> result.map(fn(task) {
-    actions.ResultCancelTask(actions.CancelTaskResult(task, None))
+    actions.ClientResultCancelTask(actions.CancelTaskResult(task, None))
   })
 }
 
 fn complete_result(
   server: Server,
   params: actions.CompleteRequestParams,
-) -> Result(actions.ActionResult, jsonrpc.RpcError) {
+) -> Result(actions.ClientActionResult, jsonrpc.RpcError) {
   case server.completion_handler {
-    Some(handler) -> handler(params) |> result.map(actions.ResultComplete)
+    Some(handler) -> handler(params) |> result.map(actions.ClientResultComplete)
     None -> Error(jsonrpc.method_not_found_error(mcp.method_complete))
   }
 }
@@ -693,10 +695,10 @@ fn complete_result(
 fn set_logging_level_result(
   server: Server,
   params: actions.SetLevelRequestParams,
-) -> Result(actions.ActionResult, jsonrpc.RpcError) {
+) -> Result(actions.ClientActionResult, jsonrpc.RpcError) {
   case server.logging_handler {
     Some(handler) ->
-      handler(params) |> result.map(fn(_) { actions.ResultEmpty(None) })
+      handler(params) |> result.map(fn(_) { actions.ClientResultEmpty(None) })
     None -> Error(jsonrpc.method_not_found_error(mcp.method_set_logging_level))
   }
 }

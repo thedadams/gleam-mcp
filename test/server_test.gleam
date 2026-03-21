@@ -22,7 +22,7 @@ pub fn initialize_infers_capabilities_test() {
       jsonrpc.StringId("req-1"),
       mcp.method_initialize,
       Some(
-        actions.RequestInitialize(actions.InitializeRequestParams(
+        actions.ClientRequestInitialize(actions.InitializeRequestParams(
           protocol_version: jsonrpc.latest_protocol_version,
           capabilities: capabilities.none()
             |> capabilities.to_initialize_capabilities,
@@ -36,7 +36,7 @@ pub fn initialize_infers_capabilities_test() {
     server.handle_request(example_server.sample_server(), request)
 
   case response {
-    jsonrpc.ResultResponse(_, actions.ResultInitialize(result)) -> {
+    jsonrpc.ResultResponse(_, actions.ClientResultInitialize(result)) -> {
       should.equal(result.protocol_version, jsonrpc.latest_protocol_version)
       should.equal(result.instructions, Some("Use the Gleam MCP demo server."))
 
@@ -73,7 +73,7 @@ pub fn resources_prompts_tools_completion_and_logging_test() {
         jsonrpc.StringId("resources"),
         mcp.method_list_resources,
         Some(
-          actions.RequestListResources(actions.PaginatedRequestParams(
+          actions.ClientRequestListResources(actions.PaginatedRequestParams(
             None,
             None,
           )),
@@ -82,7 +82,7 @@ pub fn resources_prompts_tools_completion_and_logging_test() {
     )
 
   case resources_response {
-    jsonrpc.ResultResponse(_, actions.ResultListResources(result)) -> {
+    jsonrpc.ResultResponse(_, actions.ClientResultListResources(result)) -> {
       should.equal(list.length(result.resources), 1)
       case result.resources {
         [actions.Resource(uri:, ..)] ->
@@ -100,7 +100,7 @@ pub fn resources_prompts_tools_completion_and_logging_test() {
         jsonrpc.StringId("templates"),
         mcp.method_list_resource_templates,
         Some(
-          actions.RequestListResourceTemplates(actions.PaginatedRequestParams(
+          actions.ClientRequestListResourceTemplates(actions.PaginatedRequestParams(
             None,
             None,
           )),
@@ -109,7 +109,7 @@ pub fn resources_prompts_tools_completion_and_logging_test() {
     )
 
   case templates_response {
-    jsonrpc.ResultResponse(_, actions.ResultListResourceTemplates(result)) -> {
+    jsonrpc.ResultResponse(_, actions.ClientResultListResourceTemplates(result)) -> {
       should.equal(list.length(result.resource_templates), 1)
       case result.resource_templates {
         [actions.ResourceTemplate(uri_template:, ..)] ->
@@ -127,7 +127,7 @@ pub fn resources_prompts_tools_completion_and_logging_test() {
         jsonrpc.StringId("read"),
         mcp.method_read_resource,
         Some(
-          actions.RequestReadResource(actions.ReadResourceRequestParams(
+          actions.ClientRequestReadResource(actions.ReadResourceRequestParams(
             "demo://resource/dynamic/42",
             None,
           )),
@@ -136,7 +136,7 @@ pub fn resources_prompts_tools_completion_and_logging_test() {
     )
 
   case read_response {
-    jsonrpc.ResultResponse(_, actions.ResultReadResource(result)) -> {
+    jsonrpc.ResultResponse(_, actions.ClientResultReadResource(result)) -> {
       should.be_true(
         list.any(result.contents, fn(content) {
           case content {
@@ -159,7 +159,7 @@ pub fn resources_prompts_tools_completion_and_logging_test() {
         jsonrpc.StringId("prompt"),
         mcp.method_get_prompt,
         Some(
-          actions.RequestGetPrompt(actions.GetPromptRequestParams(
+          actions.ClientRequestGetPrompt(actions.GetPromptRequestParams(
             "simple-prompt",
             None,
             None,
@@ -169,7 +169,7 @@ pub fn resources_prompts_tools_completion_and_logging_test() {
     )
 
   case prompt_response {
-    jsonrpc.ResultResponse(_, actions.ResultGetPrompt(result)) -> {
+    jsonrpc.ResultResponse(_, actions.ClientResultGetPrompt(result)) -> {
       should.be_true(
         list.any(result.messages, fn(message) {
           let actions.PromptMessage(content:, ..) = message
@@ -191,7 +191,7 @@ pub fn resources_prompts_tools_completion_and_logging_test() {
         jsonrpc.StringId("tool"),
         mcp.method_call_tool,
         Some(
-          actions.RequestCallTool(actions.CallToolRequestParams(
+          actions.ClientRequestCallTool(actions.CallToolRequestParams(
             "echo",
             Some(dict.from_list([#("message", jsonrpc.VString("hello"))])),
             None,
@@ -202,7 +202,7 @@ pub fn resources_prompts_tools_completion_and_logging_test() {
     )
 
   case tool_response {
-    jsonrpc.ResultResponse(_, actions.ResultCallTool(result)) -> {
+    jsonrpc.ResultResponse(_, actions.ClientResultCallTool(result)) -> {
       should.be_true(
         list.any(result.content, fn(block) {
           case block {
@@ -223,7 +223,7 @@ pub fn resources_prompts_tools_completion_and_logging_test() {
         jsonrpc.StringId("complete"),
         mcp.method_complete,
         Some(
-          actions.RequestComplete(actions.CompleteRequestParams(
+          actions.ClientRequestComplete(actions.CompleteRequestParams(
             actions.PromptRef("simple-prompt", None),
             actions.CompleteArgument("topic", "gleam"),
             None,
@@ -234,7 +234,7 @@ pub fn resources_prompts_tools_completion_and_logging_test() {
     )
 
   case complete_response {
-    jsonrpc.ResultResponse(_, actions.ResultComplete(result)) -> {
+    jsonrpc.ResultResponse(_, actions.ClientResultComplete(result)) -> {
       should.equal(result.completion.values, ["gleam-prompt"])
     }
     _ -> should.fail()
@@ -247,7 +247,7 @@ pub fn resources_prompts_tools_completion_and_logging_test() {
         jsonrpc.StringId("logging"),
         mcp.method_set_logging_level,
         Some(
-          actions.RequestSetLoggingLevel(actions.SetLevelRequestParams(
+          actions.ClientRequestSetLoggingLevel(actions.SetLevelRequestParams(
             actions.Info,
             None,
           )),
@@ -259,7 +259,7 @@ pub fn resources_prompts_tools_completion_and_logging_test() {
     logging_response,
     jsonrpc.ResultResponse(
       jsonrpc.StringId("logging"),
-      actions.ResultEmpty(None),
+      actions.ClientResultEmpty(None),
     ),
   )
 }
@@ -273,7 +273,7 @@ pub fn missing_completion_handler_returns_method_not_found_test() {
         jsonrpc.StringId("complete"),
         mcp.method_complete,
         Some(
-          actions.RequestComplete(actions.CompleteRequestParams(
+          actions.ClientRequestComplete(actions.CompleteRequestParams(
             actions.PromptRef("simple-prompt", None),
             actions.CompleteArgument("topic", "gleam"),
             None,
@@ -299,7 +299,7 @@ pub fn task_backed_tool_calls_can_be_polled_test() {
         jsonrpc.StringId("task-create"),
         mcp.method_call_tool,
         Some(
-          actions.RequestCallTool(actions.CallToolRequestParams(
+          actions.ClientRequestCallTool(actions.CallToolRequestParams(
             "echo",
             Some(dict.from_list([#("message", jsonrpc.VString("hello"))])),
             Some(actions.TaskMetadata(Some(1000))),
@@ -312,7 +312,7 @@ pub fn task_backed_tool_calls_can_be_polled_test() {
   let task = case create_response {
     jsonrpc.ResultResponse(
       _,
-      actions.ResultCreateTask(actions.CreateTaskResult(task: task, ..)),
+      actions.ClientResultCreateTask(actions.CreateTaskResult(task: task, ..)),
     ) -> task
     _ -> panic as string.inspect(create_response)
   }
@@ -326,13 +326,13 @@ pub fn task_backed_tool_calls_can_be_polled_test() {
         jsonrpc.StringId("task-list"),
         mcp.method_list_tasks,
         Some(
-          actions.RequestListTasks(actions.PaginatedRequestParams(None, None)),
+          actions.ClientRequestListTasks(actions.PaginatedRequestParams(None, None)),
         ),
       ),
     )
 
   case list_response {
-    jsonrpc.ResultResponse(_, actions.ResultListTasks(result)) ->
+    jsonrpc.ResultResponse(_, actions.ClientResultListTasks(result)) ->
       should.be_true(
         list.any(result.tasks, fn(entry) { entry.task_id == task.task_id }),
       )
@@ -345,14 +345,14 @@ pub fn task_backed_tool_calls_can_be_polled_test() {
       jsonrpc.Request(
         jsonrpc.StringId("task-get"),
         mcp.method_get_task,
-        Some(actions.RequestGetTask(actions.TaskIdParams(task.task_id))),
+        Some(actions.ClientRequestGetTask(actions.TaskIdParams(task.task_id))),
       ),
     )
 
   case get_response {
     jsonrpc.ResultResponse(
       _,
-      actions.ResultGetTask(actions.GetTaskResult(task:, ..)),
+      actions.ClientResultGetTask(actions.GetTaskResult(task:, ..)),
     ) -> should.equal(task.status, actions.Completed)
     _ -> should.fail()
   }
@@ -363,14 +363,14 @@ pub fn task_backed_tool_calls_can_be_polled_test() {
       jsonrpc.Request(
         jsonrpc.StringId("task-result"),
         mcp.method_get_task_result,
-        Some(actions.RequestGetTaskResult(actions.TaskIdParams(task.task_id))),
+        Some(actions.ClientRequestGetTaskResult(actions.TaskIdParams(task.task_id))),
       ),
     )
 
   case result_response {
     jsonrpc.ResultResponse(
       _,
-      actions.ResultTaskResult(actions.TaskCallTool(actions.CallToolResult(
+      actions.ClientResultTaskResult(actions.TaskCallTool(actions.CallToolResult(
         content:,
         ..,
       ))),
@@ -397,7 +397,7 @@ pub fn task_backed_tool_calls_can_be_cancelled_test() {
         jsonrpc.StringId("task-create"),
         mcp.method_call_tool,
         Some(
-          actions.RequestCallTool(actions.CallToolRequestParams(
+          actions.ClientRequestCallTool(actions.CallToolRequestParams(
             "echo",
             Some(dict.from_list([#("message", jsonrpc.VString("hello"))])),
             Some(actions.TaskMetadata(Some(1000))),
@@ -410,7 +410,7 @@ pub fn task_backed_tool_calls_can_be_cancelled_test() {
   let task_id = case create_response {
     jsonrpc.ResultResponse(
       _,
-      actions.ResultCreateTask(actions.CreateTaskResult(
+      actions.ClientResultCreateTask(actions.CreateTaskResult(
         task: actions.Task(task_id:, ..),
         ..,
       )),
@@ -424,14 +424,14 @@ pub fn task_backed_tool_calls_can_be_cancelled_test() {
       jsonrpc.Request(
         jsonrpc.StringId("task-cancel"),
         mcp.method_cancel_task,
-        Some(actions.RequestCancelTask(actions.TaskIdParams(task_id))),
+        Some(actions.ClientRequestCancelTask(actions.TaskIdParams(task_id))),
       ),
     )
 
   case cancel_response {
     jsonrpc.ResultResponse(
       _,
-      actions.ResultCancelTask(actions.CancelTaskResult(task:, ..)),
+      actions.ClientResultCancelTask(actions.CancelTaskResult(task:, ..)),
     ) -> should.equal(task.status, actions.Cancelled)
     _ -> should.fail()
   }
@@ -442,7 +442,7 @@ pub fn task_backed_tool_calls_can_be_cancelled_test() {
       jsonrpc.Request(
         jsonrpc.StringId("task-result"),
         mcp.method_get_task_result,
-        Some(actions.RequestGetTaskResult(actions.TaskIdParams(task_id))),
+        Some(actions.ClientRequestGetTaskResult(actions.TaskIdParams(task_id))),
       ),
     )
 

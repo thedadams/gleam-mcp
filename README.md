@@ -18,3 +18,4 @@ This repository is a work in progress.
 - [ ] Support for cancellation in both directions
 - [ ] Restart HTTP GET for server-sent requests
 - [ ] Convenience functions for processing requests and responses
+- [ ] Separate ActionRequests into client and server requests, and ActionResponses into client and server responses

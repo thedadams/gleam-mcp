@@ -13,7 +13,7 @@ pub fn main() {
 }
 
 pub fn decode_server_sent_roots_request_test() {
-  let assert Ok(codec.ActionRequest(request)) =
+  let assert Ok(codec.ServerActionRequest(request)) =
     codec.decode_server_message(
       "{\"jsonrpc\":\"2.0\",\"id\":\"req-1\",\"method\":\"roots/list\"}",
     )
@@ -23,13 +23,13 @@ pub fn decode_server_sent_roots_request_test() {
     jsonrpc.Request(
       jsonrpc.StringId("req-1"),
       mcp.method_list_roots,
-      Some(actions.RequestListRoots(None)),
+      Some(actions.ServerRequestListRoots(None)),
     ),
   )
 }
 
 pub fn decode_server_sent_sampling_request_test() {
-  let assert Ok(codec.ActionRequest(request)) =
+  let assert Ok(codec.ServerActionRequest(request)) =
     codec.decode_server_message(
       "{\"jsonrpc\":\"2.0\",\"id\":\"req-2\",\"method\":\"sampling/createMessage\",\"params\":{\"messages\":[{\"role\":\"user\",\"content\":{\"type\":\"text\",\"text\":\"Hello\"}}],\"maxTokens\":64}}",
     )
@@ -40,7 +40,7 @@ pub fn decode_server_sent_sampling_request_test() {
       jsonrpc.StringId("req-2"),
       mcp.method_create_message,
       Some(
-        actions.RequestCreateMessage(actions.CreateMessageRequestParams(
+        actions.ServerRequestCreateMessage(actions.CreateMessageRequestParams(
           messages: [
             actions.SamplingMessage(
               actions.User,
@@ -99,7 +99,7 @@ pub fn handle_server_sent_roots_request_test() {
       jsonrpc.Request(
         jsonrpc.StringId("req-1"),
         mcp.method_list_roots,
-        Some(actions.RequestListRoots(None)),
+        Some(actions.ServerRequestListRoots(None)),
       ),
     )
     |> should.be_ok
@@ -108,7 +108,7 @@ pub fn handle_server_sent_roots_request_test() {
     result,
     jsonrpc.ResultResponse(
       jsonrpc.StringId("req-1"),
-      actions.ResultListRoots(actions.ListRootsResult(
+      actions.ServerResultListRoots(actions.ListRootsResult(
         roots: [actions.Root("file:///workspace", Some("workspace"), None)],
         meta: None,
       )),
@@ -175,7 +175,7 @@ pub fn handle_server_sent_sampling_request_test() {
       jsonrpc.Request(
         jsonrpc.StringId("req-2"),
         mcp.method_create_message,
-        Some(actions.RequestCreateMessage(params)),
+        Some(actions.ServerRequestCreateMessage(params)),
       ),
     )
     |> should.be_ok
@@ -183,7 +183,7 @@ pub fn handle_server_sent_sampling_request_test() {
   case result {
     jsonrpc.ResultResponse(
       _,
-      actions.ResultCreateMessage(actions.CreateMessageResult(model:, ..)),
+      actions.ServerResultCreateMessage(actions.CreateMessageResult(model:, ..)),
     ) -> should.equal(model, "test-model")
     _ -> should.fail()
   }
@@ -231,14 +231,14 @@ pub fn handle_server_sent_sampling_task_request_test() {
       jsonrpc.Request(
         jsonrpc.StringId("req-2"),
         mcp.method_create_message,
-        Some(actions.RequestCreateMessage(params)),
+        Some(actions.ServerRequestCreateMessage(params)),
       ),
     )
     |> should.be_ok
   {
     jsonrpc.ResultResponse(
       _,
-      actions.ResultCreateTask(actions.CreateTaskResult(task:, ..)),
+      actions.ServerResultCreateTask(actions.CreateTaskResult(task:, ..)),
     ) -> task.task_id
     _ -> panic
   }
@@ -249,7 +249,7 @@ pub fn handle_server_sent_sampling_task_request_test() {
       jsonrpc.Request(
         jsonrpc.StringId("req-3"),
         mcp.method_get_task,
-        Some(actions.RequestGetTask(actions.TaskIdParams(task_id))),
+        Some(actions.ServerRequestGetTask(actions.TaskIdParams(task_id))),
       ),
     )
     |> should.be_ok
@@ -257,7 +257,7 @@ pub fn handle_server_sent_sampling_task_request_test() {
   case get_result {
     jsonrpc.ResultResponse(
       _,
-      actions.ResultGetTask(actions.GetTaskResult(task:, ..)),
+      actions.ServerResultGetTask(actions.GetTaskResult(task:, ..)),
     ) -> should.equal(task.status, actions.Completed)
     _ -> should.fail()
   }
@@ -268,7 +268,7 @@ pub fn handle_server_sent_sampling_task_request_test() {
       jsonrpc.Request(
         jsonrpc.StringId("req-4"),
         mcp.method_get_task_result,
-        Some(actions.RequestGetTaskResult(actions.TaskIdParams(task_id))),
+        Some(actions.ServerRequestGetTaskResult(actions.TaskIdParams(task_id))),
       ),
     )
     |> should.be_ok
@@ -276,7 +276,7 @@ pub fn handle_server_sent_sampling_task_request_test() {
   case result {
     jsonrpc.ResultResponse(
       _,
-      actions.ResultTaskResult(actions.TaskCreateMessage(actions.CreateMessageResult(
+      actions.ServerResultTaskResult(actions.TaskCreateMessage(actions.CreateMessageResult(
         model:,
         ..,
       ))),

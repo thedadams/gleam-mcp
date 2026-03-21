@@ -1,3 +1,4 @@
 /build
+/src/everything
 src/gleam_mcp_client.gleam
 src/gleam_mcp_client_ffi.erl

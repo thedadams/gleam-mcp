@@ -14,7 +14,7 @@ import stdin
 type PendingInteraction {
   PendingInteraction(
     tool_call_id: jsonrpc.RequestId,
-    request: jsonrpc.Request(actions.ActionRequest),
+    request: jsonrpc.Request(actions.ServerActionRequest),
     prefix: String,
   )
 }
@@ -31,7 +31,8 @@ pub fn main() -> Nil {
 
 fn handle_line(state: State, line: String) -> State {
   case server_codec.decode_message(line) {
-    Ok(server_codec.ActionRequest(request)) -> handle_request(state, request)
+    Ok(server_codec.ClientActionRequest(request)) ->
+      handle_request(state, request)
     Ok(server_codec.ActionNotification(_)) -> state
     Ok(server_codec.UnknownRequest(id, method)) -> {
       respond(jsonrpc.ErrorResponse(
@@ -47,18 +48,18 @@ fn handle_line(state: State, line: String) -> State {
 
 fn handle_request(
   state: State,
-  request: jsonrpc.Request(actions.ActionRequest),
+  request: jsonrpc.Request(actions.ClientActionRequest),
 ) -> State {
   case request {
-    jsonrpc.Request(id, _, Some(actions.RequestInitialize(_))) -> {
+    jsonrpc.Request(id, _, Some(actions.ClientRequestInitialize(_))) -> {
       respond(jsonrpc.ResultResponse(id, initialize_result()))
       state
     }
-    jsonrpc.Request(id, _, Some(actions.RequestListTools(_))) -> {
+    jsonrpc.Request(id, _, Some(actions.ClientRequestListTools(_))) -> {
       respond(jsonrpc.ResultResponse(id, list_tools_result()))
       state
     }
-    jsonrpc.Request(id, _, Some(actions.RequestCallTool(params))) ->
+    jsonrpc.Request(id, _, Some(actions.ClientRequestCallTool(params))) ->
       start_interaction(id, params.name)
     jsonrpc.Request(id, method, _) -> {
       respond(jsonrpc.ErrorResponse(
@@ -80,7 +81,7 @@ fn start_interaction(tool_call_id: jsonrpc.RequestId, name: String) -> State {
   }
 
   let PendingInteraction(request:, ..) = pending
-  io.println(client_codec.encode_request(request))
+  io.println(client_codec.encode_server_request(request))
   State(Some(pending))
 }
 
@@ -94,7 +95,7 @@ fn handle_pending_response(state: State, line: String) -> State {
           let PendingInteraction(tool_call_id, _, prefix) = interaction
           respond(jsonrpc.ResultResponse(
             tool_call_id,
-            actions.ResultCallTool(actions.CallToolResult(
+            actions.ClientResultCallTool(actions.CallToolResult(
               content: [
                 actions.TextBlock(actions.TextContent(
                   prefix <> text,
@@ -120,13 +121,13 @@ fn interaction_response(
 ) -> Result(String, Nil) {
   let PendingInteraction(_, request, _) = interaction
   case request {
-    jsonrpc.Request(_, _, Some(actions.RequestCreateMessage(_))) ->
+    jsonrpc.Request(_, _, Some(actions.ServerRequestCreateMessage(_))) ->
       extract_json_string(line, "text")
     _ ->
-      case client_codec.decode_response(line, request) {
-        Ok(jsonrpc.ResultResponse(_, actions.ResultElicit(result))) ->
+      case client_codec.decode_server_response(line, request) {
+        Ok(jsonrpc.ResultResponse(_, actions.ServerResultElicit(result))) ->
           extract_elicitation_text(result)
-        Ok(jsonrpc.ResultResponse(_, actions.ResultCreateMessage(result))) ->
+        Ok(jsonrpc.ResultResponse(_, actions.ServerResultCreateMessage(result))) ->
           extract_sampling_text(result)
         _ -> Error(Nil)
       }
@@ -171,8 +172,8 @@ fn extract_sampling_text(
   }
 }
 
-fn initialize_result() -> actions.ActionResult {
-  actions.ResultInitialize(actions.InitializeResult(
+fn initialize_result() -> actions.ClientActionResult {
+  actions.ClientResultInitialize(actions.InitializeResult(
     protocol_version: jsonrpc.latest_protocol_version,
     capabilities: server_capabilities.infer(
       has_tools: True,
@@ -195,8 +196,8 @@ fn initialize_result() -> actions.ActionResult {
   ))
 }
 
-fn list_tools_result() -> actions.ActionResult {
-  actions.ResultListTools(actions.ListToolsResult(
+fn list_tools_result() -> actions.ClientActionResult {
+  actions.ClientResultListTools(actions.ListToolsResult(
     tools: [
       actions.Tool(
         name: "roundtrip-elicitation",
@@ -226,12 +227,14 @@ fn list_tools_result() -> actions.ActionResult {
   ))
 }
 
-fn elicitation_request(name: String) -> jsonrpc.Request(actions.ActionRequest) {
+fn elicitation_request(
+  name: String,
+) -> jsonrpc.Request(actions.ServerActionRequest) {
   jsonrpc.Request(
     jsonrpc.StringId("elicit-1"),
     mcp.method_elicit,
     Some(
-      actions.RequestElicit(
+      actions.ServerRequestElicit(
         actions.ElicitRequestForm(actions.ElicitRequestFormParams(
           "Please provide a value for requst " <> name,
           jsonrpc.VObject([
@@ -255,12 +258,12 @@ fn elicitation_request(name: String) -> jsonrpc.Request(actions.ActionRequest) {
   )
 }
 
-fn sampling_request() -> jsonrpc.Request(actions.ActionRequest) {
+fn sampling_request() -> jsonrpc.Request(actions.ServerActionRequest) {
   jsonrpc.Request(
     jsonrpc.StringId("sample-1"),
     mcp.method_create_message,
     Some(
-      actions.RequestCreateMessage(actions.CreateMessageRequestParams(
+      actions.ServerRequestCreateMessage(actions.CreateMessageRequestParams(
         messages: [
           actions.SamplingMessage(
             actions.User,
@@ -290,6 +293,6 @@ fn sampling_request() -> jsonrpc.Request(actions.ActionRequest) {
   )
 }
 
-fn respond(response: jsonrpc.Response(actions.ActionResult)) {
+fn respond(response: jsonrpc.Response(actions.ClientActionResult)) {
   io.println(server_codec.encode_response(response))
 }

@@ -11,7 +11,7 @@ import gleam_mcp/jsonrpc
 import gleam_mcp/mcp
 
 pub type Message {
-  ActionRequest(jsonrpc.Request(actions.ActionRequest))
+  ClientActionRequest(jsonrpc.Request(actions.ClientActionRequest))
   ActionNotification(jsonrpc.Request(actions.ActionNotification))
   UnknownRequest(id: jsonrpc.RequestId, method: String)
   UnknownNotification(method: String)
@@ -22,9 +22,15 @@ pub fn decode_message(body: String) -> Result(Message, String) {
 }
 
 pub fn encode_response(
-  response: jsonrpc.Response(actions.ActionResult),
+  response: jsonrpc.Response(actions.ClientActionResult),
 ) -> String {
-  response |> encode_jsonrpc_response |> json.to_string
+  response |> encode_client_jsonrpc_response |> json.to_string
+}
+
+pub fn encode_server_response(
+  response: jsonrpc.Response(actions.ServerActionResult),
+) -> String {
+  response |> encode_server_jsonrpc_response |> json.to_string
 }
 
 fn message_decoder() -> decode.Decoder(Message) {
@@ -58,7 +64,7 @@ fn initialize_message_decoder() -> decode.Decoder(Message) {
       use params <- decode.field("params", initialize_request_params_decoder())
       decode.success(params)
     },
-    fn(params) { actions.RequestInitialize(params) },
+    fn(params) { actions.ClientRequestInitialize(params) },
   )
 }
 
@@ -73,7 +79,7 @@ fn ping_message_decoder() -> decode.Decoder(Message) {
       )
       decode.success(params)
     },
-    fn(params) { actions.RequestPing(params) },
+    fn(params) { actions.ClientRequestPing(params) },
   )
 }
 
@@ -88,7 +94,7 @@ fn list_resources_message_decoder() -> decode.Decoder(Message) {
       )
       decode.success(params)
     },
-    fn(params) { actions.RequestListResources(params) },
+    fn(params) { actions.ClientRequestListResources(params) },
   )
 }
 
@@ -103,7 +109,7 @@ fn list_resource_templates_message_decoder() -> decode.Decoder(Message) {
       )
       decode.success(params)
     },
-    fn(params) { actions.RequestListResourceTemplates(params) },
+    fn(params) { actions.ClientRequestListResourceTemplates(params) },
   )
 }
 
@@ -117,7 +123,7 @@ fn read_resource_message_decoder() -> decode.Decoder(Message) {
       )
       decode.success(params)
     },
-    fn(params) { actions.RequestReadResource(params) },
+    fn(params) { actions.ClientRequestReadResource(params) },
   )
 }
 
@@ -132,7 +138,7 @@ fn list_prompts_message_decoder() -> decode.Decoder(Message) {
       )
       decode.success(params)
     },
-    fn(params) { actions.RequestListPrompts(params) },
+    fn(params) { actions.ClientRequestListPrompts(params) },
   )
 }
 
@@ -143,7 +149,7 @@ fn get_prompt_message_decoder() -> decode.Decoder(Message) {
       use params <- decode.field("params", get_prompt_request_params_decoder())
       decode.success(params)
     },
-    fn(params) { actions.RequestGetPrompt(params) },
+    fn(params) { actions.ClientRequestGetPrompt(params) },
   )
 }
 
@@ -158,7 +164,7 @@ fn list_tools_message_decoder() -> decode.Decoder(Message) {
       )
       decode.success(params)
     },
-    fn(params) { actions.RequestListTools(params) },
+    fn(params) { actions.ClientRequestListTools(params) },
   )
 }
 
@@ -169,7 +175,7 @@ fn call_tool_message_decoder() -> decode.Decoder(Message) {
       use params <- decode.field("params", call_tool_request_params_decoder())
       decode.success(params)
     },
-    fn(params) { actions.RequestCallTool(params) },
+    fn(params) { actions.ClientRequestCallTool(params) },
   )
 }
 
@@ -180,7 +186,7 @@ fn complete_message_decoder() -> decode.Decoder(Message) {
       use params <- decode.field("params", complete_request_params_decoder())
       decode.success(params)
     },
-    fn(params) { actions.RequestComplete(params) },
+    fn(params) { actions.ClientRequestComplete(params) },
   )
 }
 
@@ -195,7 +201,7 @@ fn list_tasks_message_decoder() -> decode.Decoder(Message) {
       )
       decode.success(params)
     },
-    fn(params) { actions.RequestListTasks(params) },
+    fn(params) { actions.ClientRequestListTasks(params) },
   )
 }
 
@@ -206,7 +212,7 @@ fn get_task_message_decoder() -> decode.Decoder(Message) {
       use params <- decode.field("params", task_id_params_decoder())
       decode.success(params)
     },
-    fn(params) { actions.RequestGetTask(params) },
+    fn(params) { actions.ClientRequestGetTask(params) },
   )
 }
 
@@ -217,7 +223,7 @@ fn get_task_result_message_decoder() -> decode.Decoder(Message) {
       use params <- decode.field("params", task_id_params_decoder())
       decode.success(params)
     },
-    fn(params) { actions.RequestGetTaskResult(params) },
+    fn(params) { actions.ClientRequestGetTaskResult(params) },
   )
 }
 
@@ -228,7 +234,7 @@ fn cancel_task_message_decoder() -> decode.Decoder(Message) {
       use params <- decode.field("params", task_id_params_decoder())
       decode.success(params)
     },
-    fn(params) { actions.RequestCancelTask(params) },
+    fn(params) { actions.ClientRequestCancelTask(params) },
   )
 }
 
@@ -239,7 +245,7 @@ fn set_logging_level_message_decoder() -> decode.Decoder(Message) {
       use params <- decode.field("params", set_level_request_params_decoder())
       decode.success(params)
     },
-    fn(params) { actions.RequestSetLoggingLevel(params) },
+    fn(params) { actions.ClientRequestSetLoggingLevel(params) },
   )
 }
 
@@ -286,26 +292,26 @@ fn unknown_message_decoder(method: String) -> decode.Decoder(Message) {
 fn decode_request_message(
   method: String,
   params_decoder: decode.Decoder(params),
-  wrap: fn(params) -> actions.ActionRequest,
+  wrap: fn(params) -> actions.ClientActionRequest,
 ) -> decode.Decoder(Message) {
   decode.then(decode.at(["id"], request_id_decoder()), fn(id) {
     decode.then(params_decoder, fn(params) {
       decode.success(
-        ActionRequest(jsonrpc.Request(id, method, Some(wrap(params)))),
+        ClientActionRequest(jsonrpc.Request(id, method, Some(wrap(params)))),
       )
     })
   })
 }
 
-fn encode_jsonrpc_response(
-  response: jsonrpc.Response(actions.ActionResult),
+fn encode_client_jsonrpc_response(
+  response: jsonrpc.Response(actions.ClientActionResult),
 ) -> json.Json {
   case response {
     jsonrpc.ResultResponse(id, result) ->
       json.object([
         #("jsonrpc", json.string(jsonrpc.jsonrpc_version)),
         #("id", encode_request_id(id)),
-        #("result", encode_action_result(result)),
+        #("result", encode_client_action_result(result)),
       ])
     jsonrpc.ErrorResponse(id, error) ->
       [#("jsonrpc", json.string(jsonrpc.jsonrpc_version))]
@@ -315,27 +321,74 @@ fn encode_jsonrpc_response(
   }
 }
 
-fn encode_action_result(result: actions.ActionResult) -> json.Json {
+fn encode_server_jsonrpc_response(
+  response: jsonrpc.Response(actions.ServerActionResult),
+) -> json.Json {
+  case response {
+    jsonrpc.ResultResponse(id, result) ->
+      json.object([
+        #("jsonrpc", json.string(jsonrpc.jsonrpc_version)),
+        #("id", encode_request_id(id)),
+        #("result", encode_server_action_result(result)),
+      ])
+    jsonrpc.ErrorResponse(id, error) ->
+      [#("jsonrpc", json.string(jsonrpc.jsonrpc_version))]
+      |> append_optional("id", option_map(id, encode_request_id))
+      |> append_optional("error", Some(encode_error(error)))
+      |> json.object
+  }
+}
+
+fn encode_client_action_result(result: actions.ClientActionResult) -> json.Json {
   case result {
-    actions.ResultEmpty(meta) -> encode_meta_only(meta)
-    actions.ResultInitialize(value) -> encode_initialize_result(value)
-    actions.ResultListResources(value) -> encode_list_resources_result(value)
-    actions.ResultListResourceTemplates(value) ->
+    actions.ClientResultEmpty(meta) -> encode_meta_only(meta)
+    actions.ClientResultInitialize(value) -> encode_initialize_result(value)
+    actions.ClientResultListResources(value) ->
+      encode_list_resources_result(value)
+    actions.ClientResultListResourceTemplates(value) ->
       encode_list_resource_templates_result(value)
-    actions.ResultReadResource(value) -> encode_read_resource_result(value)
-    actions.ResultListPrompts(value) -> encode_list_prompts_result(value)
-    actions.ResultGetPrompt(value) -> encode_get_prompt_result(value)
-    actions.ResultListTools(value) -> encode_list_tools_result(value)
-    actions.ResultCallTool(value) -> encode_call_tool_result(value)
-    actions.ResultComplete(value) -> encode_complete_result(value)
-    actions.ResultCreateTask(value) -> encode_create_task_result(value)
-    actions.ResultListRoots(_) -> json.object([])
-    actions.ResultCreateMessage(value) -> encode_create_message_result(value)
-    actions.ResultElicit(value) -> encode_elicit_result(value)
-    actions.ResultGetTask(value) -> encode_get_task_result(value)
-    actions.ResultTaskResult(value) -> encode_task_result(value)
-    actions.ResultCancelTask(value) -> encode_cancel_task_result(value)
-    actions.ResultListTasks(value) -> encode_list_tasks_result(value)
+    actions.ClientResultReadResource(value) ->
+      encode_read_resource_result(value)
+    actions.ClientResultListPrompts(value) -> encode_list_prompts_result(value)
+    actions.ClientResultGetPrompt(value) -> encode_get_prompt_result(value)
+    actions.ClientResultListTools(value) -> encode_list_tools_result(value)
+    actions.ClientResultCallTool(value) -> encode_call_tool_result(value)
+    actions.ClientResultComplete(value) -> encode_complete_result(value)
+    actions.ClientResultCreateTask(value) -> encode_create_task_result(value)
+    actions.ClientResultGetTask(value) -> encode_get_task_result(value)
+    actions.ClientResultTaskResult(value) -> encode_task_result(value)
+    actions.ClientResultCancelTask(value) -> encode_cancel_task_result(value)
+    actions.ClientResultListTasks(value) -> encode_list_tasks_result(value)
+  }
+}
+
+fn encode_root(root: actions.Root) -> json.Json {
+  let actions.Root(uri, name, meta) = root
+  [#("uri", json.string(uri))]
+  |> append_optional("name", option_map(name, json.string))
+  |> append_optional("_meta", option_map(meta, encode_meta))
+  |> json.object
+}
+
+fn encode_list_roots_result(result: actions.ListRootsResult) -> json.Json {
+  let actions.ListRootsResult(roots, meta) = result
+  [#("roots", json.array(roots, encode_root))]
+  |> append_optional("_meta", option_map(meta, encode_meta))
+  |> json.object
+}
+
+fn encode_server_action_result(result: actions.ServerActionResult) -> json.Json {
+  case result {
+    actions.ServerResultEmpty(meta) -> encode_meta_only(meta)
+    actions.ServerResultListRoots(value) -> encode_list_roots_result(value)
+    actions.ServerResultCreateMessage(value) ->
+      encode_create_message_result(value)
+    actions.ServerResultElicit(value) -> encode_elicit_result(value)
+    actions.ServerResultCreateTask(value) -> encode_create_task_result(value)
+    actions.ServerResultGetTask(value) -> encode_get_task_result(value)
+    actions.ServerResultTaskResult(value) -> encode_task_result(value)
+    actions.ServerResultCancelTask(value) -> encode_cancel_task_result(value)
+    actions.ServerResultListTasks(value) -> encode_list_tasks_result(value)
   }
 }
 

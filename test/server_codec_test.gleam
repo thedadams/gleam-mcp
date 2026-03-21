@@ -23,10 +23,10 @@ pub fn decode_message_parses_initialize_request_test() {
     <> "\",\"capabilities\":{},\"clientInfo\":{\"name\":\"test-client\",\"version\":\"1.0.0\"}}}"
 
   case codec.decode_message(body) |> should.be_ok {
-    codec.ActionRequest(jsonrpc.Request(
+    codec.ClientActionRequest(jsonrpc.Request(
       id,
       method,
-      Some(actions.RequestInitialize(params)),
+      Some(actions.ClientRequestInitialize(params)),
     )) -> {
       should.equal(id, jsonrpc.StringId("req-1"))
       should.equal(method, "initialize")
@@ -57,7 +57,7 @@ pub fn encode_response_serializes_initialize_result_test() {
       jsonrpc.StringId("req-1"),
       "initialize",
       Some(
-        actions.RequestInitialize(actions.InitializeRequestParams(
+        actions.ClientRequestInitialize(actions.InitializeRequestParams(
           protocol_version: jsonrpc.latest_protocol_version,
           capabilities: actions.ClientCapabilities(None, None, None, None, None),
           client_info: server_test_support.sample_client_info(),
@@ -86,10 +86,10 @@ pub fn decode_message_parses_task_get_request_test() {
     <> "\"jsonrpc\":\"2.0\",\"id\":\"req-2\",\"method\":\"tasks/get\",\"params\":{\"taskId\":\"task-1\"}}"
 
   case codec.decode_message(body) |> should.be_ok {
-    codec.ActionRequest(jsonrpc.Request(
+    codec.ClientActionRequest(jsonrpc.Request(
       id,
       method,
-      Some(actions.RequestGetTask(actions.TaskIdParams(task_id))),
+      Some(actions.ClientRequestGetTask(actions.TaskIdParams(task_id))),
     )) -> {
       should.equal(id, jsonrpc.StringId("req-2"))
       should.equal(method, mcp.method_get_task)
@@ -103,7 +103,7 @@ pub fn encode_response_serializes_create_task_result_test() {
   let response =
     jsonrpc.ResultResponse(
       jsonrpc.StringId("req-3"),
-      actions.ResultCreateTask(actions.CreateTaskResult(
+      actions.ClientResultCreateTask(actions.CreateTaskResult(
         task: actions.Task(
           task_id: "task-1",
           status: actions.Working,

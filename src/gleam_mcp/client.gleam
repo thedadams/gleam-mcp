@@ -2,7 +2,7 @@ import gleam/erlang/process
 import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam_mcp/actions.{
-  type ActionNotification, type ActionRequest, type ActionResult,
+  type ActionNotification, type ClientActionRequest, type ClientActionResult,
   type Implementation,
 }
 import gleam_mcp/client/capabilities
@@ -66,11 +66,11 @@ pub fn initialize(
     send_request(
       client,
       mcp.method_initialize,
-      Some(actions.RequestInitialize(params)),
+      Some(actions.ClientRequestInitialize(params)),
     )
 
   case response {
-    Ok(jsonrpc.ResultResponse(_, actions.ResultInitialize(result))) -> {
+    Ok(jsonrpc.ResultResponse(_, actions.ClientResultInitialize(result))) -> {
       let #(_, r) = initialized(next_client)
       case r {
         Ok(_) -> Ok(#(next_client, result))
@@ -154,11 +154,11 @@ pub fn list_resources(
   send_request(
     client,
     mcp.method_list_resources,
-    Some(actions.RequestListResources(resource_params)),
+    Some(actions.ClientRequestListResources(resource_params)),
   )
   |> expect_result("resources/list", fn(result) {
     case result {
-      actions.ResultListResources(value) -> Some(value)
+      actions.ClientResultListResources(value) -> Some(value)
       _ -> None
     }
   })
@@ -175,11 +175,11 @@ pub fn list_resource_templates(
   send_request(
     client,
     mcp.method_list_resource_templates,
-    Some(actions.RequestListResourceTemplates(template_params)),
+    Some(actions.ClientRequestListResourceTemplates(template_params)),
   )
   |> expect_result("resources/templates/list", fn(result) {
     case result {
-      actions.ResultListResourceTemplates(value) -> Some(value)
+      actions.ClientResultListResourceTemplates(value) -> Some(value)
       _ -> None
     }
   })
@@ -192,11 +192,11 @@ pub fn read_resource(
   send_request(
     client,
     mcp.method_read_resource,
-    Some(actions.RequestReadResource(params)),
+    Some(actions.ClientRequestReadResource(params)),
   )
   |> expect_result("resources/read", fn(result) {
     case result {
-      actions.ResultReadResource(value) -> Some(value)
+      actions.ClientResultReadResource(value) -> Some(value)
       _ -> None
     }
   })
@@ -209,7 +209,7 @@ pub fn subscribe_resource(
   send_request(
     client,
     mcp.method_subscribe_resource,
-    Some(actions.RequestSubscribeResource(params)),
+    Some(actions.ClientRequestSubscribeResource(params)),
   )
   |> expect_empty_result
 }
@@ -221,7 +221,7 @@ pub fn unsubscribe_resource(
   send_request(
     client,
     mcp.method_unsubscribe_resource,
-    Some(actions.RequestUnsubscribeResource(params)),
+    Some(actions.ClientRequestUnsubscribeResource(params)),
   )
   |> expect_empty_result
 }
@@ -237,11 +237,11 @@ pub fn list_prompts(
   send_request(
     client,
     mcp.method_list_prompts,
-    Some(actions.RequestListPrompts(prompt_params)),
+    Some(actions.ClientRequestListPrompts(prompt_params)),
   )
   |> expect_result("prompts/list", fn(result) {
     case result {
-      actions.ResultListPrompts(value) -> Some(value)
+      actions.ClientResultListPrompts(value) -> Some(value)
       _ -> None
     }
   })
@@ -254,11 +254,11 @@ pub fn get_prompt(
   send_request(
     client,
     mcp.method_get_prompt,
-    Some(actions.RequestGetPrompt(params)),
+    Some(actions.ClientRequestGetPrompt(params)),
   )
   |> expect_result("prompts/get", fn(result) {
     case result {
-      actions.ResultGetPrompt(value) -> Some(value)
+      actions.ClientResultGetPrompt(value) -> Some(value)
       _ -> None
     }
   })
@@ -275,11 +275,11 @@ pub fn list_tools(
   send_request(
     client,
     mcp.method_list_tools,
-    Some(actions.RequestListTools(request_params)),
+    Some(actions.ClientRequestListTools(request_params)),
   )
   |> expect_result("tools/list", fn(result) {
     case result {
-      actions.ResultListTools(value) -> Some(value)
+      actions.ClientResultListTools(value) -> Some(value)
       _ -> None
     }
   })
@@ -292,12 +292,12 @@ pub fn call_tool(
   send_request(
     client,
     mcp.method_call_tool,
-    Some(actions.RequestCallTool(params)),
+    Some(actions.ClientRequestCallTool(params)),
   )
   |> expect_result("tools/call", fn(result) {
     case result {
-      actions.ResultCallTool(res) -> Some(actions.CallTool(res))
-      actions.ResultCreateTask(res) -> Some(actions.CallToolTask(res))
+      actions.ClientResultCallTool(res) -> Some(actions.CallTool(res))
+      actions.ClientResultCreateTask(res) -> Some(actions.CallToolTask(res))
       _ -> None
     }
   })
@@ -310,11 +310,11 @@ pub fn complete(
   send_request(
     client,
     mcp.method_complete,
-    Some(actions.RequestComplete(params)),
+    Some(actions.ClientRequestComplete(params)),
   )
   |> expect_result("completion/complete", fn(result) {
     case result {
-      actions.ResultComplete(value) -> Some(value)
+      actions.ClientResultComplete(value) -> Some(value)
       _ -> None
     }
   })
@@ -327,58 +327,9 @@ pub fn set_logging_level(
   send_request(
     client,
     mcp.method_set_logging_level,
-    Some(actions.RequestSetLoggingLevel(params)),
+    Some(actions.ClientRequestSetLoggingLevel(params)),
   )
   |> expect_empty_result
-}
-
-pub fn list_roots(
-  client: Client,
-  meta: Option(actions.RequestMeta),
-) -> #(Client, Result(actions.ListRootsResult, ClientError)) {
-  send_request(
-    client,
-    mcp.method_list_roots,
-    Some(actions.RequestListRoots(meta)),
-  )
-  |> expect_result("roots/list", fn(result) {
-    case result {
-      actions.ResultListRoots(value) -> Some(value)
-      _ -> None
-    }
-  })
-}
-
-pub fn create_message(
-  client: Client,
-  params: actions.CreateMessageRequestParams,
-) -> #(Client, Result(actions.CreateMessageResponse, ClientError)) {
-  send_request(
-    client,
-    mcp.method_create_message,
-    Some(actions.RequestCreateMessage(params)),
-  )
-  |> expect_result("sampling/createMessage", fn(result) {
-    case result {
-      actions.ResultCreateMessage(res) -> Some(actions.CreateMessage(res))
-      actions.ResultCreateTask(res) -> Some(actions.CreateMessageTask(res))
-      _ -> None
-    }
-  })
-}
-
-pub fn elicit(
-  client: Client,
-  params: actions.ElicitRequestParams,
-) -> #(Client, Result(actions.ElicitResponse, ClientError)) {
-  send_request(client, mcp.method_elicit, Some(actions.RequestElicit(params)))
-  |> expect_result("elicitation/create", fn(result) {
-    case result {
-      actions.ResultElicit(res) -> Some(actions.Elicit(res))
-      actions.ResultCreateTask(res) -> Some(actions.ElicitTask(res))
-      _ -> None
-    }
-  })
 }
 
 pub fn list_tasks(
@@ -392,11 +343,11 @@ pub fn list_tasks(
   send_request(
     client,
     mcp.method_list_tasks,
-    Some(actions.RequestListTasks(request_params)),
+    Some(actions.ClientRequestListTasks(request_params)),
   )
   |> expect_result("tasks/list", fn(result) {
     case result {
-      actions.ResultListTasks(value) -> Some(value)
+      actions.ClientResultListTasks(value) -> Some(value)
       _ -> None
     }
   })
@@ -409,11 +360,11 @@ pub fn get_task(
   send_request(
     client,
     mcp.method_get_task,
-    Some(actions.RequestGetTask(params)),
+    Some(actions.ClientRequestGetTask(params)),
   )
   |> expect_result("tasks/get", fn(result) {
     case result {
-      actions.ResultGetTask(value) -> Some(value)
+      actions.ClientResultGetTask(value) -> Some(value)
       _ -> None
     }
   })
@@ -426,11 +377,11 @@ pub fn get_task_result(
   send_request(
     client,
     mcp.method_get_task_result,
-    Some(actions.RequestGetTaskResult(params)),
+    Some(actions.ClientRequestGetTaskResult(params)),
   )
   |> expect_result("tasks/result", fn(result) {
     case result {
-      actions.ResultTaskResult(value) -> Some(value)
+      actions.ClientResultTaskResult(value) -> Some(value)
       _ -> None
     }
   })
@@ -443,11 +394,11 @@ pub fn cancel_task(
   send_request(
     client,
     mcp.method_cancel_task,
-    Some(actions.RequestCancelTask(params)),
+    Some(actions.ClientRequestCancelTask(params)),
   )
   |> expect_result("tasks/cancel", fn(result) {
     case result {
-      actions.ResultCancelTask(value) -> Some(value)
+      actions.ClientResultCancelTask(value) -> Some(value)
       _ -> None
     }
   })
@@ -556,7 +507,7 @@ pub fn task_status(
 }
 
 fn expect_empty_result(
-  response: #(Client, Result(Response(ActionResult), ClientError)),
+  response: #(Client, Result(Response(ClientActionResult), ClientError)),
 ) -> #(Client, Result(Nil, ClientError)) {
   let #(client, result) = response
 
@@ -568,9 +519,9 @@ fn expect_empty_result(
 }
 
 fn expect_result(
-  response: #(Client, Result(Response(ActionResult), ClientError)),
+  response: #(Client, Result(Response(ClientActionResult), ClientError)),
   method: String,
-  extract: fn(ActionResult) -> Option(result),
+  extract: fn(ClientActionResult) -> Option(result),
 ) -> #(Client, Result(result, ClientError)) {
   let #(client, pending) = response
 
@@ -595,8 +546,8 @@ fn unexpected_response_error(method: String) -> ClientError {
 fn send_request(
   client: Client,
   method: String,
-  params: Option(ActionRequest),
-) -> #(Client, Result(Response(ActionResult), ClientError)) {
+  params: Option(ClientActionRequest),
+) -> #(Client, Result(Response(ClientActionResult), ClientError)) {
   let Client(
     transport_config: transport_config,
     runners: runners,

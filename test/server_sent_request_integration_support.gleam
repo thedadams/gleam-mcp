@@ -211,7 +211,7 @@ fn handle_post_body(
     }
     Error(_) ->
       case server_codec.decode_message(body) {
-        Ok(server_codec.ActionRequest(rpc_request)) ->
+        Ok(server_codec.ClientActionRequest(rpc_request)) ->
           handle_client_request(kind, broker, rpc_request)
         Ok(server_codec.ActionNotification(notification)) ->
           handle_client_notification(notification)
@@ -231,28 +231,29 @@ fn handle_post_body(
 fn handle_client_request(
   kind: InteractionKind,
   broker: process.Subject(BrokerMessage),
-  rpc_request: jsonrpc.Request(actions.ActionRequest),
+  rpc_request: jsonrpc.Request(actions.ClientActionRequest),
 ) -> response.Response(mist.ResponseData) {
   case rpc_request {
-    jsonrpc.Request(id, _, Some(actions.RequestInitialize(_))) ->
+    jsonrpc.Request(id, _, Some(actions.ClientRequestInitialize(_))) ->
       json_response(
         server_codec.encode_response(jsonrpc.ResultResponse(
           id,
           initialize_result(),
         )),
       )
-    jsonrpc.Request(id, _, Some(actions.RequestListTools(_))) ->
+    jsonrpc.Request(id, _, Some(actions.ClientRequestListTools(_))) ->
       json_response(
         server_codec.encode_response(jsonrpc.ResultResponse(
           id,
           list_tools_result(kind),
         )),
       )
-    jsonrpc.Request(id, _, Some(actions.RequestCallTool(params))) -> {
+    jsonrpc.Request(id, _, Some(actions.ClientRequestCallTool(params))) -> {
       process.send(
         broker,
         PushListenerRequest(
-          interaction_request(kind, params.name) |> client_codec.encode_request,
+          interaction_request(kind, params.name)
+          |> client_codec.encode_server_request,
         ),
       )
       tool_call_response(kind, broker, id)
@@ -291,7 +292,7 @@ fn tool_call_response(
   json_response(
     server_codec.encode_response(jsonrpc.ResultResponse(
       id,
-      actions.ResultCallTool(actions.CallToolResult(
+      actions.ClientResultCallTool(actions.CallToolResult(
         content: [
           actions.TextBlock(actions.TextContent(
             result_prefix(kind) <> response_text,
@@ -320,8 +321,8 @@ fn handle_client_notification(
   }
 }
 
-fn initialize_result() -> actions.ActionResult {
-  actions.ResultInitialize(actions.InitializeResult(
+fn initialize_result() -> actions.ClientActionResult {
+  actions.ClientResultInitialize(actions.InitializeResult(
     protocol_version: jsonrpc.latest_protocol_version,
     capabilities: server_capabilities.infer(
       has_tools: True,
@@ -344,8 +345,8 @@ fn initialize_result() -> actions.ActionResult {
   ))
 }
 
-fn list_tools_result(kind: InteractionKind) -> actions.ActionResult {
-  actions.ResultListTools(actions.ListToolsResult(
+fn list_tools_result(kind: InteractionKind) -> actions.ClientActionResult {
+  actions.ClientResultListTools(actions.ListToolsResult(
     tools: [
       actions.Tool(
         name: tool_name(kind),
@@ -367,14 +368,14 @@ fn list_tools_result(kind: InteractionKind) -> actions.ActionResult {
 fn interaction_request(
   kind: InteractionKind,
   name: String,
-) -> jsonrpc.Request(actions.ActionRequest) {
+) -> jsonrpc.Request(actions.ServerActionRequest) {
   case kind {
     Elicitation ->
       jsonrpc.Request(
         jsonrpc.StringId("elicit-1"),
         mcp.method_elicit,
         Some(
-          actions.RequestElicit(
+          actions.ServerRequestElicit(
             actions.ElicitRequestForm(actions.ElicitRequestFormParams(
               "Please provide a value for requst " <> name,
               jsonrpc.VObject([
@@ -403,7 +404,7 @@ fn interaction_request(
         jsonrpc.StringId("sample-1"),
         mcp.method_create_message,
         Some(
-          actions.RequestCreateMessage(actions.CreateMessageRequestParams(
+          actions.ServerRequestCreateMessage(actions.CreateMessageRequestParams(
             messages: [
               actions.SamplingMessage(
                 actions.User,
@@ -490,7 +491,7 @@ fn task_roundtrip_response_text(
       process.send(
         broker,
         PushListenerRequest(
-          task_get_request(task_id) |> client_codec.encode_request,
+          task_get_request(task_id) |> client_codec.encode_server_request,
         ),
       )
       let _ = process.call(broker, 5000, PopClientResponse)
@@ -498,7 +499,7 @@ fn task_roundtrip_response_text(
       process.send(
         broker,
         PushListenerRequest(
-          task_result_request(task_id) |> client_codec.encode_request,
+          task_result_request(task_id) |> client_codec.encode_server_request,
         ),
       )
 
@@ -515,21 +516,23 @@ fn task_roundtrip_response_text(
   }
 }
 
-fn task_get_request(task_id: String) -> jsonrpc.Request(actions.ActionRequest) {
+fn task_get_request(
+  task_id: String,
+) -> jsonrpc.Request(actions.ServerActionRequest) {
   jsonrpc.Request(
     jsonrpc.StringId("task-get-1"),
     mcp.method_get_task,
-    Some(actions.RequestGetTask(actions.TaskIdParams(task_id))),
+    Some(actions.ServerRequestGetTask(actions.TaskIdParams(task_id))),
   )
 }
 
 fn task_result_request(
   task_id: String,
-) -> jsonrpc.Request(actions.ActionRequest) {
+) -> jsonrpc.Request(actions.ServerActionRequest) {
   jsonrpc.Request(
     jsonrpc.StringId("task-result-1"),
     mcp.method_get_task_result,
-    Some(actions.RequestGetTaskResult(actions.TaskIdParams(task_id))),
+    Some(actions.ServerRequestGetTaskResult(actions.TaskIdParams(task_id))),
   )
 }
 

@@ -17,7 +17,7 @@ pub fn serve_with_lines(server: server.Server, lines: yielder.Yielder(String)) {
 
 fn handle_message(server: server.Server, message: String) -> server.Server {
   case codec.decode_message(message) {
-    Ok(codec.ActionRequest(request)) -> {
+    Ok(codec.ClientActionRequest(request)) -> {
       let #(_, response) = server.handle_request(server, request)
       io.println(codec.encode_response(response))
     }

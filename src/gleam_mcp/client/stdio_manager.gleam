@@ -548,13 +548,16 @@ fn handle_server_message(
   }
 
   case client_codec.decode_server_message(line) {
-    Ok(client_codec.ActionRequest(request)) ->
+    Ok(client_codec.ServerActionRequest(request)) ->
       case
         capabilities.handle_request(capability_config, request)
         |> result.map_error(rpc_error_message)
       {
         Ok(response) ->
-          send_server_message(handle, server_codec.encode_response(response))
+          send_server_message(
+            handle,
+            server_codec.encode_server_response(response),
+          )
           |> result.map(fn(_) { #(pending, listener) })
         Error(error) -> Error(error)
       }
@@ -565,7 +568,7 @@ fn handle_server_message(
     Ok(client_codec.UnknownRequest(id, method)) ->
       send_server_message(
         handle,
-        server_codec.encode_response(jsonrpc.ErrorResponse(
+        server_codec.encode_server_response(jsonrpc.ErrorResponse(
           Some(id),
           jsonrpc.method_not_found_error(method),
         )),

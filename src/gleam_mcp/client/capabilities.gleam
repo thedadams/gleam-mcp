@@ -3,8 +3,8 @@ import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam_mcp/actions.{
-  type ActionNotification, type ActionRequest, type ActionResult,
-  type ClientCapabilities, ClientCapabilities, ClientElicitationCapabilities,
+  type ActionNotification, type ClientCapabilities, type ServerActionRequest,
+  type ServerActionResult, ClientCapabilities, ClientElicitationCapabilities,
   ClientRootsCapabilities, ClientSamplingCapabilities,
 }
 import gleam_mcp/jsonrpc.{
@@ -655,8 +655,8 @@ pub fn to_initialize_capabilities(config: Config) -> ClientCapabilities {
 
 pub fn handle_request(
   config: Config,
-  request: Request(ActionRequest),
-) -> Result(Response(ActionResult), RpcError) {
+  request: Request(ServerActionRequest),
+) -> Result(Response(ServerActionResult), RpcError) {
   case request {
     jsonrpc.Request(id, method, Some(action)) ->
       dispatch_request(config, id, method, action)
@@ -727,21 +727,22 @@ pub fn handle_notification(
 fn dispatch_request(
   config: Config,
   id: jsonrpc.RequestId,
-  method: String,
-  action: ActionRequest,
-) -> Result(Response(ActionResult), RpcError) {
+  _method: String,
+  action: ServerActionRequest,
+) -> Result(Response(ServerActionResult), RpcError) {
   case action {
-    actions.RequestListRoots(meta) -> list_roots_result(config, id, meta)
-    actions.RequestCreateMessage(params) ->
+    actions.ServerRequestPing(_) ->
+      Ok(jsonrpc.ResultResponse(id, actions.ServerResultEmpty(None)))
+    actions.ServerRequestListRoots(meta) -> list_roots_result(config, id, meta)
+    actions.ServerRequestCreateMessage(params) ->
       create_message_result(config, id, params)
-    actions.RequestElicit(params) -> elicit_result(config, id, params)
-    actions.RequestListTasks(_) -> Ok(list_tasks_result(config, id))
-    actions.RequestGetTask(params) -> get_task_result(config, id, params)
-    actions.RequestGetTaskResult(params) ->
+    actions.ServerRequestElicit(params) -> elicit_result(config, id, params)
+    actions.ServerRequestListTasks(_) -> Ok(list_tasks_result(config, id))
+    actions.ServerRequestGetTask(params) -> get_task_result(config, id, params)
+    actions.ServerRequestGetTaskResult(params) ->
       get_task_payload_result(config, id, params)
-    actions.RequestCancelTask(params) -> cancel_task_result(config, id, params)
-    _ ->
-      Ok(jsonrpc.ErrorResponse(Some(id), jsonrpc.method_not_found_error(method)))
+    actions.ServerRequestCancelTask(params) ->
+      cancel_task_result(config, id, params)
   }
 }
 
@@ -749,7 +750,7 @@ fn list_roots_result(
   config: Config,
   id: jsonrpc.RequestId,
   meta: Option(actions.RequestMeta),
-) -> Result(Response(ActionResult), RpcError) {
+) -> Result(Response(ServerActionResult), RpcError) {
   let Config(list_roots: list_roots, ..) = config
 
   case list_roots {
@@ -758,7 +759,7 @@ fn list_roots_result(
       |> result.map(fn(roots) {
         jsonrpc.ResultResponse(
           id,
-          actions.ResultListRoots(actions.ListRootsResult(
+          actions.ServerResultListRoots(actions.ListRootsResult(
             roots: list.map(roots, encode_root),
             meta: None,
           )),
@@ -776,7 +777,7 @@ fn create_message_result(
   config: Config,
   id: jsonrpc.RequestId,
   params: actions.CreateMessageRequestParams,
-) -> Result(Response(ActionResult), RpcError) {
+) -> Result(Response(ServerActionResult), RpcError) {
   let Config(create_message: create_message, task_store: tasks, ..) = config
 
   case create_message {
@@ -787,7 +788,7 @@ fn create_message_result(
           CreateMessage(value) ->
             case params.task {
               Some(actions.TaskMetadata(ttl_ms)) ->
-                actions.ResultCreateTask(actions.CreateTaskResult(
+                actions.ServerResultCreateTask(actions.CreateTaskResult(
                   task_store.create(
                     tasks,
                     Ok(actions.TaskCreateMessage(value)),
@@ -795,9 +796,9 @@ fn create_message_result(
                   ),
                   None,
                 ))
-              None -> actions.ResultCreateMessage(value)
+              None -> actions.ServerResultCreateMessage(value)
             }
-          CreateMessageTask(value) -> actions.ResultCreateTask(value)
+          CreateMessageTask(value) -> actions.ServerResultCreateTask(value)
         })
       })
     None ->
@@ -812,7 +813,7 @@ fn elicit_result(
   config: Config,
   id: jsonrpc.RequestId,
   params: actions.ElicitRequestParams,
-) -> Result(Response(ActionResult), RpcError) {
+) -> Result(Response(ServerActionResult), RpcError) {
   let Config(
     elicit_form: elicit_form,
     elicit_url: elicit_url,
@@ -839,7 +840,7 @@ fn elicit_result(
       Elicit(value) ->
         case task_ttl(params) {
           Some(ttl_ms) ->
-            actions.ResultCreateTask(actions.CreateTaskResult(
+            actions.ServerResultCreateTask(actions.CreateTaskResult(
               task_store.create(
                 tasks,
                 Ok(actions.TaskElicit(value)),
@@ -847,9 +848,9 @@ fn elicit_result(
               ),
               None,
             ))
-          None -> actions.ResultElicit(value)
+          None -> actions.ServerResultElicit(value)
         }
-      ElicitTask(value) -> actions.ResultCreateTask(value)
+      ElicitTask(value) -> actions.ServerResultCreateTask(value)
     })
   })
 }
@@ -857,11 +858,11 @@ fn elicit_result(
 fn list_tasks_result(
   config: Config,
   id: jsonrpc.RequestId,
-) -> Response(ActionResult) {
+) -> Response(ServerActionResult) {
   let Config(task_store: tasks, ..) = config
   jsonrpc.ResultResponse(
     id,
-    actions.ResultListTasks(actions.ListTasksResult(
+    actions.ServerResultListTasks(actions.ListTasksResult(
       tasks: task_store.list(tasks),
       page: actions.Page(None),
       meta: None,
@@ -873,14 +874,14 @@ fn get_task_result(
   config: Config,
   id: jsonrpc.RequestId,
   params: actions.TaskIdParams,
-) -> Result(Response(ActionResult), RpcError) {
+) -> Result(Response(ServerActionResult), RpcError) {
   let Config(task_store: tasks, ..) = config
   let actions.TaskIdParams(task_id) = params
   task_store.get(tasks, task_id)
   |> result.map(fn(task) {
     jsonrpc.ResultResponse(
       id,
-      actions.ResultGetTask(actions.GetTaskResult(task, None)),
+      actions.ServerResultGetTask(actions.GetTaskResult(task, None)),
     )
   })
 }
@@ -889,12 +890,12 @@ fn get_task_payload_result(
   config: Config,
   id: jsonrpc.RequestId,
   params: actions.TaskIdParams,
-) -> Result(Response(ActionResult), RpcError) {
+) -> Result(Response(ServerActionResult), RpcError) {
   let Config(task_store: tasks, ..) = config
   let actions.TaskIdParams(task_id) = params
   task_store.result(tasks, task_id)
   |> result.map(fn(task_result) {
-    jsonrpc.ResultResponse(id, actions.ResultTaskResult(task_result))
+    jsonrpc.ResultResponse(id, actions.ServerResultTaskResult(task_result))
   })
 }
 
@@ -902,14 +903,14 @@ fn cancel_task_result(
   config: Config,
   id: jsonrpc.RequestId,
   params: actions.TaskIdParams,
-) -> Result(Response(ActionResult), RpcError) {
+) -> Result(Response(ServerActionResult), RpcError) {
   let Config(task_store: tasks, ..) = config
   let actions.TaskIdParams(task_id) = params
   task_store.cancel(tasks, task_id)
   |> result.map(fn(task) {
     jsonrpc.ResultResponse(
       id,
-      actions.ResultCancelTask(actions.CancelTaskResult(task, None)),
+      actions.ServerResultCancelTask(actions.CancelTaskResult(task, None)),
     )
   })
 }

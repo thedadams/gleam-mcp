@@ -11,15 +11,25 @@ import gleam_mcp/jsonrpc
 import gleam_mcp/mcp
 
 pub type ServerMessage {
-  ActionRequest(jsonrpc.Request(actions.ActionRequest))
+  ServerActionRequest(jsonrpc.Request(actions.ServerActionRequest))
   ActionNotification(jsonrpc.Request(actions.ActionNotification))
   UnknownRequest(id: jsonrpc.RequestId, method: String)
   UnknownNotification(method: String)
 }
 
-pub fn encode_request(request: jsonrpc.Request(actions.ActionRequest)) -> String {
+pub fn encode_request(
+  request: jsonrpc.Request(actions.ClientActionRequest),
+) -> String {
   request
   |> encode_action_request
+  |> json.to_string
+}
+
+pub fn encode_server_request(
+  request: jsonrpc.Request(actions.ServerActionRequest),
+) -> String {
+  request
+  |> encode_server_action_request
   |> json.to_string
 }
 
@@ -33,9 +43,17 @@ pub fn encode_notification(
 
 pub fn decode_response(
   body: String,
-  request: jsonrpc.Request(actions.ActionRequest),
-) -> Result(jsonrpc.Response(actions.ActionResult), String) {
+  request: jsonrpc.Request(actions.ClientActionRequest),
+) -> Result(jsonrpc.Response(actions.ClientActionResult), String) {
   json.parse(body, response_decoder(request))
+  |> result.map_error(json_error_message)
+}
+
+pub fn decode_server_response(
+  body: String,
+  request: jsonrpc.Request(actions.ServerActionRequest),
+) -> Result(jsonrpc.Response(actions.ServerActionResult), String) {
+  json.parse(body, server_response_decoder(request))
   |> result.map_error(json_error_message)
 }
 
@@ -45,7 +63,7 @@ pub fn decode_server_message(body: String) -> Result(ServerMessage, String) {
 }
 
 fn encode_action_request(
-  request: jsonrpc.Request(actions.ActionRequest),
+  request: jsonrpc.Request(actions.ClientActionRequest),
 ) -> json.Json {
   case request {
     jsonrpc.Request(id, method, params) ->
@@ -60,6 +78,27 @@ fn encode_action_request(
         method,
         None,
         option_map(params, encode_request_params),
+      )
+      |> json.object
+  }
+}
+
+fn encode_server_action_request(
+  request: jsonrpc.Request(actions.ServerActionRequest),
+) -> json.Json {
+  case request {
+    jsonrpc.Request(id, method, params) ->
+      base_request_fields(
+        method,
+        Some(id),
+        option_map(params, encode_server_request_params),
+      )
+      |> json.object
+    jsonrpc.Notification(method, params) ->
+      base_request_fields(
+        method,
+        None,
+        option_map(params, encode_server_request_params),
       )
       |> json.object
   }
@@ -99,37 +138,55 @@ fn base_request_fields(
   |> append_optional("params", params)
 }
 
-fn encode_request_params(request: actions.ActionRequest) -> json.Json {
+fn encode_request_params(request: actions.ClientActionRequest) -> json.Json {
   case request {
-    actions.RequestInitialize(params) ->
+    actions.ClientRequestInitialize(params) ->
       encode_initialize_request_params(params)
-    actions.RequestPing(meta) -> encode_request_meta_only(meta)
-    actions.RequestListResources(params) ->
+    actions.ClientRequestPing(meta) -> encode_request_meta_only(meta)
+    actions.ClientRequestListResources(params) ->
       encode_paginated_request_params(params)
-    actions.RequestListResourceTemplates(params) ->
+    actions.ClientRequestListResourceTemplates(params) ->
       encode_paginated_request_params(params)
-    actions.RequestReadResource(params) ->
+    actions.ClientRequestReadResource(params) ->
       encode_read_resource_request_params(params)
-    actions.RequestSubscribeResource(params) ->
+    actions.ClientRequestSubscribeResource(params) ->
       encode_subscribe_request_params(params)
-    actions.RequestUnsubscribeResource(params) ->
+    actions.ClientRequestUnsubscribeResource(params) ->
       encode_unsubscribe_request_params(params)
-    actions.RequestListPrompts(params) ->
+    actions.ClientRequestListPrompts(params) ->
       encode_paginated_request_params(params)
-    actions.RequestGetPrompt(params) -> encode_get_prompt_request_params(params)
-    actions.RequestListTools(params) -> encode_paginated_request_params(params)
-    actions.RequestCallTool(params) -> encode_call_tool_request_params(params)
-    actions.RequestComplete(params) -> encode_complete_request_params(params)
-    actions.RequestSetLoggingLevel(params) ->
+    actions.ClientRequestGetPrompt(params) ->
+      encode_get_prompt_request_params(params)
+    actions.ClientRequestListTools(params) ->
+      encode_paginated_request_params(params)
+    actions.ClientRequestCallTool(params) ->
+      encode_call_tool_request_params(params)
+    actions.ClientRequestComplete(params) ->
+      encode_complete_request_params(params)
+    actions.ClientRequestSetLoggingLevel(params) ->
       encode_set_level_request_params(params)
-    actions.RequestListRoots(meta) -> encode_request_meta_only(meta)
-    actions.RequestCreateMessage(params) ->
+    actions.ClientRequestListTasks(params) ->
+      encode_paginated_request_params(params)
+    actions.ClientRequestGetTask(params) -> encode_task_id_params(params)
+    actions.ClientRequestGetTaskResult(params) -> encode_task_id_params(params)
+    actions.ClientRequestCancelTask(params) -> encode_task_id_params(params)
+  }
+}
+
+fn encode_server_request_params(
+  request: actions.ServerActionRequest,
+) -> json.Json {
+  case request {
+    actions.ServerRequestPing(meta) -> encode_request_meta_only(meta)
+    actions.ServerRequestListRoots(meta) -> encode_request_meta_only(meta)
+    actions.ServerRequestCreateMessage(params) ->
       encode_create_message_request_params(params)
-    actions.RequestElicit(params) -> encode_elicit_request_params(params)
-    actions.RequestListTasks(params) -> encode_paginated_request_params(params)
-    actions.RequestGetTask(params) -> encode_task_id_params(params)
-    actions.RequestGetTaskResult(params) -> encode_task_id_params(params)
-    actions.RequestCancelTask(params) -> encode_task_id_params(params)
+    actions.ServerRequestElicit(params) -> encode_elicit_request_params(params)
+    actions.ServerRequestListTasks(params) ->
+      encode_paginated_request_params(params)
+    actions.ServerRequestGetTask(params) -> encode_task_id_params(params)
+    actions.ServerRequestGetTaskResult(params) -> encode_task_id_params(params)
+    actions.ServerRequestCancelTask(params) -> encode_task_id_params(params)
   }
 }
 
@@ -1057,8 +1114,8 @@ fn encode_request_id(id: jsonrpc.RequestId) -> json.Json {
 }
 
 fn response_decoder(
-  request: jsonrpc.Request(actions.ActionRequest),
-) -> decode.Decoder(jsonrpc.Response(actions.ActionResult)) {
+  request: jsonrpc.Request(actions.ClientActionRequest),
+) -> decode.Decoder(jsonrpc.Response(actions.ClientActionResult)) {
   case request {
     jsonrpc.Request(original_id, _, Some(action)) ->
       decode.one_of(
@@ -1078,9 +1135,38 @@ fn response_decoder(
   }
 }
 
+fn server_response_decoder(
+  request: jsonrpc.Request(actions.ServerActionRequest),
+) -> decode.Decoder(jsonrpc.Response(actions.ServerActionResult)) {
+  case request {
+    jsonrpc.Request(original_id, _, Some(action)) ->
+      decode.one_of(
+        server_result_response_decoder(
+          original_id,
+          server_action_result_decoder(action),
+        ),
+        or: [server_error_response_decoder()],
+      )
+    jsonrpc.Request(original_id, _, None) ->
+      decode.one_of(
+        server_result_response_decoder(
+          original_id,
+          server_empty_result_decoder(),
+        ),
+        or: [server_error_response_decoder()],
+      )
+    jsonrpc.Notification(_, _) ->
+      decode.failure(
+        jsonrpc.ErrorResponse(None, jsonrpc.user_rejected_error()),
+        expected: "JSON-RPC response",
+      )
+  }
+}
+
 fn server_message_decoder() -> decode.Decoder(ServerMessage) {
   decode.then(decode.at(["method"], decode.string), fn(method) {
     case method {
+      method if method == mcp.method_ping -> ping_message_decoder()
       method if method == mcp.method_list_roots -> list_roots_message_decoder()
       method if method == mcp.method_create_message ->
         create_message_message_decoder()
@@ -1116,6 +1202,21 @@ fn server_message_decoder() -> decode.Decoder(ServerMessage) {
   })
 }
 
+fn ping_message_decoder() -> decode.Decoder(ServerMessage) {
+  decode_server_request_message(
+    mcp.method_ping,
+    {
+      use params <- decode.optional_field(
+        "params",
+        None,
+        decode.optional(request_meta_decoder()),
+      )
+      decode.success(params)
+    },
+    fn(params) { actions.ServerRequestPing(params) },
+  )
+}
+
 fn list_roots_message_decoder() -> decode.Decoder(ServerMessage) {
   decode_server_request_message(
     mcp.method_list_roots,
@@ -1127,7 +1228,7 @@ fn list_roots_message_decoder() -> decode.Decoder(ServerMessage) {
       )
       decode.success(params)
     },
-    fn(params) { actions.RequestListRoots(params) },
+    fn(params) { actions.ServerRequestListRoots(params) },
   )
 }
 
@@ -1141,7 +1242,7 @@ fn create_message_message_decoder() -> decode.Decoder(ServerMessage) {
       )
       decode.success(params)
     },
-    fn(params) { actions.RequestCreateMessage(params) },
+    fn(params) { actions.ServerRequestCreateMessage(params) },
   )
 }
 
@@ -1152,7 +1253,7 @@ fn elicit_message_decoder() -> decode.Decoder(ServerMessage) {
       use params <- decode.field("params", elicit_request_params_decoder())
       decode.success(params)
     },
-    fn(params) { actions.RequestElicit(params) },
+    fn(params) { actions.ServerRequestElicit(params) },
   )
 }
 
@@ -1167,7 +1268,7 @@ fn list_tasks_message_decoder() -> decode.Decoder(ServerMessage) {
       )
       decode.success(params)
     },
-    fn(params) { actions.RequestListTasks(params) },
+    fn(params) { actions.ServerRequestListTasks(params) },
   )
 }
 
@@ -1178,7 +1279,7 @@ fn get_task_message_decoder() -> decode.Decoder(ServerMessage) {
       use params <- decode.field("params", task_id_params_decoder())
       decode.success(params)
     },
-    fn(params) { actions.RequestGetTask(params) },
+    fn(params) { actions.ServerRequestGetTask(params) },
   )
 }
 
@@ -1189,7 +1290,7 @@ fn get_task_result_message_decoder() -> decode.Decoder(ServerMessage) {
       use params <- decode.field("params", task_id_params_decoder())
       decode.success(params)
     },
-    fn(params) { actions.RequestGetTaskResult(params) },
+    fn(params) { actions.ServerRequestGetTaskResult(params) },
   )
 }
 
@@ -1200,7 +1301,7 @@ fn cancel_task_message_decoder() -> decode.Decoder(ServerMessage) {
       use params <- decode.field("params", task_id_params_decoder())
       decode.success(params)
     },
-    fn(params) { actions.RequestCancelTask(params) },
+    fn(params) { actions.ServerRequestCancelTask(params) },
   )
 }
 
@@ -1373,12 +1474,12 @@ fn unknown_server_message_decoder(
 fn decode_server_request_message(
   method: String,
   params_decoder: decode.Decoder(params),
-  wrap: fn(params) -> actions.ActionRequest,
+  wrap: fn(params) -> actions.ServerActionRequest,
 ) -> decode.Decoder(ServerMessage) {
   decode.then(decode.at(["id"], request_id_decoder()), fn(id) {
     decode.then(params_decoder, fn(params) {
       decode.success(
-        ActionRequest(jsonrpc.Request(id, method, Some(wrap(params)))),
+        ServerActionRequest(jsonrpc.Request(id, method, Some(wrap(params)))),
       )
     })
   })
@@ -1527,8 +1628,8 @@ fn task_status_notification_params_decoder() -> decode.Decoder(
 
 fn result_response_decoder(
   original_id: jsonrpc.RequestId,
-  decoder result_decoder: decode.Decoder(actions.ActionResult),
-) -> decode.Decoder(jsonrpc.Response(actions.ActionResult)) {
+  decoder result_decoder: decode.Decoder(actions.ClientActionResult),
+) -> decode.Decoder(jsonrpc.Response(actions.ClientActionResult)) {
   {
     use version <- decode.field("jsonrpc", decode.string)
     use _id <- decode.field("id", request_id_decoder())
@@ -1539,7 +1640,36 @@ fn result_response_decoder(
 }
 
 fn error_response_decoder() -> decode.Decoder(
-  jsonrpc.Response(actions.ActionResult),
+  jsonrpc.Response(actions.ClientActionResult),
+) {
+  {
+    use version <- decode.field("jsonrpc", decode.string)
+    use id <- decode.optional_field(
+      "id",
+      None,
+      decode.optional(request_id_decoder()),
+    )
+    use error <- decode.field("error", error_decoder())
+    let _ = version
+    decode.success(jsonrpc.ErrorResponse(id, error))
+  }
+}
+
+fn server_result_response_decoder(
+  original_id: jsonrpc.RequestId,
+  decoder result_decoder: decode.Decoder(actions.ServerActionResult),
+) -> decode.Decoder(jsonrpc.Response(actions.ServerActionResult)) {
+  {
+    use version <- decode.field("jsonrpc", decode.string)
+    use _id <- decode.field("id", request_id_decoder())
+    use result <- decode.field("result", result_decoder)
+    let _ = version
+    decode.success(jsonrpc.ResultResponse(original_id, result))
+  }
+}
+
+fn server_error_response_decoder() -> decode.Decoder(
+  jsonrpc.Response(actions.ServerActionResult),
 ) {
   {
     use version <- decode.field("jsonrpc", decode.string)
@@ -1555,67 +1685,95 @@ fn error_response_decoder() -> decode.Decoder(
 }
 
 fn action_result_decoder(
-  action: actions.ActionRequest,
-) -> decode.Decoder(actions.ActionResult) {
+  action: actions.ClientActionRequest,
+) -> decode.Decoder(actions.ClientActionResult) {
   case action {
-    actions.RequestInitialize(_) ->
-      decode.map(initialize_result_decoder(), actions.ResultInitialize)
-    actions.RequestPing(_) -> empty_result_decoder()
-    actions.RequestListResources(_) ->
-      decode.map(list_resources_result_decoder(), actions.ResultListResources)
-    actions.RequestListResourceTemplates(_) ->
+    actions.ClientRequestInitialize(_) ->
+      decode.map(initialize_result_decoder(), actions.ClientResultInitialize)
+    actions.ClientRequestPing(_) -> empty_result_decoder()
+    actions.ClientRequestListResources(_) ->
+      decode.map(
+        list_resources_result_decoder(),
+        actions.ClientResultListResources,
+      )
+    actions.ClientRequestListResourceTemplates(_) ->
       decode.map(
         list_resource_templates_result_decoder(),
-        actions.ResultListResourceTemplates,
+        actions.ClientResultListResourceTemplates,
       )
-    actions.RequestReadResource(_) ->
-      decode.map(read_resource_result_decoder(), actions.ResultReadResource)
-    actions.RequestSubscribeResource(_) -> empty_result_decoder()
-    actions.RequestUnsubscribeResource(_) -> empty_result_decoder()
-    actions.RequestListPrompts(_) ->
-      decode.map(list_prompts_result_decoder(), actions.ResultListPrompts)
-    actions.RequestGetPrompt(_) ->
-      decode.map(get_prompt_result_decoder(), actions.ResultGetPrompt)
-    actions.RequestListTools(_) ->
-      decode.map(list_tools_result_decoder(), actions.ResultListTools)
-    actions.RequestCallTool(_) ->
-      decode.one_of(
-        decode.map(create_task_result_decoder(), actions.ResultCreateTask),
-        or: [decode.map(call_tool_result_decoder(), actions.ResultCallTool)],
+    actions.ClientRequestReadResource(_) ->
+      decode.map(
+        read_resource_result_decoder(),
+        actions.ClientResultReadResource,
       )
-    actions.RequestComplete(_) ->
-      decode.map(complete_result_decoder(), actions.ResultComplete)
-    actions.RequestSetLoggingLevel(_) -> empty_result_decoder()
-    actions.RequestListRoots(_) ->
-      decode.map(list_roots_result_decoder(), actions.ResultListRoots)
-    actions.RequestCreateMessage(_) ->
+    actions.ClientRequestSubscribeResource(_) -> empty_result_decoder()
+    actions.ClientRequestUnsubscribeResource(_) -> empty_result_decoder()
+    actions.ClientRequestListPrompts(_) ->
+      decode.map(list_prompts_result_decoder(), actions.ClientResultListPrompts)
+    actions.ClientRequestGetPrompt(_) ->
+      decode.map(get_prompt_result_decoder(), actions.ClientResultGetPrompt)
+    actions.ClientRequestListTools(_) ->
+      decode.map(list_tools_result_decoder(), actions.ClientResultListTools)
+    actions.ClientRequestCallTool(_) ->
       decode.one_of(
-        decode.map(create_task_result_decoder(), actions.ResultCreateTask),
+        decode.map(create_task_result_decoder(), actions.ClientResultCreateTask),
         or: [
-          decode.map(
-            create_message_result_decoder(),
-            actions.ResultCreateMessage,
-          ),
+          decode.map(call_tool_result_decoder(), actions.ClientResultCallTool),
         ],
       )
-    actions.RequestElicit(_) ->
-      decode.one_of(
-        decode.map(create_task_result_decoder(), actions.ResultCreateTask),
-        or: [decode.map(elicit_result_decoder(), actions.ResultElicit)],
-      )
-    actions.RequestListTasks(_) ->
-      decode.map(list_tasks_result_decoder(), actions.ResultListTasks)
-    actions.RequestGetTask(_) ->
-      decode.map(get_task_result_decoder(), actions.ResultGetTask)
-    actions.RequestGetTaskResult(_) ->
-      decode.map(task_result_decoder(), actions.ResultTaskResult)
-    actions.RequestCancelTask(_) ->
-      decode.map(cancel_task_result_decoder(), actions.ResultCancelTask)
+    actions.ClientRequestComplete(_) ->
+      decode.map(complete_result_decoder(), actions.ClientResultComplete)
+    actions.ClientRequestSetLoggingLevel(_) -> empty_result_decoder()
+    actions.ClientRequestListTasks(_) ->
+      decode.map(list_tasks_result_decoder(), actions.ClientResultListTasks)
+    actions.ClientRequestGetTask(_) ->
+      decode.map(get_task_result_decoder(), actions.ClientResultGetTask)
+    actions.ClientRequestGetTaskResult(_) ->
+      decode.map(task_result_decoder(), actions.ClientResultTaskResult)
+    actions.ClientRequestCancelTask(_) ->
+      decode.map(cancel_task_result_decoder(), actions.ClientResultCancelTask)
   }
 }
 
-fn empty_result_decoder() -> decode.Decoder(actions.ActionResult) {
-  decode.map(meta_only_decoder(), actions.ResultEmpty)
+fn server_action_result_decoder(
+  action: actions.ServerActionRequest,
+) -> decode.Decoder(actions.ServerActionResult) {
+  case action {
+    actions.ServerRequestPing(_) -> server_empty_result_decoder()
+    actions.ServerRequestListRoots(_) ->
+      decode.map(list_roots_result_decoder(), actions.ServerResultListRoots)
+    actions.ServerRequestCreateMessage(_) ->
+      decode.one_of(
+        decode.map(create_task_result_decoder(), actions.ServerResultCreateTask),
+        or: [
+          decode.map(
+            create_message_result_decoder(),
+            actions.ServerResultCreateMessage,
+          ),
+        ],
+      )
+    actions.ServerRequestElicit(_) ->
+      decode.one_of(
+        decode.map(create_task_result_decoder(), actions.ServerResultCreateTask),
+        or: [decode.map(elicit_result_decoder(), actions.ServerResultElicit)],
+      )
+    actions.ServerRequestListTasks(_) ->
+      decode.map(list_tasks_result_decoder(), actions.ServerResultListTasks)
+    actions.ServerRequestGetTask(_) ->
+      decode.map(get_task_result_decoder(), actions.ServerResultGetTask)
+    actions.ServerRequestGetTaskResult(_) ->
+      decode.map(task_result_decoder(), actions.ServerResultTaskResult)
+    actions.ServerRequestCancelTask(_) ->
+      decode.map(cancel_task_result_decoder(), actions.ServerResultCancelTask)
+  }
+}
+
+fn empty_result_decoder() -> decode.Decoder(actions.ClientActionResult) {
+  decode.map(meta_only_decoder(), actions.ClientResultEmpty)
+}
+
+fn server_empty_result_decoder() -> decode.Decoder(actions.ServerActionResult) {
+  decode.map(meta_only_decoder(), actions.ServerResultEmpty)
 }
 
 fn initialize_result_decoder() -> decode.Decoder(actions.InitializeResult) {
