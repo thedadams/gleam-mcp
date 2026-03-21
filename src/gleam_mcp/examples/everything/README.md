@@ -19,11 +19,11 @@ Not implemented yet because the current public SDK does not expose the needed se
 Run with stdio:
 
 ```sh
-gleam run -m everything/main
+gleam run -m gleam_mcp/examples/everything/main
 ```
 
 Run with streamable HTTP on port 3000:
 
 ```sh
-gleam run -m everything/main -- streamableHttp 3000
+gleam run -m gleam_mcp/examples/everything/main -- streamableHttp 3000
 ```
