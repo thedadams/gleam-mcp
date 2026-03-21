@@ -106,7 +106,11 @@ pub fn initialize_sends_requests_and_notification_test() {
       transport.Runners(
         stdio_request: fn(_, _, _, request) {
           case request {
-            jsonrpc.Request(_, method, Some(actions.ClientRequestInitialize(params))) -> {
+            jsonrpc.Request(
+              _,
+              method,
+              Some(actions.ClientRequestInitialize(params)),
+            ) -> {
               should.equal(method, mcp.method_initialize)
               let actions.InitializeRequestParams(
                 request_protocol_version,

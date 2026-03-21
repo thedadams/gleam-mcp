@@ -100,10 +100,9 @@ pub fn resources_prompts_tools_completion_and_logging_test() {
         jsonrpc.StringId("templates"),
         mcp.method_list_resource_templates,
         Some(
-          actions.ClientRequestListResourceTemplates(actions.PaginatedRequestParams(
-            None,
-            None,
-          )),
+          actions.ClientRequestListResourceTemplates(
+            actions.PaginatedRequestParams(None, None),
+          ),
         ),
       ),
     )
@@ -326,7 +325,10 @@ pub fn task_backed_tool_calls_can_be_polled_test() {
         jsonrpc.StringId("task-list"),
         mcp.method_list_tasks,
         Some(
-          actions.ClientRequestListTasks(actions.PaginatedRequestParams(None, None)),
+          actions.ClientRequestListTasks(actions.PaginatedRequestParams(
+            None,
+            None,
+          )),
         ),
       ),
     )
@@ -363,7 +365,9 @@ pub fn task_backed_tool_calls_can_be_polled_test() {
       jsonrpc.Request(
         jsonrpc.StringId("task-result"),
         mcp.method_get_task_result,
-        Some(actions.ClientRequestGetTaskResult(actions.TaskIdParams(task.task_id))),
+        Some(
+          actions.ClientRequestGetTaskResult(actions.TaskIdParams(task.task_id)),
+        ),
       ),
     )
 
