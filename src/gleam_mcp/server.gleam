@@ -1,4 +1,5 @@
 import gleam/dict.{type Dict}
+import gleam/erlang/process
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
@@ -7,10 +8,16 @@ import gleam_mcp/actions
 import gleam_mcp/jsonrpc
 import gleam_mcp/mcp
 import gleam_mcp/server/capabilities
+import gleam_mcp/server/streamable_http_store
 import gleam_mcp/task_store
+import youid/uuid
 
 pub type ToolHandler =
   fn(Option(Dict(String, jsonrpc.Value))) ->
+    Result(actions.CallToolResult, jsonrpc.RpcError)
+
+pub type ContextToolHandler =
+  fn(Server, RequestContext, Option(Dict(String, jsonrpc.Value))) ->
     Result(actions.CallToolResult, jsonrpc.RpcError)
 
 pub type ResourceHandler =
@@ -34,12 +41,17 @@ pub type HeaderAuthorization {
   HeaderAuthorization(header: String, validate: fn(String) -> Bool)
 }
 
+pub type RequestContext {
+  RequestContext(session_id: Option(String))
+}
+
 pub opaque type Server {
   Server(
     implementation: actions.Implementation,
     instructions: Option(String),
     authorization: Option(HeaderAuthorization),
     task_store: task_store.Store,
+    http_store: streamable_http_store.Store,
     tools: List(RegisteredTool),
     resources: List(RegisteredResource),
     resource_templates: List(RegisteredResourceTemplate),
@@ -50,7 +62,12 @@ pub opaque type Server {
 }
 
 type RegisteredTool {
-  RegisteredTool(tool: actions.Tool, handler: ToolHandler)
+  RegisteredTool(tool: actions.Tool, handler: RegisteredToolHandler)
+}
+
+type RegisteredToolHandler {
+  PlainToolHandler(ToolHandler)
+  ContextualToolHandler(ContextToolHandler)
 }
 
 type RegisteredResource {
@@ -74,6 +91,7 @@ pub fn new(implementation: actions.Implementation) -> Server {
     None,
     None,
     task_store.new(),
+    streamable_http_store.new(),
     [],
     [],
     [],
@@ -88,6 +106,7 @@ pub fn with_instructions(server: Server, instructions: String) -> Server {
     implementation: implementation,
     authorization: authorization,
     task_store: tasks,
+    http_store: http_store,
     tools: tools,
     resources: resources,
     resource_templates: resource_templates,
@@ -102,6 +121,7 @@ pub fn with_instructions(server: Server, instructions: String) -> Server {
     Some(instructions),
     authorization,
     tasks,
+    http_store,
     tools,
     resources,
     resource_templates,
@@ -120,6 +140,7 @@ pub fn with_header_authorization(
     implementation: implementation,
     instructions: instructions,
     task_store: tasks,
+    http_store: http_store,
     tools: tools,
     resources: resources,
     resource_templates: resource_templates,
@@ -134,6 +155,7 @@ pub fn with_header_authorization(
     instructions,
     Some(HeaderAuthorization(header, validate)),
     tasks,
+    http_store,
     tools,
     resources,
     resource_templates,
@@ -173,6 +195,7 @@ pub fn add_tool(
     instructions: instructions,
     authorization: authorization,
     task_store: tasks,
+    http_store: http_store,
     tools: tools,
     resources: resources,
     resource_templates: resource_templates,
@@ -186,7 +209,57 @@ pub fn add_tool(
     instructions,
     authorization,
     tasks,
-    [RegisteredTool(tool, implementation), ..tools],
+    http_store,
+    [RegisteredTool(tool, PlainToolHandler(implementation)), ..tools],
+    resources,
+    resource_templates,
+    prompts,
+    completion_handler,
+    logging_handler,
+  )
+}
+
+pub fn add_tool_with_context(
+  server: Server,
+  name: String,
+  description: String,
+  input_schema: jsonrpc.Value,
+  implementation: ContextToolHandler,
+) -> Server {
+  let tool =
+    actions.Tool(
+      name: name,
+      title: None,
+      description: Some(description),
+      input_schema: input_schema,
+      execution: Some(actions.ToolExecution(Some(actions.TaskOptional))),
+      output_schema: None,
+      annotations: None,
+      icons: [],
+      meta: None,
+    )
+
+  let Server(
+    implementation: server_info,
+    instructions: instructions,
+    authorization: authorization,
+    task_store: tasks,
+    http_store: http_store,
+    tools: tools,
+    resources: resources,
+    resource_templates: resource_templates,
+    prompts: prompts,
+    completion_handler: completion_handler,
+    logging_handler: logging_handler,
+  ) = server
+
+  Server(
+    server_info,
+    instructions,
+    authorization,
+    tasks,
+    http_store,
+    [RegisteredTool(tool, ContextualToolHandler(implementation)), ..tools],
     resources,
     resource_templates,
     prompts,
@@ -221,6 +294,7 @@ pub fn add_resource(
     instructions: instructions,
     authorization: authorization,
     task_store: tasks,
+    http_store: http_store,
     tools: tools,
     resources: resources,
     resource_templates: resource_templates,
@@ -234,6 +308,7 @@ pub fn add_resource(
     instructions,
     authorization,
     tasks,
+    http_store,
     tools,
     [RegisteredResource(resource, implementation), ..resources],
     resource_templates,
@@ -268,6 +343,7 @@ pub fn add_resource_template(
     instructions: instructions,
     authorization: authorization,
     task_store: tasks,
+    http_store: http_store,
     tools: tools,
     resources: resources,
     resource_templates: resource_templates,
@@ -281,6 +357,7 @@ pub fn add_resource_template(
     instructions,
     authorization,
     tasks,
+    http_store,
     tools,
     resources,
     [
@@ -315,6 +392,7 @@ pub fn add_prompt(
     instructions: instructions,
     authorization: authorization,
     task_store: tasks,
+    http_store: http_store,
     tools: tools,
     resources: resources,
     resource_templates: resource_templates,
@@ -328,6 +406,7 @@ pub fn add_prompt(
     instructions,
     authorization,
     tasks,
+    http_store,
     tools,
     resources,
     resource_templates,
@@ -346,6 +425,7 @@ pub fn set_completion_handler(
     instructions: instructions,
     authorization: authorization,
     task_store: tasks,
+    http_store: http_store,
     tools: tools,
     resources: resources,
     resource_templates: resource_templates,
@@ -359,6 +439,7 @@ pub fn set_completion_handler(
     instructions,
     authorization,
     tasks,
+    http_store,
     tools,
     resources,
     resource_templates,
@@ -374,6 +455,7 @@ pub fn set_logging_handler(server: Server, handler: LoggingHandler) -> Server {
     instructions: instructions,
     authorization: authorization,
     task_store: tasks,
+    http_store: http_store,
     tools: tools,
     resources: resources,
     resource_templates: resource_templates,
@@ -387,6 +469,7 @@ pub fn set_logging_handler(server: Server, handler: LoggingHandler) -> Server {
     instructions,
     authorization,
     tasks,
+    http_store,
     tools,
     resources,
     resource_templates,
@@ -400,9 +483,17 @@ pub fn handle_request(
   server: Server,
   request: jsonrpc.Request(actions.ClientActionRequest),
 ) -> #(Server, jsonrpc.Response(actions.ClientActionResult)) {
+  handle_request_with_context(server, RequestContext(None), request)
+}
+
+pub fn handle_request_with_context(
+  server: Server,
+  context: RequestContext,
+  request: jsonrpc.Request(actions.ClientActionRequest),
+) -> #(Server, jsonrpc.Response(actions.ClientActionResult)) {
   case request {
     jsonrpc.Request(id, _method, Some(action)) ->
-      case dispatch_request(server, action) {
+      case dispatch_request(server, context, action) {
         Ok(result) -> #(server, jsonrpc.ResultResponse(id, result))
         Error(error) -> #(server, jsonrpc.ErrorResponse(Some(id), error))
       }
@@ -442,8 +533,127 @@ pub fn handle_notification(
   }
 }
 
+pub fn session_id(context: RequestContext) -> Option(String) {
+  let RequestContext(session_id: session_id) = context
+  session_id
+}
+
+pub fn ensure_streamable_http_session(
+  server: Server,
+  session_id: Option(String),
+) -> String {
+  let Server(http_store: http_store, ..) = server
+  streamable_http_store.ensure_session(http_store, session_id)
+}
+
+pub fn new_streamable_http_listener_id() -> String {
+  streamable_http_store.new_listener_id()
+}
+
+pub fn register_streamable_http_listener(
+  server: Server,
+  session_id: String,
+  listener_id: String,
+  listener: process.Subject(streamable_http_store.ListenerMessage),
+) -> Nil {
+  let Server(http_store: http_store, ..) = server
+  streamable_http_store.register_listener(
+    http_store,
+    session_id,
+    listener_id,
+    listener,
+  )
+}
+
+pub fn unregister_streamable_http_listener(
+  server: Server,
+  session_id: String,
+  listener_id: String,
+) -> Nil {
+  let Server(http_store: http_store, ..) = server
+  streamable_http_store.unregister_listener(http_store, session_id, listener_id)
+}
+
+pub fn handle_server_sent_response(
+  server: Server,
+  context: RequestContext,
+  body: String,
+) -> Result(Nil, jsonrpc.RpcError) {
+  case session_id(context) {
+    Some(value) -> {
+      let Server(http_store: http_store, ..) = server
+      streamable_http_store.resolve_response(http_store, value, body)
+    }
+    None ->
+      Error(jsonrpc.invalid_params_error(
+        "Server-sent request responses require an MCP session id",
+      ))
+  }
+}
+
+pub fn send_request(
+  server: Server,
+  context: RequestContext,
+  request: jsonrpc.Request(actions.ServerActionRequest),
+) -> Result(jsonrpc.Response(actions.ServerActionResult), jsonrpc.RpcError) {
+  case session_id(context) {
+    Some(value) -> {
+      let Server(http_store: http_store, ..) = server
+      streamable_http_store.send_request(http_store, value, request, 5000)
+    }
+    None ->
+      Error(jsonrpc.invalid_params_error(
+        "Server-sent requests require a streamable HTTP session",
+      ))
+  }
+}
+
+pub fn elicit(
+  server: Server,
+  context: RequestContext,
+  params: actions.ElicitRequestParams,
+) -> Result(actions.ElicitResult, jsonrpc.RpcError) {
+  let request =
+    jsonrpc.Request(
+      jsonrpc.StringId(uuid.v4_string()),
+      mcp.method_elicit,
+      Some(actions.ServerRequestElicit(params)),
+    )
+
+  case send_request(server, context, request) {
+    Ok(jsonrpc.ResultResponse(_, actions.ServerResultElicit(result))) ->
+      Ok(result)
+    Ok(jsonrpc.ErrorResponse(_, error)) -> Error(error)
+    Ok(_) ->
+      Error(jsonrpc.invalid_params_error(
+        "Client returned an unexpected result for elicitation request",
+      ))
+    Error(error) -> Error(error)
+  }
+}
+
+pub fn create_message(
+  server: Server,
+  context: RequestContext,
+  params: actions.CreateMessageRequestParams,
+) -> Result(actions.ServerActionResult, jsonrpc.RpcError) {
+  let request =
+    jsonrpc.Request(
+      jsonrpc.StringId(uuid.v4_string()),
+      mcp.method_create_message,
+      Some(actions.ServerRequestCreateMessage(params)),
+    )
+
+  case send_request(server, context, request) {
+    Ok(jsonrpc.ResultResponse(_, result)) -> Ok(result)
+    Ok(jsonrpc.ErrorResponse(_, error)) -> Error(error)
+    Error(error) -> Error(error)
+  }
+}
+
 fn dispatch_request(
   server: Server,
+  context: RequestContext,
   action: actions.ClientActionRequest,
 ) -> Result(actions.ClientActionResult, jsonrpc.RpcError) {
   case action {
@@ -461,7 +671,8 @@ fn dispatch_request(
     actions.ClientRequestListPrompts(_) -> Ok(list_prompts_result(server))
     actions.ClientRequestGetPrompt(params) -> get_prompt_result(server, params)
     actions.ClientRequestListTools(_) -> Ok(list_tools_result(server))
-    actions.ClientRequestCallTool(params) -> call_tool_result(server, params)
+    actions.ClientRequestCallTool(params) ->
+      call_tool_result(server, context, params)
     actions.ClientRequestComplete(params) -> complete_result(server, params)
     actions.ClientRequestSetLoggingLevel(params) ->
       set_logging_level_result(server, params)
@@ -617,6 +828,7 @@ fn list_tools_result(server: Server) -> actions.ClientActionResult {
 
 fn call_tool_result(
   server: Server,
+  context: RequestContext,
   params: actions.CallToolRequestParams,
 ) -> Result(actions.ClientActionResult, jsonrpc.RpcError) {
   let actions.CallToolRequestParams(name, arguments, task, _) = params
@@ -625,7 +837,9 @@ fn call_tool_result(
     Ok(RegisteredTool(handler:, ..)) ->
       case task {
         Some(actions.TaskMetadata(ttl_ms)) -> {
-          let outcome = handler(arguments) |> result.map(actions.TaskCallTool)
+          let outcome =
+            run_tool_handler(server, handler, context, arguments)
+            |> result.map(actions.TaskCallTool)
           let created = task_store.create(server.task_store, outcome, ttl_ms)
           Ok(
             actions.ClientResultCreateTask(actions.CreateTaskResult(
@@ -634,9 +848,24 @@ fn call_tool_result(
             )),
           )
         }
-        None -> handler(arguments) |> result.map(actions.ClientResultCallTool)
+        None ->
+          run_tool_handler(server, handler, context, arguments)
+          |> result.map(actions.ClientResultCallTool)
       }
     Error(Nil) -> Error(jsonrpc.invalid_params_error("Unknown tool: " <> name))
+  }
+}
+
+fn run_tool_handler(
+  server: Server,
+  handler: RegisteredToolHandler,
+  context: RequestContext,
+  arguments: Option(Dict(String, jsonrpc.Value)),
+) -> Result(actions.CallToolResult, jsonrpc.RpcError) {
+  case handler {
+    PlainToolHandler(tool_handler) -> tool_handler(arguments)
+    ContextualToolHandler(tool_handler) ->
+      tool_handler(server, context, arguments)
   }
 }
 

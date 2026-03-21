@@ -10,11 +10,17 @@ import gleam_mcp/client
 import gleam_mcp/client/capabilities
 import gleam_mcp/client/transport
 import gleam_mcp/jsonrpc
+import gleam_mcp/server
 import gleeunit
 import gleeunit/should
-import server_sent_request_integration_support
+import server_test_support
 
 const dynamic_resource_uri = "demo://resource/dynamic/text/1"
+
+type InteractionKind {
+  Elicitation
+  Sampling
+}
 
 pub fn main() {
   gleeunit.main()
@@ -299,8 +305,8 @@ fn simulate_research_query_runs_as_task_with_transport(config: transport.Config)
 pub fn elicitation_server_sent_roundtrip_http_test() {
   let config =
     transport.Http(transport.HttpConfig(
-      server_sent_request_integration_support.start_http_server(
-        server_sent_request_integration_support.Elicitation,
+      server_test_support.start_http_server_with_server(
+        server_sent_request_server(Elicitation),
       ),
       [],
       Some(5000),
@@ -327,7 +333,7 @@ pub fn elicitation_server_sent_roundtrip_http_test() {
 
   let client = client.new(config, capability_config)
   let #(client, _) = initialize_client(client)
-  let _ = spawn_http_listener_once(client)
+  let _ = spawn_listener(client)
   process.sleep(100)
 
   let #(_, call_result) =
@@ -345,20 +351,17 @@ pub fn elicitation_server_sent_roundtrip_http_test() {
     _ -> panic as string.inspect(call_result)
   }
 
-  let _ = spawn_http_listener_once(client)
-  process.sleep(100)
-
   let #(_, call_result) =
     client.call_tool(
       client,
-      actions.CallToolRequestParams("roundtrip-elicitation-1", None, None, None),
+      actions.CallToolRequestParams("roundtrip-elicitation", None, None, None),
     )
 
   case call_result {
     Ok(actions.CallTool(actions.CallToolResult(content:, ..))) ->
       should.be_true(has_text_content(
         content,
-        "Elicited: elicited for Please provide a value for requst roundtrip-elicitation-1",
+        "Elicited: elicited for Please provide a value for requst roundtrip-elicitation",
       ))
     _ -> panic as string.inspect(call_result)
   }
@@ -367,8 +370,8 @@ pub fn elicitation_server_sent_roundtrip_http_test() {
 pub fn sampling_server_sent_roundtrip_http_test() {
   let config =
     transport.Http(transport.HttpConfig(
-      server_sent_request_integration_support.start_http_server(
-        server_sent_request_integration_support.Sampling,
+      server_test_support.start_http_server_with_server(
+        server_sent_request_server(Sampling),
       ),
       [],
       Some(5000),
@@ -399,7 +402,7 @@ pub fn sampling_server_sent_roundtrip_http_test() {
 
   let client = client.new(config, capability_config)
   let #(client, _) = initialize_client(client)
-  let _ = spawn_http_listener_once(client)
+  let _ = spawn_listener(client)
   process.sleep(100)
 
   let #(_, call_result) =
@@ -412,6 +415,60 @@ pub fn sampling_server_sent_roundtrip_http_test() {
     Ok(actions.CallTool(actions.CallToolResult(content:, ..))) ->
       should.be_true(has_text_content(content, "Sampled: sampled value"))
     _ -> panic as string.inspect(call_result)
+  }
+}
+
+pub fn server_sent_requests_use_matching_http_session_test() {
+  let base_url =
+    server_test_support.start_http_server_with_server(
+      server_sent_request_server(Elicitation),
+    )
+
+  let client_a =
+    client.new(
+      transport.Http(transport.HttpConfig(base_url, [], Some(5000))),
+      elicitation_capabilities("client-a"),
+    )
+  let client_b =
+    client.new(
+      transport.Http(transport.HttpConfig(base_url, [], Some(5000))),
+      elicitation_capabilities("client-b"),
+    )
+
+  let #(client_a, _) = initialize_client(client_a)
+  let #(client_b, _) = initialize_client(client_b)
+
+  let _ = spawn_listener(client_a)
+  let _ = spawn_listener(client_b)
+  process.sleep(100)
+
+  let #(_, result_a) =
+    client.call_tool(
+      client_a,
+      actions.CallToolRequestParams("roundtrip-elicitation", None, None, None),
+    )
+  let #(_, result_b) =
+    client.call_tool(
+      client_b,
+      actions.CallToolRequestParams("roundtrip-elicitation", None, None, None),
+    )
+
+  case result_a {
+    Ok(actions.CallTool(actions.CallToolResult(content:, ..))) ->
+      should.be_true(has_text_content(
+        content,
+        "Elicited: client-a for Please provide a value for requst roundtrip-elicitation",
+      ))
+    _ -> panic as string.inspect(result_a)
+  }
+
+  case result_b {
+    Ok(actions.CallTool(actions.CallToolResult(content:, ..))) ->
+      should.be_true(has_text_content(
+        content,
+        "Elicited: client-b for Please provide a value for requst roundtrip-elicitation",
+      ))
+    _ -> panic as string.inspect(result_b)
   }
 }
 
@@ -538,37 +595,178 @@ fn spawn_listener(
   reply_to
 }
 
-fn spawn_http_listener_once(
-  listening_client: client.Client,
-) -> process.Subject(Result(Nil, client.ClientError)) {
-  let reply_to = process.new_subject()
-  let _ =
-    process.spawn(fn() {
-      let result = case listening_client {
-        client.Client(
-          transport_config: transport.Http(http_config),
-          capabilities: capability_config,
-          protocol_version: protocol_version,
-          session_id: session_id,
-          ..,
-        ) ->
-          transport.streamable_http_listen(
-            http_config,
-            session_id,
-            protocol_version,
-            capability_config,
-          )
-          |> result.map(fn(_) { Nil })
-          |> result.map_error(client.Transport)
-        _ ->
-          Error(
-            client.Transport(transport.ProcessError("Expected HTTP transport")),
-          )
+fn server_sent_request_server(kind: InteractionKind) -> server.Server {
+  server.new(
+    actions.Implementation(
+      name: "server-sent-request-http-test-server",
+      version: "0.1.0",
+      title: None,
+      description: None,
+      website_url: None,
+      icons: [],
+    ),
+  )
+  |> server.add_tool_with_context(
+    tool_name(kind),
+    "Roundtrip test tool",
+    jsonrpc.VObject([]),
+    fn(app_server, context, _) {
+      case kind {
+        Elicitation ->
+          elicitation_tool_result(app_server, context, tool_name(kind))
+        Sampling -> sampling_tool_result(app_server, context)
       }
+    },
+  )
+}
 
-      process.send(reply_to, result)
-    })
-  reply_to
+fn elicitation_tool_result(
+  app_server: server.Server,
+  context: server.RequestContext,
+  tool: String,
+) -> Result(actions.CallToolResult, jsonrpc.RpcError) {
+  server.elicit(
+    app_server,
+    context,
+    actions.ElicitRequestForm(actions.ElicitRequestFormParams(
+      "Please provide a value for requst " <> tool,
+      jsonrpc.VObject([
+        #("type", jsonrpc.VString("object")),
+        #(
+          "properties",
+          jsonrpc.VObject([
+            #("answer", jsonrpc.VObject([#("type", jsonrpc.VString("string"))])),
+          ]),
+        ),
+        #("required", jsonrpc.VArray([jsonrpc.VString("answer")])),
+      ]),
+      None,
+      None,
+    )),
+  )
+  |> result.map(fn(elicited) {
+    let actions.ElicitResult(_, content, _) = elicited
+    let answer = case content {
+      Some(fields) ->
+        case dict.get(fields, "answer") {
+          Ok(actions.ElicitString(value)) -> value
+          _ -> "missing answer"
+        }
+      None -> "missing answer"
+    }
+
+    actions.CallToolResult(
+      content: [
+        actions.TextBlock(actions.TextContent(
+          "Elicited: " <> answer,
+          None,
+          None,
+        )),
+      ],
+      structured_content: None,
+      is_error: Some(False),
+      meta: None,
+    )
+  })
+}
+
+fn sampling_tool_result(
+  app_server: server.Server,
+  context: server.RequestContext,
+) -> Result(actions.CallToolResult, jsonrpc.RpcError) {
+  case
+    server.create_message(
+      app_server,
+      context,
+      actions.CreateMessageRequestParams(
+        messages: [
+          actions.SamplingMessage(
+            actions.User,
+            actions.SingleSamplingContent(
+              actions.SamplingText(actions.TextContent(
+                "Return the integration-test sample",
+                None,
+                None,
+              )),
+            ),
+            None,
+          ),
+        ],
+        model_preferences: None,
+        system_prompt: None,
+        include_context: None,
+        temperature: None,
+        max_tokens: 32,
+        stop_sequences: [],
+        metadata: None,
+        tools: [],
+        tool_choice: None,
+        task: None,
+        meta: None,
+      ),
+    )
+  {
+    Ok(actions.ServerResultCreateMessage(actions.CreateMessageResult(
+      message:,
+      ..,
+    ))) -> {
+      let actions.SamplingMessage(content:, ..) = message
+      case content {
+        actions.SingleSamplingContent(actions.SamplingText(actions.TextContent(
+          text:,
+          ..,
+        ))) ->
+          Ok(actions.CallToolResult(
+            content: [
+              actions.TextBlock(actions.TextContent(
+                "Sampled: " <> text,
+                None,
+                None,
+              )),
+            ],
+            structured_content: None,
+            is_error: Some(False),
+            meta: None,
+          ))
+        _ ->
+          Error(jsonrpc.invalid_params_error(
+            "Client returned unsupported sampling content",
+          ))
+      }
+    }
+    Ok(_) ->
+      Error(jsonrpc.invalid_params_error(
+        "Client returned an unexpected result for sampling request",
+      ))
+    Error(error) -> Error(error)
+  }
+}
+
+fn elicitation_capabilities(prefix: String) -> capabilities.Config {
+  capabilities.none()
+  |> capabilities.with_elicit_form(fn(param) {
+    Ok(
+      capabilities.Elicit(actions.ElicitResult(
+        actions.ElicitAccept,
+        Some(
+          dict.from_list([
+            #(
+              "answer",
+              actions.ElicitString(prefix <> " for " <> param.message),
+            ),
+          ]),
+        ),
+        None,
+      )),
+    )
+  })
+}
+
+fn tool_name(kind: InteractionKind) -> String {
+  case kind {
+    Elicitation -> "roundtrip-elicitation"
+    Sampling -> "roundtrip-sampling"
+  }
 }
 
 fn wait_for_completed_task(
