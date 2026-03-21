@@ -21,6 +21,7 @@ type ParserState {
     event_lines: List(String),
     session_id: Option(String),
     status: Result(Nil, String),
+    stream_started: Bool,
   )
 }
 
@@ -38,13 +39,13 @@ pub fn listen(
     |> dream_client.start_stream,
   )
 
-  loop(mailbox, on_event, timeout_ms, ParserState("", [], None, Ok(Nil)))
+  loop(mailbox, on_event, timeout_ms, ParserState("", [], None, Ok(Nil), False))
 }
 
 fn request_builder(
   url: String,
   headers: List(#(String, String)),
-  timeout_ms: Int,
+  _timeout_ms: Int,
   mailbox: process.Subject(StreamMessage),
 ) -> dream_client.ClientRequest {
   let #(scheme, host, port, path, query) = parse_url(url)
@@ -56,7 +57,6 @@ fn request_builder(
   |> apply_port(port)
   |> dream_client.path(path)
   |> apply_query(query)
-  |> dream_client.timeout(timeout_ms)
   |> add_headers(headers)
   |> dream_client.on_stream_start(fn(headers) {
     process.send(mailbox, StreamStarted(headers))
@@ -76,7 +76,7 @@ fn loop(
   timeout_ms: Int,
   state: ParserState,
 ) -> Result(Option(String), String) {
-  case process.receive(mailbox, timeout_ms) {
+  case next_stream_message(mailbox, timeout_ms, state) {
     Error(Nil) -> Error("Timed out waiting for transport response")
     Ok(StreamFailed(reason)) -> Error(reason)
     Ok(StreamStarted(headers)) ->
@@ -93,6 +93,18 @@ fn loop(
           )
       }
     Ok(StreamEnded) -> finalise(state, on_event)
+  }
+}
+
+fn next_stream_message(
+  mailbox: process.Subject(StreamMessage),
+  timeout_ms: Int,
+  state: ParserState,
+) -> Result(StreamMessage, Nil) {
+  let ParserState(stream_started: stream_started, ..) = state
+  case stream_started {
+    True -> Ok(process.receive_forever(mailbox))
+    False -> process.receive(mailbox, timeout_ms)
   }
 }
 
@@ -163,12 +175,14 @@ fn append_line(state: ParserState, line: String) -> ParserState {
       case string.starts_with(line, "data:") {
         True -> {
           let ParserState(event_lines:, ..) = state
-          let ParserState(pending_line, _, session_id, status) = state
+          let ParserState(pending_line, _, session_id, status, stream_started) =
+            state
           ParserState(
             pending_line,
             list.append(event_lines, [data_value(line)]),
             session_id,
             status,
+            stream_started,
           )
         }
         False -> state
@@ -185,12 +199,19 @@ fn dispatch_event(
 
   case payload == "" {
     True -> {
-      let ParserState(pending_line, _, session_id, status) = state
-      ParserState(pending_line, [], session_id, status)
+      let ParserState(pending_line, _, session_id, status, stream_started) =
+        state
+      ParserState(pending_line, [], session_id, status, stream_started)
     }
     False -> {
-      let ParserState(pending_line, _, session_id, _) = state
-      ParserState(pending_line, [], session_id, on_event(payload))
+      let ParserState(pending_line, _, session_id, _, stream_started) = state
+      ParserState(
+        pending_line,
+        [],
+        session_id,
+        on_event(payload),
+        stream_started,
+      )
     }
   }
 }
@@ -217,21 +238,28 @@ fn data_value(line: String) -> String {
 }
 
 fn set_pending_line(state: ParserState, pending_line: String) -> ParserState {
-  let ParserState(_, event_lines, session_id, status) = state
-  ParserState(pending_line, event_lines, session_id, status)
+  let ParserState(_, event_lines, session_id, status, stream_started) = state
+  ParserState(pending_line, event_lines, session_id, status, stream_started)
 }
 
 fn set_status(state: ParserState, status: Result(Nil, String)) -> ParserState {
-  let ParserState(pending_line, event_lines, session_id, _) = state
-  ParserState(pending_line, event_lines, session_id, status)
+  let ParserState(pending_line, event_lines, session_id, _, stream_started) =
+    state
+  ParserState(pending_line, event_lines, session_id, status, stream_started)
 }
 
 fn set_session_id(
   state: ParserState,
   headers: List(dream_client.Header),
 ) -> ParserState {
-  let ParserState(pending_line, event_lines, _, status) = state
-  ParserState(pending_line, event_lines, extract_session_id(headers), status)
+  let ParserState(pending_line, event_lines, _, status, _) = state
+  ParserState(
+    pending_line,
+    event_lines,
+    extract_session_id(headers),
+    status,
+    True,
+  )
 }
 
 fn state_status(state: ParserState) -> Result(Nil, String) {

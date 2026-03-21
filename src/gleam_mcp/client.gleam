@@ -126,7 +126,14 @@ fn listen_forever(client: Client) -> Result(Nil, ClientError) {
       {
         Ok(next_session_id) ->
           listen_forever(set_runtime(client, next_session_id))
-        Error(error) -> Error(Transport(error))
+        Error(error) ->
+          case should_retry_http_listen(error) {
+            True -> {
+              process.sleep(100)
+              listen_forever(client)
+            }
+            False -> Error(Transport(error))
+          }
       }
     transport.Stdio(stdio_config) -> {
       let transport.Runners(stdio_listen: stdio_listen, ..) = runners
@@ -140,6 +147,14 @@ fn listen_forever(client: Client) -> Result(Nil, ClientError) {
         Error(error) -> Error(Transport(error))
       }
     }
+  }
+}
+
+fn should_retry_http_listen(error: transport.TransportError) -> Bool {
+  case error {
+    transport.TimeoutError -> True
+    transport.HttpError(_) -> True
+    _ -> False
   }
 }
 
