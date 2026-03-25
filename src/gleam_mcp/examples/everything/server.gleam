@@ -12,6 +12,7 @@ pub fn make_server() -> server.Server {
   |> resources.register_resources
   |> prompts.register_prompts
   |> server.set_completion_handler(prompts.completion_handler)
+  |> server.set_logging_handler(fn(_) { Ok(Nil) })
 }
 
 pub fn implementation() -> actions.Implementation {

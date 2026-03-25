@@ -5,13 +5,13 @@ This directory contains a best-effort Gleam port of the MCP reference `everythin
 Implemented here:
 - tools for echo, sum, env inspection, structured content, images, annotations, resource links, and embedded resources
 - stdio-only server-initiated tools for sampling and elicitation roundtrips
+- simulated logging notifications over stdio and streamable HTTP, toggled by tool and filtered by `logging/setLevel`
 - static resources and dynamic text/blob resource templates
 - prompts, including argument-driven prompts and completion support
 - stdio and basic streamable HTTP entrypoints
 
 Not implemented yet because the current public SDK does not expose the needed server hooks:
 - resource subscriptions and update notifications
-- simulated logging notifications
 - roots synchronization
 - server-initiated sampling and elicitation requests over streamable HTTP
 - faithful long-running and bidirectional task flows

@@ -17,6 +17,7 @@ pub opaque type Store {
 
 pub type ListenerMessage {
   DeliverRequest(jsonrpc.Request(actions.ServerActionRequest))
+  DeliverNotification(jsonrpc.Request(actions.ActionNotification))
   CloseListener
 }
 
@@ -39,6 +40,10 @@ type Message {
     reply_to: process.Subject(
       Result(jsonrpc.Response(actions.ServerActionResult), jsonrpc.RpcError),
     ),
+  )
+  SendNotification(
+    session_id: String,
+    notification: jsonrpc.Request(actions.ActionNotification),
   )
   ResolveResponse(
     session_id: String,
@@ -140,6 +145,15 @@ pub fn send_request(
   }
 }
 
+pub fn send_notification(
+  store: Store,
+  session_id: String,
+  notification: jsonrpc.Request(actions.ActionNotification),
+) -> Nil {
+  let Store(subject) = store
+  process.send(subject, SendNotification(session_id, notification))
+}
+
 pub fn resolve_response(
   store: Store,
   session_id: String,
@@ -184,6 +198,13 @@ fn loop(
         |> enqueue_request(session_id, request, reply_to)
       loop(subject, next_sessions)
     }
+    SendNotification(session_id, notification) -> {
+      let next_sessions =
+        sessions
+        |> ensure_session_entry(session_id)
+        |> deliver_notification(session_id, notification)
+      loop(subject, next_sessions)
+    }
     ResolveResponse(session_id, body, reply_to) -> {
       let #(next_sessions, result) =
         resolve_pending_response(sessions, session_id, body)
@@ -194,6 +215,22 @@ fn loop(
       loop(subject, expire_request(sessions, session_id, pending_id))
     }
   }
+}
+
+fn deliver_notification(
+  sessions: Dict(String, Session),
+  session_id: String,
+  notification: jsonrpc.Request(actions.ActionNotification),
+) -> Dict(String, Session) {
+  let Session(_, _, listener) = get_session(sessions, session_id)
+
+  case listener {
+    Some(Listener(subject: listener_subject, ..)) ->
+      process.send(listener_subject, DeliverNotification(notification))
+    None -> Nil
+  }
+
+  sessions
 }
 
 fn ensure_session_entry(

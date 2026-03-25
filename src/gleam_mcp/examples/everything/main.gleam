@@ -5,7 +5,7 @@ import gleam/io
 import gleam/string
 import gleam_mcp/examples/everything/server as everything_server
 import gleam_mcp/examples/everything/stdio as everything_stdio
-import gleam_mcp/server/streamable_http
+import gleam_mcp/examples/everything/streamable_http
 import mist
 
 pub fn main() -> Nil {

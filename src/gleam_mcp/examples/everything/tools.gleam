@@ -163,6 +163,12 @@ pub fn register_tools(app_server: server.Server) -> server.Server {
     empty_object_schema(),
     trigger_elicitation_request_tool,
   )
+  |> server.add_tool(
+    "toggle-simulated-logging",
+    "Toggle periodic simulated logging notifications for the current session",
+    empty_object_schema(),
+    unsupported_server_interaction_tool,
+  )
 }
 
 fn echo_tool(
@@ -428,6 +434,23 @@ fn trigger_elicitation_request_tool(
 ) -> Result(actions.CallToolResult, jsonrpc.RpcError) {
   server.elicit(app_server, context, elicitation_request())
   |> result.map(elicitation_tool_result)
+}
+
+fn unsupported_server_interaction_tool(
+  _arguments: Option(dict.Dict(String, jsonrpc.Value)),
+) -> Result(actions.CallToolResult, jsonrpc.RpcError) {
+  Ok(actions.CallToolResult(
+    content: [
+      actions.TextBlock(actions.TextContent(
+        "This tool needs a transport-specific interactive loop. Use the stdio Everything server entrypoint to exercise it.",
+        None,
+        None,
+      )),
+    ],
+    structured_content: None,
+    is_error: Some(True),
+    meta: None,
+  ))
 }
 
 fn sampling_request(

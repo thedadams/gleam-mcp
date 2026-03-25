@@ -608,6 +608,24 @@ pub fn send_request(
   }
 }
 
+pub fn send_notification(
+  server: Server,
+  context: RequestContext,
+  notification: jsonrpc.Request(actions.ActionNotification),
+) -> Result(Nil, jsonrpc.RpcError) {
+  case session_id(context) {
+    Some(value) -> {
+      let Server(http_store: http_store, ..) = server
+      streamable_http_store.send_notification(http_store, value, notification)
+      Ok(Nil)
+    }
+    None ->
+      Error(jsonrpc.invalid_params_error(
+        "Server-sent notifications require a streamable HTTP session",
+      ))
+  }
+}
+
 pub fn elicit(
   server: Server,
   context: RequestContext,

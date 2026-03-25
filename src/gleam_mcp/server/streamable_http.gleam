@@ -240,7 +240,27 @@ fn handle_sse_message(
             session_id,
             listener_id,
           )
-          actor.stop_abnormal("Failed to send server-sent request event")
+          actor.stop()
+        }
+      }
+    streamable_http_store.DeliverNotification(notification) ->
+      case
+        mist.send_event(
+          connection,
+          mist.event(
+            client_codec.encode_notification(notification)
+            |> string_tree.from_string,
+          ),
+        )
+      {
+        Ok(Nil) -> actor.continue(state)
+        Error(Nil) -> {
+          server.unregister_streamable_http_listener(
+            app_server,
+            session_id,
+            listener_id,
+          )
+          actor.stop()
         }
       }
     streamable_http_store.CloseListener -> {
