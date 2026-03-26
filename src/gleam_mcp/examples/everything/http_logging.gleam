@@ -2,14 +2,14 @@ import gleam/dict
 import gleam/erlang/process
 import gleam/int
 import gleam/list
-import gleam/option.{None, Some}
+import gleam/option.{type Option, None, Some}
 import gleam_mcp/actions
 import gleam_mcp/jsonrpc
 import gleam_mcp/mcp
 import gleam_mcp/server
 import gleam_mcp/server/streamable_http
 
-type Logger {
+pub opaque type Logger {
   Logger(subject: process.Subject(LoggerMessage))
 }
 
@@ -22,22 +22,9 @@ type SessionLogger {
   SessionLogger(enabled: Bool, minimum_level: actions.LoggingLevel, tick: Int)
 }
 
-pub fn middleware(
-  app_server: server.Server,
-) -> streamable_http.ClientActionMiddleware {
-  let logger = new_logger(app_server)
+pub fn middleware(logger: Logger) -> streamable_http.ClientActionMiddleware {
   fn(_, _, session_id, message) {
     case message {
-      jsonrpc.Request(id, _, Some(actions.ClientRequestCallTool(params))) ->
-        case params.name {
-          "toggle-simulated-logging" ->
-            streamable_http.RespondRpc(toggle_response(
-              id,
-              toggle_logger(logger, session_id),
-              session_id,
-            ))
-          _ -> streamable_http.Continue
-        }
       jsonrpc.Request(_, _, Some(actions.ClientRequestSetLoggingLevel(params))) -> {
         let actions.SetLevelRequestParams(level, _) = params
         set_logger_level(logger, session_id, level)
@@ -48,11 +35,23 @@ pub fn middleware(
   }
 }
 
-fn toggle_response(
-  id: jsonrpc.RequestId,
-  enabled: Bool,
-  session_id: String,
-) -> jsonrpc.Response(actions.ClientActionResult) {
+pub fn toggle_tool(
+  logger: Logger,
+  _app_server: server.Server,
+  context: server.RequestContext,
+  _arguments: Option(dict.Dict(String, jsonrpc.Value)),
+) -> Result(actions.CallToolResult, jsonrpc.RpcError) {
+  case server.session_id(context) {
+    Some(session_id) ->
+      Ok(toggle_result(toggle_logger(logger, session_id), session_id))
+    None ->
+      Error(jsonrpc.invalid_params_error(
+        "toggle-simulated-logging requires a session-based transport",
+      ))
+  }
+}
+
+fn toggle_result(enabled: Bool, session_id: String) -> actions.CallToolResult {
   let text = case enabled {
     True ->
       "Started simulated, random-leveled logging for session "
@@ -61,18 +60,15 @@ fn toggle_response(
     False -> "Stopped simulated logging for session " <> session_id
   }
 
-  jsonrpc.ResultResponse(
-    id,
-    actions.ClientResultCallTool(actions.CallToolResult(
-      content: [actions.TextBlock(actions.TextContent(text, None, None))],
-      structured_content: None,
-      is_error: Some(False),
-      meta: None,
-    )),
+  actions.CallToolResult(
+    content: [actions.TextBlock(actions.TextContent(text, None, None))],
+    structured_content: None,
+    is_error: Some(False),
+    meta: None,
   )
 }
 
-fn new_logger(app_server: server.Server) -> Logger {
+pub fn new_logger(app_server: server.Server) -> Logger {
   let reply_to = process.new_subject()
   let _ = process.spawn(fn() { start_logger(app_server, reply_to) })
   Logger(expect_ok(process.receive(reply_to, within: 1000)))

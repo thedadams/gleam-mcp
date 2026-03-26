@@ -8,13 +8,17 @@ import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
 import gleam_mcp/actions
+import gleam_mcp/examples/everything/http_logging
 import gleam_mcp/examples/everything/resources
 import gleam_mcp/jsonrpc
 import gleam_mcp/server
 
 pub const tiny_png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aF9sAAAAASUVORK5CYII="
 
-pub fn register_tools(app_server: server.Server) -> server.Server {
+pub fn register_tools(
+  app_server: server.Server,
+  logger: Option(http_logging.Logger),
+) -> server.Server {
   app_server
   |> server.add_tool(
     "echo",
@@ -163,11 +167,20 @@ pub fn register_tools(app_server: server.Server) -> server.Server {
     empty_object_schema(),
     trigger_elicitation_request_tool,
   )
-  |> server.add_tool(
+  |> server.add_tool_with_context(
     "toggle-simulated-logging",
     "Toggle periodic simulated logging notifications for the current session",
     empty_object_schema(),
-    unsupported_server_interaction_tool,
+    fn(server, context, arguments) {
+      case logger {
+        Some(logger) ->
+          http_logging.toggle_tool(logger, server, context, arguments)
+        None ->
+          Error(jsonrpc.invalid_params_error(
+            "toggle-simulated-logging is not available for this transport",
+          ))
+      }
+    },
   )
 }
 
@@ -434,23 +447,6 @@ fn trigger_elicitation_request_tool(
 ) -> Result(actions.CallToolResult, jsonrpc.RpcError) {
   server.elicit(app_server, context, elicitation_request())
   |> result.map(elicitation_tool_result)
-}
-
-fn unsupported_server_interaction_tool(
-  _arguments: Option(dict.Dict(String, jsonrpc.Value)),
-) -> Result(actions.CallToolResult, jsonrpc.RpcError) {
-  Ok(actions.CallToolResult(
-    content: [
-      actions.TextBlock(actions.TextContent(
-        "This tool needs a transport-specific interactive loop. Use the stdio Everything server entrypoint to exercise it.",
-        None,
-        None,
-      )),
-    ],
-    structured_content: None,
-    is_error: Some(True),
-    meta: None,
-  ))
 }
 
 fn sampling_request(
