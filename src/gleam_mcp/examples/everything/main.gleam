@@ -3,9 +3,10 @@ import gleam/erlang/process
 import gleam/int
 import gleam/io
 import gleam/string
+import gleam_mcp/examples/everything/http_logging
 import gleam_mcp/examples/everything/server as everything_server
 import gleam_mcp/examples/everything/stdio as everything_stdio
-import gleam_mcp/examples/everything/streamable_http
+import gleam_mcp/server/streamable_http
 import mist
 
 pub fn main() -> Nil {
@@ -31,8 +32,12 @@ pub fn main() -> Nil {
 }
 
 fn run_streamable_http(port: Int) -> Nil {
+  let app_server = everything_server.make_server()
   let builder =
-    mist.new(streamable_http.handler(everything_server.make_server()))
+    mist.new(streamable_http.handler_with_middleware(
+      app_server,
+      http_logging.middleware(app_server),
+    ))
     |> mist.bind("127.0.0.1")
     |> mist.port(port)
 

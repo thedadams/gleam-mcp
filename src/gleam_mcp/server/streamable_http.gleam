@@ -18,6 +18,22 @@ import mist
 // 1 MiB
 const default_max_body_bytes = 1_048_576
 
+pub type ClientActionMiddleware =
+  fn(
+    server.Server,
+    server.RequestContext,
+    String,
+    jsonrpc.Request(actions.ClientActionRequest),
+  ) ->
+    MiddlewareDecision
+
+pub type MiddlewareDecision {
+  Continue
+  RespondRpc(jsonrpc.Response(actions.ClientActionResult))
+  RespondAccepted
+  RespondPlain(status: Int, body: String)
+}
+
 pub fn handler(
   server: server.Server,
 ) -> fn(request.Request(mist.Connection)) ->
@@ -25,18 +41,42 @@ pub fn handler(
   handler_with_max_body(server, default_max_body_bytes)
 }
 
+pub fn handler_with_middleware(
+  server: server.Server,
+  middleware: ClientActionMiddleware,
+) -> fn(request.Request(mist.Connection)) ->
+  response.Response(mist.ResponseData) {
+  handler_with_max_body_and_middleware(
+    server,
+    default_max_body_bytes,
+    middleware,
+  )
+}
+
 pub fn handler_with_max_body(
   server: server.Server,
   max_body_bytes: Int,
 ) -> fn(request.Request(mist.Connection)) ->
   response.Response(mist.ResponseData) {
-  fn(req) { handle(server, req, max_body_bytes) }
+  handler_with_max_body_and_middleware(server, max_body_bytes, fn(_, _, _, _) {
+    Continue
+  })
+}
+
+pub fn handler_with_max_body_and_middleware(
+  server: server.Server,
+  max_body_bytes: Int,
+  middleware: ClientActionMiddleware,
+) -> fn(request.Request(mist.Connection)) ->
+  response.Response(mist.ResponseData) {
+  fn(req) { handle(server, req, max_body_bytes, middleware) }
 }
 
 fn handle(
   server: server.Server,
   req: request.Request(mist.Connection),
   max_body_bytes: Int,
+  middleware: ClientActionMiddleware,
 ) -> response.Response(mist.ResponseData) {
   case authorize_request(server, req) {
     False -> plain_response(401, "Unauthorized")
@@ -45,7 +85,7 @@ fn handle(
 
       case method {
         http.Get -> handle_get(server, req)
-        http.Post -> handle_post(server, req, max_body_bytes)
+        http.Post -> handle_post(server, req, max_body_bytes, middleware)
         _ -> plain_response(405, "Method Not Allowed")
       }
     }
@@ -102,6 +142,7 @@ fn handle_post(
   server: server.Server,
   req: request.Request(mist.Connection),
   max_body_bytes: Int,
+  middleware: ClientActionMiddleware,
 ) -> response.Response(mist.ResponseData) {
   case has_json_content_type(req) {
     False -> plain_response(415, "Expected application/json request body")
@@ -109,7 +150,13 @@ fn handle_post(
       case mist.read_body(req, max_body_bytes) {
         Ok(body_request) ->
           case bit_array.to_string(body_request.body) {
-            Ok(body) -> handle_post_body(server, body, request_session_id(req))
+            Ok(body) ->
+              handle_post_body(
+                server,
+                body,
+                request_session_id(req),
+                middleware,
+              )
             Error(_) -> plain_response(400, "Request body was not valid UTF-8")
           }
         Error(_) -> plain_response(400, "Unable to read request body")
@@ -121,17 +168,18 @@ fn handle_post_body(
   server: server.Server,
   body: String,
   requested_session_id: Option(String),
+  middleware: ClientActionMiddleware,
 ) -> response.Response(mist.ResponseData) {
   case codec.decode_message(body) {
     Ok(message) ->
       case session_id_for_message(server, requested_session_id, message) {
         Ok(session_id) ->
-          handle_decoded_message(server, body, session_id, message)
+          handle_decoded_message(server, body, session_id, message, middleware)
         Error(Nil) -> plain_response(404, "Unknown MCP session")
       }
     Error(_) ->
       case require_existing_session(server, requested_session_id) {
-        Ok(session_id) -> handle_message(server, body, session_id)
+        Ok(session_id) -> handle_message(server, body, session_id, middleware)
         Error(Nil) -> plain_response(404, "Unknown MCP session")
       }
   }
@@ -142,8 +190,9 @@ fn handle_decoded_message(
   body: String,
   session_id: String,
   _message: codec.Message,
+  middleware: ClientActionMiddleware,
 ) -> response.Response(mist.ResponseData) {
-  handle_message(server, body, session_id)
+  handle_message(server, body, session_id, middleware)
 }
 
 fn session_id_for_message(
@@ -200,15 +249,32 @@ fn handle_message(
   server: server.Server,
   body: String,
   session_id: String,
+  middleware: ClientActionMiddleware,
 ) -> response.Response(mist.ResponseData) {
   let context = server.RequestContext(Some(session_id))
 
   case codec.decode_message(body) {
-    Ok(codec.ClientActionRequest(message)) -> {
-      let #(_, rpc_response) =
-        server.handle_request_with_context(server, context, message)
-      json_response(200, codec.encode_response(rpc_response), Some(session_id))
-    }
+    Ok(codec.ClientActionRequest(message)) ->
+      case middleware(server, context, session_id, message) {
+        Continue -> {
+          let #(_, rpc_response) =
+            server.handle_request_with_context(server, context, message)
+          json_response(
+            200,
+            codec.encode_response(rpc_response),
+            Some(session_id),
+          )
+        }
+        RespondRpc(rpc_response) ->
+          json_response(
+            200,
+            codec.encode_response(rpc_response),
+            Some(session_id),
+          )
+        RespondAccepted -> accepted_response(Some(session_id))
+        RespondPlain(status, response_body) ->
+          plain_response(status, response_body)
+      }
     Ok(codec.ActionNotification(notification)) -> {
       let #(_, _) = server.handle_notification(server, notification)
       accepted_response(Some(session_id))
