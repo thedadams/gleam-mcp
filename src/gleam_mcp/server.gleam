@@ -546,6 +546,11 @@ pub fn ensure_streamable_http_session(
   streamable_http_store.ensure_session(http_store, session_id)
 }
 
+pub fn has_streamable_http_session(server: Server, session_id: String) -> Bool {
+  let Server(http_store: http_store, ..) = server
+  streamable_http_store.has_session(http_store, session_id)
+}
+
 pub fn new_streamable_http_listener_id() -> String {
   streamable_http_store.new_listener_id()
 }

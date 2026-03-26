@@ -7,6 +7,7 @@ import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
 import gleam/string
 import gleam/string_tree
+import gleam_mcp/actions
 import gleam_mcp/client/codec as client_codec
 import gleam_mcp/jsonrpc
 import gleam_mcp/server
@@ -69,29 +70,32 @@ fn handle_get(
   server: server.Server,
   req: request.Request(mist.Connection),
 ) -> response.Response(mist.ResponseData) {
-  let session_id =
-    server.ensure_streamable_http_session(server, request_session_id(req))
-  let listener_id = server.new_streamable_http_listener_id()
+  case require_existing_session(server, request_session_id(req)) {
+    Ok(session_id) -> {
+      let listener_id = server.new_streamable_http_listener_id()
 
-  mist.server_sent_events(
-    request: req,
-    initial_response: response.new(200)
-      |> response.set_header(
-        "mcp-protocol-version",
-        jsonrpc.latest_protocol_version,
+      mist.server_sent_events(
+        request: req,
+        initial_response: response.new(200)
+          |> response.set_header(
+            "mcp-protocol-version",
+            jsonrpc.latest_protocol_version,
+          )
+          |> response.set_header("mcp-session-id", session_id),
+        init: fn(listener) {
+          server.register_streamable_http_listener(
+            server,
+            session_id,
+            listener_id,
+            listener,
+          )
+          SseState(server, session_id, listener_id)
+        },
+        loop: handle_sse_message,
       )
-      |> response.set_header("mcp-session-id", session_id),
-    init: fn(listener) {
-      server.register_streamable_http_listener(
-        server,
-        session_id,
-        listener_id,
-        listener,
-      )
-      SseState(server, session_id, listener_id)
-    },
-    loop: handle_sse_message,
-  )
+    }
+    Error(Nil) -> plain_response(404, "Unknown MCP session")
+  }
 }
 
 fn handle_post(
@@ -99,20 +103,96 @@ fn handle_post(
   req: request.Request(mist.Connection),
   max_body_bytes: Int,
 ) -> response.Response(mist.ResponseData) {
-  let session_id =
-    server.ensure_streamable_http_session(server, request_session_id(req))
-
   case has_json_content_type(req) {
     False -> plain_response(415, "Expected application/json request body")
     True ->
       case mist.read_body(req, max_body_bytes) {
         Ok(body_request) ->
           case bit_array.to_string(body_request.body) {
-            Ok(body) -> handle_message(server, body, session_id)
+            Ok(body) -> handle_post_body(server, body, request_session_id(req))
             Error(_) -> plain_response(400, "Request body was not valid UTF-8")
           }
         Error(_) -> plain_response(400, "Unable to read request body")
       }
+  }
+}
+
+fn handle_post_body(
+  server: server.Server,
+  body: String,
+  requested_session_id: Option(String),
+) -> response.Response(mist.ResponseData) {
+  case codec.decode_message(body) {
+    Ok(message) ->
+      case session_id_for_message(server, requested_session_id, message) {
+        Ok(session_id) ->
+          handle_decoded_message(server, body, session_id, message)
+        Error(Nil) -> plain_response(404, "Unknown MCP session")
+      }
+    Error(_) ->
+      case require_existing_session(server, requested_session_id) {
+        Ok(session_id) -> handle_message(server, body, session_id)
+        Error(Nil) -> plain_response(404, "Unknown MCP session")
+      }
+  }
+}
+
+fn handle_decoded_message(
+  server: server.Server,
+  body: String,
+  session_id: String,
+  _message: codec.Message,
+) -> response.Response(mist.ResponseData) {
+  handle_message(server, body, session_id)
+}
+
+fn session_id_for_message(
+  server: server.Server,
+  requested_session_id: Option(String),
+  message: codec.Message,
+) -> Result(String, Nil) {
+  case require_existing_session(server, requested_session_id) {
+    Ok(session_id) -> Ok(session_id)
+    Error(Nil) ->
+      case is_initialize_message(message) {
+        True -> Ok(initialize_session(server, requested_session_id))
+        False -> Error(Nil)
+      }
+  }
+}
+
+fn require_existing_session(
+  server: server.Server,
+  requested_session_id: Option(String),
+) -> Result(String, Nil) {
+  case requested_session_id {
+    Some(session_id) ->
+      case server.has_streamable_http_session(server, session_id) {
+        True -> Ok(session_id)
+        False -> Error(Nil)
+      }
+    None -> Error(Nil)
+  }
+}
+
+fn initialize_session(
+  server: server.Server,
+  requested_session_id: Option(String),
+) -> String {
+  case require_existing_session(server, requested_session_id) {
+    Ok(session_id) -> session_id
+    Error(Nil) -> server.ensure_streamable_http_session(server, None)
+  }
+}
+
+fn is_initialize_message(message: codec.Message) -> Bool {
+  case message {
+    codec.ClientActionRequest(jsonrpc.Request(
+      _,
+      _,
+      Some(actions.ClientRequestInitialize(_)),
+    )) -> True
+    _ -> False
   }
 }
 

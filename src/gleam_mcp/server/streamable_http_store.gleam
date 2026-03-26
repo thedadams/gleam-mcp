@@ -23,6 +23,7 @@ pub type ListenerMessage {
 
 type Message {
   EnsureSession(session_id: Option(String), reply_to: process.Subject(String))
+  HasSession(session_id: String, reply_to: process.Subject(Bool))
   RegisterListener(
     session_id: String,
     listener_id: String,
@@ -91,6 +92,13 @@ pub fn ensure_session(store: Store, session_id: Option(String)) -> String {
   let Store(subject) = store
   let reply_to = process.new_subject()
   process.send(subject, EnsureSession(session_id, reply_to))
+  expect_ok(process.receive(reply_to, 1000))
+}
+
+pub fn has_session(store: Store, session_id: String) -> Bool {
+  let Store(subject) = store
+  let reply_to = process.new_subject()
+  process.send(subject, HasSession(session_id, reply_to))
   expect_ok(process.receive(reply_to, 1000))
 }
 
@@ -177,6 +185,13 @@ fn loop(
       }
       process.send(reply_to, ensured)
       loop(subject, ensure_session_entry(sessions, ensured))
+    }
+    HasSession(session_id, reply_to) -> {
+      process.send(reply_to, case dict.get(sessions, session_id) {
+        Ok(_) -> True
+        Error(Nil) -> False
+      })
+      loop(subject, sessions)
     }
     RegisterListener(session_id, listener_id, listener, reply_to) -> {
       let next_sessions =

@@ -5,6 +5,7 @@ import gleam/string
 import gleam_mcp/actions
 import gleam_mcp/client
 import gleam_mcp/client/capabilities
+import gleam_mcp/client/codec as client_codec
 import gleam_mcp/client/transport
 import gleam_mcp/examples/example_server
 import gleam_mcp/jsonrpc
@@ -298,6 +299,69 @@ pub fn http_server_accepts_requests_with_valid_authorization_header_test() {
   }
 
   should.equal(initialized.server_info.name, "gleam-mcp-test-server")
+}
+
+pub fn http_server_rejects_sse_listen_without_session_test() {
+  let base_url = server_test_support.start_http_server()
+
+  case
+    transport.streamable_http_listen(
+      transport.HttpConfig(base_url, [], Some(1000)),
+      None,
+      jsonrpc.latest_protocol_version,
+      capabilities.none(),
+    )
+  {
+    Error(transport.HttpError(message)) ->
+      should.be_true(string.contains(message, "404"))
+    _ -> should.fail()
+  }
+}
+
+pub fn http_server_rejects_non_initialize_requests_without_session_test() {
+  let base_url = server_test_support.start_http_server()
+  let app_client =
+    client.new(
+      transport.Http(transport.HttpConfig(base_url, [], Some(5000))),
+      capabilities.none(),
+    )
+
+  let #(_, result) = client.list_tools(app_client, None)
+
+  case result {
+    Error(client.Transport(transport.HttpError(message))) ->
+      should.be_true(string.contains(message, "status 404"))
+    _ -> should.fail()
+  }
+}
+
+pub fn http_server_rejects_non_initialize_requests_with_invalid_session_test() {
+  let base_url = server_test_support.start_http_server()
+
+  case
+    transport.streamable_http_request(
+      transport.HttpConfig(base_url, [], Some(5000)),
+      Some("invalid-session"),
+      jsonrpc.latest_protocol_version,
+      capabilities.none(),
+      jsonrpc.Request(
+        jsonrpc.StringId("tools"),
+        "tools/list",
+        Some(
+          actions.ClientRequestListTools(actions.PaginatedRequestParams(
+            None,
+            None,
+          )),
+        ),
+      ),
+      client_codec.encode_request,
+      client_codec.decode_response,
+    )
+  {
+    Error(transport.HttpError(message)) ->
+      should.be_true(string.contains(message, "status 404"))
+    _ -> should.fail()
+  }
 }
 
 fn authorized_server(header: String, token: String) -> server.Server {
