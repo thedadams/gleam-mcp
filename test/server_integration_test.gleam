@@ -1,6 +1,9 @@
 import gleam/dict
+import gleam/http/request
+import gleam/httpc
 import gleam/list
 import gleam/option.{None, Some}
+import gleam/result
 import gleam/string
 import gleam_mcp/actions
 import gleam_mcp/client
@@ -304,18 +307,23 @@ pub fn http_server_accepts_requests_with_valid_authorization_header_test() {
 pub fn http_server_rejects_sse_listen_without_session_test() {
   let base_url = server_test_support.start_http_server()
 
-  case
-    transport.streamable_http_listen(
-      transport.HttpConfig(base_url, [], Some(1000)),
-      None,
-      jsonrpc.latest_protocol_version,
-      capabilities.none(),
-    )
-  {
-    Error(transport.HttpError(message)) ->
-      should.be_true(string.contains(message, "404"))
-    _ -> should.fail()
-  }
+  let assert Ok(http_request) =
+    request.to(base_url)
+    |> result.map(fn(req) {
+      req
+      |> request.set_header("accept", "text/event-stream")
+      |> request.set_header(
+        "mcp-protocol-version",
+        jsonrpc.latest_protocol_version,
+      )
+    })
+
+  let assert Ok(http_response) =
+    httpc.configure()
+    |> httpc.timeout(1000)
+    |> httpc.dispatch(http_request)
+
+  should.equal(http_response.status, 404)
 }
 
 pub fn http_server_rejects_non_initialize_requests_without_session_test() {

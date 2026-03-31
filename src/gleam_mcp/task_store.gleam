@@ -154,7 +154,10 @@ fn loop(subject: process.Subject(Message), entries: Dict(String, Entry)) -> Nil 
     }
     Result(task_id, reply_to) -> {
       let #(next_entries, response) = get_result(entries, task_id, reply_to)
-      process.send(reply_to, response)
+      case response {
+        Some(value) -> process.send(reply_to, value)
+        None -> Nil
+      }
       loop(subject, next_entries)
     }
     Cancel(task_id, reply_to) -> {
@@ -179,22 +182,33 @@ fn get_result(
   entries: Dict(String, Entry),
   task_id: String,
   reply_to: process.Subject(Result(actions.TaskResult, jsonrpc.RpcError)),
-) -> #(Dict(String, Entry), Result(actions.TaskResult, jsonrpc.RpcError)) {
+) -> #(
+  Dict(String, Entry),
+  Option(Result(actions.TaskResult, jsonrpc.RpcError)),
+) {
   case dict.get(entries, task_id) {
     Ok(Entry(task:, outcome:, waiters:)) ->
       case outcome {
-        Some(result) -> #(entries, result_for_task(task, task_id, result))
+        Some(result) -> #(entries, Some(result_for_task(task, task_id, result)))
         None -> {
-          let waiting_entry = Entry(task, None, [reply_to, ..waiters])
-          #(dict.insert(entries, task_id, waiting_entry), wait_for_result())
+          case task.status {
+            actions.Cancelled -> #(
+              entries,
+              Some(Error(cancelled_task_error(task_id))),
+            )
+            actions.Completed | actions.Failed -> #(
+              entries,
+              Some(Error(task_not_found_error(task_id))),
+            )
+            _ -> {
+              let waiting_entry = Entry(task, None, [reply_to, ..waiters])
+              #(dict.insert(entries, task_id, waiting_entry), None)
+            }
+          }
         }
       }
-    Error(Nil) -> #(entries, Error(task_not_found_error(task_id)))
+    Error(Nil) -> #(entries, Some(Error(task_not_found_error(task_id))))
   }
-}
-
-fn wait_for_result() -> Result(actions.TaskResult, jsonrpc.RpcError) {
-  panic as "task_store internal error: pending task result returned synchronously"
 }
 
 fn cancel_task(

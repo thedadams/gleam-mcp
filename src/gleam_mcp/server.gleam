@@ -703,6 +703,13 @@ pub fn create_message(
   }
 }
 
+pub fn task_result(
+  server: Server,
+  task_id: String,
+) -> Result(actions.TaskResult, jsonrpc.RpcError) {
+  task_store.result(server.task_store, task_id)
+}
+
 fn dispatch_request(
   server: Server,
   context: RequestContext,
