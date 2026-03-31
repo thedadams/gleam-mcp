@@ -12,6 +12,8 @@ import gleam_mcp/server/streamable_http_store
 import gleam_mcp/task_store
 import youid/uuid
 
+const server_sent_request_timeout_ms = 3_600_000
+
 pub type ToolHandler =
   fn(Option(Dict(String, jsonrpc.Value))) ->
     Result(actions.CallToolResult, jsonrpc.RpcError)
@@ -177,45 +179,31 @@ pub fn add_tool(
   input_schema: jsonrpc.Value,
   implementation: ToolHandler,
 ) -> Server {
-  let tool =
-    actions.Tool(
-      name: name,
-      title: None,
-      description: Some(description),
-      input_schema: input_schema,
-      execution: Some(actions.ToolExecution(Some(actions.TaskOptional))),
-      output_schema: None,
-      annotations: None,
-      icons: [],
-      meta: None,
-    )
+  add_tool_with_execution(
+    server,
+    name,
+    description,
+    input_schema,
+    actions.TaskOptional,
+    implementation,
+  )
+}
 
-  let Server(
-    implementation: server_info,
-    instructions: instructions,
-    authorization: authorization,
-    task_store: tasks,
-    http_store: http_store,
-    tools: tools,
-    resources: resources,
-    resource_templates: resource_templates,
-    prompts: prompts,
-    completion_handler: completion_handler,
-    logging_handler: logging_handler,
-  ) = server
-
-  Server(
-    server_info,
-    instructions,
-    authorization,
-    tasks,
-    http_store,
-    [RegisteredTool(tool, PlainToolHandler(implementation)), ..tools],
-    resources,
-    resource_templates,
-    prompts,
-    completion_handler,
-    logging_handler,
+pub fn add_tool_with_execution(
+  server: Server,
+  name: String,
+  description: String,
+  input_schema: jsonrpc.Value,
+  task_support: actions.TaskSupport,
+  implementation: ToolHandler,
+) -> Server {
+  register_tool(
+    server,
+    name,
+    description,
+    input_schema,
+    task_support,
+    PlainToolHandler(implementation),
   )
 }
 
@@ -226,13 +214,49 @@ pub fn add_tool_with_context(
   input_schema: jsonrpc.Value,
   implementation: ContextToolHandler,
 ) -> Server {
+  add_tool_with_context_execution(
+    server,
+    name,
+    description,
+    input_schema,
+    actions.TaskOptional,
+    implementation,
+  )
+}
+
+pub fn add_tool_with_context_execution(
+  server: Server,
+  name: String,
+  description: String,
+  input_schema: jsonrpc.Value,
+  task_support: actions.TaskSupport,
+  implementation: ContextToolHandler,
+) -> Server {
+  register_tool(
+    server,
+    name,
+    description,
+    input_schema,
+    task_support,
+    ContextualToolHandler(implementation),
+  )
+}
+
+fn register_tool(
+  server: Server,
+  name: String,
+  description: String,
+  input_schema: jsonrpc.Value,
+  task_support: actions.TaskSupport,
+  handler: RegisteredToolHandler,
+) -> Server {
   let tool =
     actions.Tool(
       name: name,
       title: None,
       description: Some(description),
       input_schema: input_schema,
-      execution: Some(actions.ToolExecution(Some(actions.TaskOptional))),
+      execution: Some(actions.ToolExecution(Some(task_support))),
       output_schema: None,
       annotations: None,
       icons: [],
@@ -259,7 +283,7 @@ pub fn add_tool_with_context(
     authorization,
     tasks,
     http_store,
-    [RegisteredTool(tool, ContextualToolHandler(implementation)), ..tools],
+    [RegisteredTool(tool, handler), ..tools],
     resources,
     resource_templates,
     prompts,
@@ -604,7 +628,12 @@ pub fn send_request(
   case session_id(context) {
     Some(value) -> {
       let Server(http_store: http_store, ..) = server
-      streamable_http_store.send_request(http_store, value, request, 5000)
+      streamable_http_store.send_request(
+        http_store,
+        value,
+        request,
+        server_sent_request_timeout_ms,
+      )
     }
     None ->
       Error(jsonrpc.invalid_params_error(
@@ -857,25 +886,50 @@ fn call_tool_result(
   let actions.CallToolRequestParams(name, arguments, task, _) = params
 
   case find_tool(server.tools, name) {
-    Ok(RegisteredTool(handler:, ..)) ->
-      case task {
-        Some(actions.TaskMetadata(ttl_ms)) -> {
-          let outcome =
-            run_tool_handler(server, handler, context, arguments)
-            |> result.map(actions.TaskCallTool)
-          let created = task_store.create(server.task_store, outcome, ttl_ms)
-          Ok(
-            actions.ClientResultCreateTask(actions.CreateTaskResult(
-              created,
-              None,
-            )),
-          )
-        }
-        None ->
+    Ok(RegisteredTool(tool:, handler:)) ->
+      case task, tool_task_support(tool) {
+        Some(actions.TaskMetadata(ttl_ms)), _ ->
+          Ok(create_tool_task_result(
+            server,
+            handler,
+            context,
+            arguments,
+            ttl_ms,
+          ))
+        None, Some(actions.TaskRequired) ->
+          Error(jsonrpc.method_not_found_error(mcp.method_call_tool))
+        None, _ ->
           run_tool_handler(server, handler, context, arguments)
           |> result.map(actions.ClientResultCallTool)
       }
     Error(Nil) -> Error(jsonrpc.invalid_params_error("Unknown tool: " <> name))
+  }
+}
+
+fn create_tool_task_result(
+  server: Server,
+  handler: RegisteredToolHandler,
+  context: RequestContext,
+  arguments: Option(Dict(String, jsonrpc.Value)),
+  ttl_ms: Option(Int),
+) -> actions.ClientActionResult {
+  let created = task_store.create(server.task_store, ttl_ms)
+  let _ =
+    process.spawn(fn() {
+      let outcome =
+        run_tool_handler(server, handler, context, arguments)
+        |> result.map(actions.TaskCallTool)
+      let _ = task_store.complete(server.task_store, created.task_id, outcome)
+      Nil
+    })
+  actions.ClientResultCreateTask(actions.CreateTaskResult(created, None))
+}
+
+fn tool_task_support(tool: actions.Tool) -> Option(actions.TaskSupport) {
+  let actions.Tool(execution: execution, ..) = tool
+  case execution {
+    Some(actions.ToolExecution(task_support)) -> task_support
+    None -> None
   }
 }
 

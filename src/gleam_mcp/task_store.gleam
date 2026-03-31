@@ -13,15 +13,17 @@ pub opaque type Store {
 type Entry {
   Entry(
     task: actions.Task,
-    outcome: Result(actions.TaskResult, jsonrpc.RpcError),
+    outcome: Option(Result(actions.TaskResult, jsonrpc.RpcError)),
+    waiters: List(process.Subject(Result(actions.TaskResult, jsonrpc.RpcError))),
   )
 }
 
 type Message {
-  Create(
+  Create(ttl_ms: Option(Int), reply_to: process.Subject(actions.Task))
+  Complete(
+    task_id: String,
     outcome: Result(actions.TaskResult, jsonrpc.RpcError),
-    ttl_ms: Option(Int),
-    reply_to: process.Subject(actions.Task),
+    reply_to: process.Subject(Result(actions.Task, jsonrpc.RpcError)),
   )
   List(reply_to: process.Subject(List(actions.Task)))
   Get(
@@ -38,7 +40,7 @@ type Message {
   )
 }
 
-const default_poll_interval_ms = 100
+const default_poll_interval_ms = 5000
 
 const default_timestamp = "2026-03-20T00:00:00Z"
 
@@ -55,14 +57,21 @@ fn start_store(reply_to: process.Subject(process.Subject(Message))) {
   loop(subject, dict.new())
 }
 
-pub fn create(
-  store: Store,
-  outcome: Result(actions.TaskResult, jsonrpc.RpcError),
-  ttl_ms: Option(Int),
-) -> actions.Task {
+pub fn create(store: Store, ttl_ms: Option(Int)) -> actions.Task {
   let Store(subject) = store
   let reply_to = process.new_subject()
-  process.send(subject, Create(outcome, ttl_ms, reply_to))
+  process.send(subject, Create(ttl_ms, reply_to))
+  expect_ok(process.receive(reply_to, 1000))
+}
+
+pub fn complete(
+  store: Store,
+  task_id: String,
+  outcome: Result(actions.TaskResult, jsonrpc.RpcError),
+) -> Result(actions.Task, jsonrpc.RpcError) {
+  let Store(subject) = store
+  let reply_to = process.new_subject()
+  process.send(subject, Complete(task_id, outcome, reply_to))
   expect_ok(process.receive(reply_to, 1000))
 }
 
@@ -90,7 +99,7 @@ pub fn result(
   let Store(subject) = store
   let reply_to = process.new_subject()
   process.send(subject, Result(task_id, reply_to))
-  expect_ok(process.receive(reply_to, 1000))
+  process.receive_forever(reply_to)
 }
 
 pub fn cancel(
@@ -105,7 +114,7 @@ pub fn cancel(
 
 fn loop(subject: process.Subject(Message), entries: Dict(String, Entry)) -> Nil {
   case process.receive_forever(subject) {
-    Create(outcome, ttl_ms, reply_to) -> {
+    Create(ttl_ms, reply_to) -> {
       let task =
         actions.Task(
           task_id: uuid.v4_string(),
@@ -117,7 +126,14 @@ fn loop(subject: process.Subject(Message), entries: Dict(String, Entry)) -> Nil 
           poll_interval_ms: Some(default_poll_interval_ms),
         )
       process.send(reply_to, task)
-      loop(subject, dict.insert(entries, task.task_id, Entry(task, outcome)))
+      loop(subject, dict.insert(entries, task.task_id, Entry(task, None, [])))
+    }
+    Complete(task_id, outcome, reply_to) -> {
+      let #(next_entries, response, waiters, task_result) =
+        complete_task(entries, task_id, outcome)
+      process.send(reply_to, response)
+      notify_waiters(waiters, task_result)
+      loop(subject, next_entries)
     }
     List(reply_to) -> {
       process.send(
@@ -137,7 +153,7 @@ fn loop(subject: process.Subject(Message), entries: Dict(String, Entry)) -> Nil 
       loop(subject, next_entries)
     }
     Result(task_id, reply_to) -> {
-      let #(next_entries, response) = get_result(entries, task_id)
+      let #(next_entries, response) = get_result(entries, task_id, reply_to)
       process.send(reply_to, response)
       loop(subject, next_entries)
     }
@@ -154,10 +170,7 @@ fn get_task(
   task_id: String,
 ) -> #(Dict(String, Entry), Result(actions.Task, jsonrpc.RpcError)) {
   case dict.get(entries, task_id) {
-    Ok(entry) -> {
-      let next_entry = settle_entry(entry)
-      #(dict.insert(entries, task_id, next_entry), Ok(next_entry.task))
-    }
+    Ok(entry) -> #(entries, Ok(entry.task))
     Error(Nil) -> #(entries, Error(task_not_found_error(task_id)))
   }
 }
@@ -165,18 +178,23 @@ fn get_task(
 fn get_result(
   entries: Dict(String, Entry),
   task_id: String,
+  reply_to: process.Subject(Result(actions.TaskResult, jsonrpc.RpcError)),
 ) -> #(Dict(String, Entry), Result(actions.TaskResult, jsonrpc.RpcError)) {
   case dict.get(entries, task_id) {
-    Ok(entry) -> {
-      let next_entry = settle_entry(entry)
-      let result = case next_entry.task.status {
-        actions.Cancelled -> Error(cancelled_task_error(task_id))
-        _ -> next_entry.outcome
+    Ok(Entry(task:, outcome:, waiters:)) ->
+      case outcome {
+        Some(result) -> #(entries, result_for_task(task, task_id, result))
+        None -> {
+          let waiting_entry = Entry(task, None, [reply_to, ..waiters])
+          #(dict.insert(entries, task_id, waiting_entry), wait_for_result())
+        }
       }
-      #(dict.insert(entries, task_id, next_entry), result)
-    }
     Error(Nil) -> #(entries, Error(task_not_found_error(task_id)))
   }
+}
+
+fn wait_for_result() -> Result(actions.TaskResult, jsonrpc.RpcError) {
+  panic as "task_store internal error: pending task result returned synchronously"
 }
 
 fn cancel_task(
@@ -184,7 +202,7 @@ fn cancel_task(
   task_id: String,
 ) -> #(Dict(String, Entry), Result(actions.Task, jsonrpc.RpcError)) {
   case dict.get(entries, task_id) {
-    Ok(Entry(task:, outcome: outcome)) ->
+    Ok(Entry(task:, outcome: outcome, waiters: waiters)) ->
       case is_terminal(task.status) {
         True -> #(entries, Error(cannot_cancel_error(task)))
         False -> {
@@ -198,7 +216,8 @@ fn cancel_task(
               ttl_ms: task.ttl_ms,
               poll_interval_ms: task.poll_interval_ms,
             )
-          let next_entry = Entry(cancelled, outcome)
+          let next_entry = Entry(cancelled, outcome, [])
+          notify_waiters(waiters, Error(cancelled_task_error(task_id)))
           #(dict.insert(entries, task_id, next_entry), Ok(cancelled))
         }
       }
@@ -206,28 +225,55 @@ fn cancel_task(
   }
 }
 
-fn settle_entry(entry: Entry) -> Entry {
-  let Entry(task, outcome) = entry
-  case is_terminal(task.status) {
-    True -> entry
-    False -> Entry(settle_task(task, outcome), outcome)
+fn complete_task(
+  entries: Dict(String, Entry),
+  task_id: String,
+  outcome: Result(actions.TaskResult, jsonrpc.RpcError),
+) -> #(
+  Dict(String, Entry),
+  Result(actions.Task, jsonrpc.RpcError),
+  List(process.Subject(Result(actions.TaskResult, jsonrpc.RpcError))),
+  Result(actions.TaskResult, jsonrpc.RpcError),
+) {
+  case dict.get(entries, task_id) {
+    Ok(Entry(task:, waiters:, ..)) -> {
+      let task = terminal_task(task, outcome)
+      let next_entry = Entry(task, Some(outcome), [])
+      #(
+        dict.insert(entries, task_id, next_entry),
+        Ok(task),
+        waiters,
+        result_for_task(task, task_id, outcome),
+      )
+    }
+    Error(Nil) -> #(
+      entries,
+      Error(task_not_found_error(task_id)),
+      [],
+      Error(task_not_found_error(task_id)),
+    )
   }
 }
 
-fn settle_task(
+fn terminal_task(
   task: actions.Task,
   outcome: Result(actions.TaskResult, jsonrpc.RpcError),
 ) -> actions.Task {
-  let #(status, status_message) = terminal_status(outcome)
-  actions.Task(
-    task_id: task.task_id,
-    status: status,
-    status_message: status_message,
-    created_at: task.created_at,
-    last_updated_at: default_timestamp,
-    ttl_ms: task.ttl_ms,
-    poll_interval_ms: task.poll_interval_ms,
-  )
+  case is_terminal(task.status) {
+    True -> task
+    False -> {
+      let #(status, status_message) = terminal_status(outcome)
+      actions.Task(
+        task_id: task.task_id,
+        status: status,
+        status_message: status_message,
+        created_at: task.created_at,
+        last_updated_at: default_timestamp,
+        ttl_ms: task.ttl_ms,
+        poll_interval_ms: task.poll_interval_ms,
+      )
+    }
+  }
 }
 
 fn terminal_status(
@@ -240,6 +286,30 @@ fn terminal_status(
     )
     Ok(_) -> #(actions.Completed, None)
     Error(jsonrpc.RpcError(message:, ..)) -> #(actions.Failed, Some(message))
+  }
+}
+
+fn result_for_task(
+  task: actions.Task,
+  task_id: String,
+  outcome: Result(actions.TaskResult, jsonrpc.RpcError),
+) -> Result(actions.TaskResult, jsonrpc.RpcError) {
+  case task.status {
+    actions.Cancelled -> Error(cancelled_task_error(task_id))
+    _ -> outcome
+  }
+}
+
+fn notify_waiters(
+  waiters: List(process.Subject(Result(actions.TaskResult, jsonrpc.RpcError))),
+  result: Result(actions.TaskResult, jsonrpc.RpcError),
+) -> Nil {
+  case waiters {
+    [] -> Nil
+    [waiter, ..rest] -> {
+      process.send(waiter, result)
+      notify_waiters(rest, result)
+    }
   }
 }
 

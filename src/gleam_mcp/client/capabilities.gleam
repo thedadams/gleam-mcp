@@ -1,4 +1,5 @@
 import gleam/dict
+import gleam/erlang/process
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
@@ -782,25 +783,32 @@ fn create_message_result(
 
   case create_message {
     Some(handler) ->
-      handler(params)
-      |> result.map(fn(result) {
-        jsonrpc.ResultResponse(id, case result {
-          CreateMessage(value) ->
-            case params.task {
-              Some(actions.TaskMetadata(ttl_ms)) ->
-                actions.ServerResultCreateTask(actions.CreateTaskResult(
-                  task_store.create(
-                    tasks,
-                    Ok(actions.TaskCreateMessage(value)),
-                    ttl_ms,
-                  ),
-                  None,
-                ))
-              None -> actions.ServerResultCreateMessage(value)
-            }
-          CreateMessageTask(value) -> actions.ServerResultCreateTask(value)
-        })
-      })
+      case params.task {
+        Some(actions.TaskMetadata(ttl_ms)) -> {
+          let task = task_store.create(tasks, ttl_ms)
+          let _ =
+            process.spawn(fn() {
+              let outcome = case handler(params) {
+                Ok(result) -> create_message_task_result(result)
+                Error(error) -> Error(error)
+              }
+              let _ = task_store.complete(tasks, task.task_id, outcome)
+              Nil
+            })
+          Ok(jsonrpc.ResultResponse(
+            id,
+            actions.ServerResultCreateTask(actions.CreateTaskResult(task, None)),
+          ))
+        }
+        None ->
+          handler(params)
+          |> result.map(fn(result) {
+            jsonrpc.ResultResponse(id, case result {
+              CreateMessage(value) -> actions.ServerResultCreateMessage(value)
+              CreateMessageTask(value) -> actions.ServerResultCreateTask(value)
+            })
+          })
+      }
     None ->
       Ok(jsonrpc.ErrorResponse(
         Some(id),
@@ -834,25 +842,60 @@ fn elicit_result(
       }
   }
 
-  handler_result
-  |> result.map(fn(result) {
-    jsonrpc.ResultResponse(id, case result {
-      Elicit(value) ->
-        case task_ttl(params) {
-          Some(ttl_ms) ->
-            actions.ServerResultCreateTask(actions.CreateTaskResult(
-              task_store.create(
-                tasks,
-                Ok(actions.TaskElicit(value)),
-                Some(ttl_ms),
-              ),
-              None,
-            ))
-          None -> actions.ServerResultElicit(value)
-        }
-      ElicitTask(value) -> actions.ServerResultCreateTask(value)
-    })
-  })
+  case task_ttl(params) {
+    Some(ttl_ms) -> {
+      let task = task_store.create(tasks, Some(ttl_ms))
+      let _ =
+        process.spawn(fn() {
+          let outcome = case handler_result {
+            Ok(result) -> elicit_task_result(result)
+            Error(error) -> Error(error)
+          }
+          let _ = task_store.complete(tasks, task.task_id, outcome)
+          Nil
+        })
+      Ok(jsonrpc.ResultResponse(
+        id,
+        actions.ServerResultCreateTask(actions.CreateTaskResult(task, None)),
+      ))
+    }
+    None ->
+      handler_result
+      |> result.map(fn(result) {
+        jsonrpc.ResultResponse(id, case result {
+          Elicit(value) -> actions.ServerResultElicit(value)
+          ElicitTask(value) -> actions.ServerResultCreateTask(value)
+        })
+      })
+  }
+}
+
+fn create_message_task_result(
+  result: CreateMessageHandlerResult,
+) -> Result(actions.TaskResult, RpcError) {
+  case result {
+    CreateMessage(value) -> Ok(actions.TaskCreateMessage(value))
+    CreateMessageTask(_) ->
+      Error(jsonrpc.RpcError(
+        code: -32_603,
+        message: "Nested createMessage tasks are not supported",
+        data: None,
+      ))
+  }
+}
+
+fn elicit_task_result(
+  result: ElicitHandlerResult,
+) -> Result(actions.TaskResult, RpcError) {
+  case result {
+    Elicit(value) -> Ok(actions.TaskElicit(value))
+    ElicitTask(_) ->
+      Error(jsonrpc.RpcError(
+        code: -32_603,
+        message: "Nested elicitation tasks are not supported",
+        data: None,
+      ))
+  }
 }
 
 fn list_tasks_result(

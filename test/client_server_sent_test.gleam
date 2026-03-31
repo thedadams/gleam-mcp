@@ -301,7 +301,10 @@ pub fn handle_server_sent_sampling_task_request_test() {
     jsonrpc.ResultResponse(
       _,
       actions.ServerResultGetTask(actions.GetTaskResult(task:, ..)),
-    ) -> should.equal(task.status, actions.Completed)
+    ) ->
+      should.be_true(
+        task.status == actions.Working || task.status == actions.Completed,
+      )
     _ -> should.fail()
   }
 
@@ -324,6 +327,25 @@ pub fn handle_server_sent_sampling_task_request_test() {
         ..,
       ))),
     ) -> should.equal(model, "test-model")
+    _ -> should.fail()
+  }
+
+  let completed_result =
+    capabilities.handle_request(
+      config,
+      jsonrpc.Request(
+        jsonrpc.StringId("req-5"),
+        mcp.method_get_task,
+        Some(actions.ServerRequestGetTask(actions.TaskIdParams(task_id))),
+      ),
+    )
+    |> should.be_ok
+
+  case completed_result {
+    jsonrpc.ResultResponse(
+      _,
+      actions.ServerResultGetTask(actions.GetTaskResult(task:, ..)),
+    ) -> should.equal(task.status, actions.Completed)
     _ -> should.fail()
   }
 }

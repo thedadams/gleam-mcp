@@ -355,7 +355,10 @@ pub fn task_backed_tool_calls_can_be_polled_test() {
     jsonrpc.ResultResponse(
       _,
       actions.ClientResultGetTask(actions.GetTaskResult(task:, ..)),
-    ) -> should.equal(task.status, actions.Completed)
+    ) ->
+      should.be_true(
+        task.status == actions.Working || task.status == actions.Completed,
+      )
     _ -> should.fail()
   }
 
@@ -388,6 +391,24 @@ pub fn task_backed_tool_calls_can_be_polled_test() {
           }
         }),
       )
+    _ -> should.fail()
+  }
+
+  let #(_, completed_response) =
+    server.handle_request(
+      sample_server,
+      jsonrpc.Request(
+        jsonrpc.StringId("task-get-completed"),
+        mcp.method_get_task,
+        Some(actions.ClientRequestGetTask(actions.TaskIdParams(task.task_id))),
+      ),
+    )
+
+  case completed_response {
+    jsonrpc.ResultResponse(
+      _,
+      actions.ClientResultGetTask(actions.GetTaskResult(task:, ..)),
+    ) -> should.equal(task.status, actions.Completed)
     _ -> should.fail()
   }
 }
