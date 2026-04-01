@@ -20,6 +20,12 @@ type Entry {
 
 type Message {
   Create(ttl_ms: Option(Int), reply_to: process.Subject(actions.Task))
+  UpdateStatus(
+    task_id: String,
+    status: actions.TaskStatus,
+    status_message: Option(String),
+    reply_to: process.Subject(Result(actions.Task, jsonrpc.RpcError)),
+  )
   Complete(
     task_id: String,
     outcome: Result(actions.TaskResult, jsonrpc.RpcError),
@@ -72,6 +78,18 @@ pub fn complete(
   let Store(subject) = store
   let reply_to = process.new_subject()
   process.send(subject, Complete(task_id, outcome, reply_to))
+  expect_ok(process.receive(reply_to, 1000))
+}
+
+pub fn update_status(
+  store: Store,
+  task_id: String,
+  status: actions.TaskStatus,
+  status_message: Option(String),
+) -> Result(actions.Task, jsonrpc.RpcError) {
+  let Store(subject) = store
+  let reply_to = process.new_subject()
+  process.send(subject, UpdateStatus(task_id, status, status_message, reply_to))
   expect_ok(process.receive(reply_to, 1000))
 }
 
@@ -128,6 +146,12 @@ fn loop(subject: process.Subject(Message), entries: Dict(String, Entry)) -> Nil 
       process.send(reply_to, task)
       loop(subject, dict.insert(entries, task.task_id, Entry(task, None, [])))
     }
+    UpdateStatus(task_id, status, status_message, reply_to) -> {
+      let #(next_entries, response) =
+        update_task_status(entries, task_id, status, status_message)
+      process.send(reply_to, response)
+      loop(subject, next_entries)
+    }
     Complete(task_id, outcome, reply_to) -> {
       let #(next_entries, response, waiters, task_result) =
         complete_task(entries, task_id, outcome)
@@ -165,6 +189,36 @@ fn loop(subject: process.Subject(Message), entries: Dict(String, Entry)) -> Nil 
       process.send(reply_to, response)
       loop(subject, next_entries)
     }
+  }
+}
+
+fn update_task_status(
+  entries: Dict(String, Entry),
+  task_id: String,
+  status: actions.TaskStatus,
+  status_message: Option(String),
+) -> #(Dict(String, Entry), Result(actions.Task, jsonrpc.RpcError)) {
+  case dict.get(entries, task_id) {
+    Ok(Entry(task:, outcome:, waiters:)) -> {
+      let updated = case is_terminal(task.status) {
+        True -> task
+        False ->
+          actions.Task(
+            task_id: task.task_id,
+            status: status,
+            status_message: status_message,
+            created_at: task.created_at,
+            last_updated_at: default_timestamp,
+            ttl_ms: task.ttl_ms,
+            poll_interval_ms: task.poll_interval_ms,
+          )
+      }
+      #(
+        dict.insert(entries, task_id, Entry(updated, outcome, waiters)),
+        Ok(updated),
+      )
+    }
+    Error(Nil) -> #(entries, Error(task_not_found_error(task_id)))
   }
 }
 

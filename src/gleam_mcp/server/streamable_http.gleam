@@ -251,7 +251,8 @@ fn handle_message(
   session_id: String,
   middleware: ClientActionMiddleware,
 ) -> response.Response(mist.ResponseData) {
-  let context = server.RequestContext(Some(session_id))
+  let context =
+    server.RequestContext(session_id: Some(session_id), task_id: None)
 
   case codec.decode_message(body) {
     Ok(codec.ClientActionRequest(message)) ->

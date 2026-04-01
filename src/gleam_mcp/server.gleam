@@ -44,7 +44,7 @@ pub type HeaderAuthorization {
 }
 
 pub type RequestContext {
-  RequestContext(session_id: Option(String))
+  RequestContext(session_id: Option(String), task_id: Option(String))
 }
 
 pub opaque type Server {
@@ -507,7 +507,11 @@ pub fn handle_request(
   server: Server,
   request: jsonrpc.Request(actions.ClientActionRequest),
 ) -> #(Server, jsonrpc.Response(actions.ClientActionResult)) {
-  handle_request_with_context(server, RequestContext(None), request)
+  handle_request_with_context(
+    server,
+    RequestContext(session_id: None, task_id: None),
+    request,
+  )
 }
 
 pub fn handle_request_with_context(
@@ -558,8 +562,13 @@ pub fn handle_notification(
 }
 
 pub fn session_id(context: RequestContext) -> Option(String) {
-  let RequestContext(session_id: session_id) = context
+  let RequestContext(session_id: session_id, ..) = context
   session_id
+}
+
+pub fn task_id(context: RequestContext) -> Option(String) {
+  let RequestContext(task_id: task_id, ..) = context
+  task_id
 }
 
 pub fn ensure_streamable_http_session(
@@ -657,6 +666,41 @@ pub fn send_notification(
       Error(jsonrpc.invalid_params_error(
         "Server-sent notifications require a streamable HTTP session",
       ))
+  }
+}
+
+pub fn update_task_status(
+  server: Server,
+  context: RequestContext,
+  task_id: String,
+  status: actions.TaskStatus,
+  status_message: Option(String),
+) -> Result(actions.Task, jsonrpc.RpcError) {
+  let updated =
+    task_store.update_status(server.task_store, task_id, status, status_message)
+
+  case updated {
+    Ok(task) -> {
+      let _ = case session_id(context) {
+        Some(_) ->
+          send_notification(
+            server,
+            context,
+            jsonrpc.Notification(
+              mcp.method_notify_task_status,
+              Some(
+                actions.NotifyTaskStatus(actions.TaskStatusNotificationParams(
+                  task,
+                  None,
+                )),
+              ),
+            ),
+          )
+        None -> Ok(Nil)
+      }
+      Ok(task)
+    }
+    Error(error) -> Error(error)
   }
 }
 
@@ -923,8 +967,11 @@ fn create_tool_task_result(
   let created = task_store.create(server.task_store, ttl_ms)
   let _ =
     process.spawn(fn() {
+      let RequestContext(session_id:, ..) = context
+      let task_context =
+        RequestContext(session_id: session_id, task_id: Some(created.task_id))
       let outcome =
-        run_tool_handler(server, handler, context, arguments)
+        run_tool_handler(server, handler, task_context, arguments)
         |> result.map(actions.TaskCallTool)
       let _ = task_store.complete(server.task_store, created.task_id, outcome)
       Nil
