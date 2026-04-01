@@ -1,4 +1,5 @@
 import gleam/dict
+import gleam/erlang/process
 import gleam/list
 import gleam/option.{None, Some}
 import gleam/string
@@ -8,6 +9,7 @@ import gleam_mcp/examples/example_server
 import gleam_mcp/jsonrpc
 import gleam_mcp/mcp
 import gleam_mcp/server
+import gleam_mcp/server/streamable_http_store
 import gleeunit
 import gleeunit/should
 import server_test_support
@@ -476,4 +478,140 @@ pub fn task_backed_tool_calls_can_be_cancelled_test() {
       should.equal(error.code, jsonrpc.invalid_params_error_code)
     _ -> should.fail()
   }
+}
+
+pub fn update_task_status_sends_notification_for_http_session_test() {
+  let sample_server = task_status_test_server()
+  let task_id = create_task_id(sample_server)
+  let session_id = server.ensure_streamable_http_session(sample_server, None)
+  let listener_id = server.new_streamable_http_listener_id()
+  let listener = process.new_subject()
+
+  server.register_streamable_http_listener(
+    sample_server,
+    session_id,
+    listener_id,
+    listener,
+  )
+
+  let updated =
+    server.update_task_status(
+      sample_server,
+      server.RequestContext(
+        session_id: Some(session_id),
+        task_id: Some(task_id),
+      ),
+      task_id,
+      actions.InputRequired,
+      Some("Waiting for approval"),
+    )
+    |> should.be_ok
+
+  case process.receive(listener, 1000) {
+    Ok(streamable_http_store.DeliverNotification(jsonrpc.Notification(
+      method,
+      Some(actions.NotifyTaskStatus(actions.TaskStatusNotificationParams(
+        task,
+        meta,
+      ))),
+    ))) -> {
+      should.equal(method, mcp.method_notify_task_status)
+      should.equal(task, updated)
+      should.equal(task.status, actions.InputRequired)
+      should.equal(task.status_message, Some("Waiting for approval"))
+      should.equal(meta, None)
+    }
+    _ -> should.fail()
+  }
+
+  server.unregister_streamable_http_listener(
+    sample_server,
+    session_id,
+    listener_id,
+  )
+}
+
+pub fn update_task_status_without_session_skips_notification_test() {
+  let sample_server = task_status_test_server()
+  let task_id = create_task_id(sample_server)
+  let session_id = server.ensure_streamable_http_session(sample_server, None)
+  let listener_id = server.new_streamable_http_listener_id()
+  let listener = process.new_subject()
+
+  server.register_streamable_http_listener(
+    sample_server,
+    session_id,
+    listener_id,
+    listener,
+  )
+
+  let updated =
+    server.update_task_status(
+      sample_server,
+      server.RequestContext(session_id: None, task_id: Some(task_id)),
+      task_id,
+      actions.InputRequired,
+      Some("Waiting for approval"),
+    )
+    |> should.be_ok
+
+  should.equal(updated.status, actions.InputRequired)
+  should.equal(updated.status_message, Some("Waiting for approval"))
+
+  case process.receive(listener, 100) {
+    Error(Nil) -> Nil
+    _ -> should.fail()
+  }
+
+  server.unregister_streamable_http_listener(
+    sample_server,
+    session_id,
+    listener_id,
+  )
+}
+
+fn create_task_id(sample_server: server.Server) -> String {
+  let #(_, create_response) =
+    server.handle_request(
+      sample_server,
+      jsonrpc.Request(
+        jsonrpc.StringId("task-create"),
+        mcp.method_call_tool,
+        Some(
+          actions.ClientRequestCallTool(actions.CallToolRequestParams(
+            "pause",
+            None,
+            Some(actions.TaskMetadata(Some(1000))),
+            None,
+          )),
+        ),
+      ),
+    )
+
+  case create_response {
+    jsonrpc.ResultResponse(
+      _,
+      actions.ClientResultCreateTask(actions.CreateTaskResult(task:, ..)),
+    ) -> task.task_id
+    _ -> panic as string.inspect(create_response)
+  }
+}
+
+fn task_status_test_server() -> server.Server {
+  example_server.sample_server()
+  |> server.add_tool(
+    "pause",
+    "Pause before returning",
+    jsonrpc.VObject([#("type", jsonrpc.VString("object"))]),
+    fn(_) {
+      let reply_to = process.new_subject()
+      let _ = process.receive(reply_to, 1000)
+      Ok(actions.CallToolResult(
+        content: [],
+        structured_content: None,
+        is_error: Some(False),
+        meta: None,
+      ))
+    },
+  )
 }

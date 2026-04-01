@@ -136,7 +136,10 @@ fn emit_logs(
             True ->
               server.send_notification(
                 app_server,
-                server.RequestContext(Some(session_id)),
+                server.RequestContext(
+                  session_id: Some(session_id),
+                  task_id: None,
+                ),
                 jsonrpc.Notification(
                   mcp.method_notify_logging_message,
                   Some(
