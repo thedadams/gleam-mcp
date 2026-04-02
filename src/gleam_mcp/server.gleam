@@ -39,6 +39,9 @@ pub type CompletionHandler =
 pub type LoggingHandler =
   fn(actions.SetLevelRequestParams) -> Result(Nil, jsonrpc.RpcError)
 
+pub type TaskResultRequestHandler =
+  fn(Server, RequestContext, String) -> Result(Nil, jsonrpc.RpcError)
+
 pub type HeaderAuthorization {
   HeaderAuthorization(header: String, validate: fn(String) -> Bool)
 }
@@ -60,6 +63,7 @@ pub opaque type Server {
     prompts: List(RegisteredPrompt),
     completion_handler: Option(CompletionHandler),
     logging_handler: Option(LoggingHandler),
+    task_result_request_handler: Option(TaskResultRequestHandler),
   )
 }
 
@@ -100,6 +104,7 @@ pub fn new(implementation: actions.Implementation) -> Server {
     [],
     None,
     None,
+    None,
   )
 }
 
@@ -115,6 +120,7 @@ pub fn with_instructions(server: Server, instructions: String) -> Server {
     prompts: prompts,
     completion_handler: completion_handler,
     logging_handler: logging_handler,
+    task_result_request_handler: task_result_request_handler,
     ..,
   ) = server
 
@@ -130,6 +136,7 @@ pub fn with_instructions(server: Server, instructions: String) -> Server {
     prompts,
     completion_handler,
     logging_handler,
+    task_result_request_handler,
   )
 }
 
@@ -149,6 +156,7 @@ pub fn with_header_authorization(
     prompts: prompts,
     completion_handler: completion_handler,
     logging_handler: logging_handler,
+    task_result_request_handler: task_result_request_handler,
     ..,
   ) = server
 
@@ -164,6 +172,7 @@ pub fn with_header_authorization(
     prompts,
     completion_handler,
     logging_handler,
+    task_result_request_handler,
   )
 }
 
@@ -275,6 +284,7 @@ fn register_tool(
     prompts: prompts,
     completion_handler: completion_handler,
     logging_handler: logging_handler,
+    task_result_request_handler: task_result_request_handler,
   ) = server
 
   Server(
@@ -289,6 +299,7 @@ fn register_tool(
     prompts,
     completion_handler,
     logging_handler,
+    task_result_request_handler,
   )
 }
 
@@ -325,6 +336,7 @@ pub fn add_resource(
     prompts: prompts,
     completion_handler: completion_handler,
     logging_handler: logging_handler,
+    task_result_request_handler: task_result_request_handler,
   ) = server
 
   Server(
@@ -339,6 +351,7 @@ pub fn add_resource(
     prompts,
     completion_handler,
     logging_handler,
+    task_result_request_handler,
   )
 }
 
@@ -374,6 +387,7 @@ pub fn add_resource_template(
     prompts: prompts,
     completion_handler: completion_handler,
     logging_handler: logging_handler,
+    task_result_request_handler: task_result_request_handler,
   ) = server
 
   Server(
@@ -391,6 +405,7 @@ pub fn add_resource_template(
     prompts,
     completion_handler,
     logging_handler,
+    task_result_request_handler,
   )
 }
 
@@ -423,6 +438,7 @@ pub fn add_prompt(
     prompts: prompts,
     completion_handler: completion_handler,
     logging_handler: logging_handler,
+    task_result_request_handler: task_result_request_handler,
   ) = server
 
   Server(
@@ -437,6 +453,7 @@ pub fn add_prompt(
     [RegisteredPrompt(prompt, implementation), ..prompts],
     completion_handler,
     logging_handler,
+    task_result_request_handler,
   )
 }
 
@@ -455,6 +472,7 @@ pub fn set_completion_handler(
     resource_templates: resource_templates,
     prompts: prompts,
     logging_handler: logging_handler,
+    task_result_request_handler: task_result_request_handler,
     ..,
   ) = server
 
@@ -470,6 +488,7 @@ pub fn set_completion_handler(
     prompts,
     Some(handler),
     logging_handler,
+    task_result_request_handler,
   )
 }
 
@@ -485,6 +504,7 @@ pub fn set_logging_handler(server: Server, handler: LoggingHandler) -> Server {
     resource_templates: resource_templates,
     prompts: prompts,
     completion_handler: completion_handler,
+    task_result_request_handler: task_result_request_handler,
     ..,
   ) = server
 
@@ -499,6 +519,42 @@ pub fn set_logging_handler(server: Server, handler: LoggingHandler) -> Server {
     resource_templates,
     prompts,
     completion_handler,
+    Some(handler),
+    task_result_request_handler,
+  )
+}
+
+pub fn set_task_result_request_handler(
+  server: Server,
+  handler: TaskResultRequestHandler,
+) -> Server {
+  let Server(
+    implementation: implementation,
+    instructions: instructions,
+    authorization: authorization,
+    task_store: tasks,
+    http_store: http_store,
+    tools: tools,
+    resources: resources,
+    resource_templates: resource_templates,
+    prompts: prompts,
+    completion_handler: completion_handler,
+    logging_handler: logging_handler,
+    ..,
+  ) = server
+
+  Server(
+    implementation,
+    instructions,
+    authorization,
+    tasks,
+    http_store,
+    tools,
+    resources,
+    resource_templates,
+    prompts,
+    completion_handler,
+    logging_handler,
     Some(handler),
   )
 }
@@ -868,7 +924,7 @@ fn dispatch_request(
       Ok(list_tasks_result(server, params))
     actions.ClientRequestGetTask(params) -> get_task_result(server, params)
     actions.ClientRequestGetTaskResult(params) ->
-      get_task_payload_result(server, params)
+      get_task_payload_result(server, context, params)
     actions.ClientRequestCancelTask(params) ->
       cancel_task_result(server, context, params)
   }
@@ -1122,11 +1178,29 @@ fn get_task_result(
 
 fn get_task_payload_result(
   server: Server,
+  context: RequestContext,
   params: actions.TaskIdParams,
 ) -> Result(actions.ClientActionResult, jsonrpc.RpcError) {
   let actions.TaskIdParams(task_id) = params
-  task_result(server, task_id)
-  |> result.map(actions.ClientResultTaskResult)
+  case run_task_result_request_handler(server, context, task_id) {
+    Ok(Nil) ->
+      task_result(server, task_id)
+      |> result.map(actions.ClientResultTaskResult)
+    Error(error) -> Error(error)
+  }
+}
+
+fn run_task_result_request_handler(
+  server: Server,
+  context: RequestContext,
+  task_id: String,
+) -> Result(Nil, jsonrpc.RpcError) {
+  let Server(task_result_request_handler: handler, ..) = server
+
+  case handler {
+    Some(handler) -> handler(server, context, task_id)
+    None -> Ok(Nil)
+  }
 }
 
 fn cancel_task_result(
