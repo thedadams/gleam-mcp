@@ -1,4 +1,4 @@
-import gleam/dict.{type Dict}
+import gleam/dict
 import gleam/erlang/process
 import gleam/list
 import gleam/option.{type Option, None, Some}
@@ -15,11 +15,11 @@ import youid/uuid
 const server_sent_request_timeout_ms = 3_600_000
 
 pub type ToolHandler =
-  fn(Option(Dict(String, jsonrpc.Value))) ->
+  fn(Option(dict.Dict(String, jsonrpc.Value))) ->
     Result(actions.CallToolResult, jsonrpc.RpcError)
 
 pub type ContextToolHandler =
-  fn(Server, RequestContext, Option(Dict(String, jsonrpc.Value))) ->
+  fn(Server, RequestContext, Option(dict.Dict(String, jsonrpc.Value))) ->
     Result(actions.CallToolResult, jsonrpc.RpcError)
 
 pub type ResourceHandler =
@@ -29,7 +29,7 @@ pub type ResourceTemplateHandler =
   fn(String) -> Result(List(actions.ResourceContents), jsonrpc.RpcError)
 
 pub type PromptHandler =
-  fn(Option(Dict(String, String))) ->
+  fn(Option(dict.Dict(String, String))) ->
     Result(actions.GetPromptResult, jsonrpc.RpcError)
 
 pub type CompletionHandler =
@@ -760,6 +760,83 @@ pub fn task_result(
   task_id: String,
 ) -> Result(actions.TaskResult, jsonrpc.RpcError) {
   task_store.result(server.task_store, task_id)
+  |> result.map(with_related_task_result(_, task_id))
+}
+
+fn with_related_task_result(
+  task_result: actions.TaskResult,
+  task_id: String,
+) -> actions.TaskResult {
+  case task_result {
+    actions.TaskCallTool(result) ->
+      actions.TaskCallTool(with_related_task_call_tool_result(result, task_id))
+    actions.TaskCreateMessage(result) ->
+      actions.TaskCreateMessage(with_related_task_create_message_result(
+        result,
+        task_id,
+      ))
+    actions.TaskElicit(result) ->
+      actions.TaskElicit(with_related_task_elicit_result(result, task_id))
+  }
+}
+
+fn with_related_task_call_tool_result(
+  result: actions.CallToolResult,
+  task_id: String,
+) -> actions.CallToolResult {
+  let actions.CallToolResult(content, structured_content, is_error, meta) =
+    result
+  actions.CallToolResult(
+    content: content,
+    structured_content: structured_content,
+    is_error: is_error,
+    meta: Some(merge_related_task_meta(meta, task_id)),
+  )
+}
+
+fn with_related_task_create_message_result(
+  result: actions.CreateMessageResult,
+  task_id: String,
+) -> actions.CreateMessageResult {
+  let actions.CreateMessageResult(message, model, stop_reason, meta) = result
+  actions.CreateMessageResult(
+    message: message,
+    model: model,
+    stop_reason: stop_reason,
+    meta: Some(merge_related_task_meta(meta, task_id)),
+  )
+}
+
+fn with_related_task_elicit_result(
+  result: actions.ElicitResult,
+  task_id: String,
+) -> actions.ElicitResult {
+  let actions.ElicitResult(action, content, meta) = result
+  actions.ElicitResult(
+    action: action,
+    content: content,
+    meta: Some(merge_related_task_meta(meta, task_id)),
+  )
+}
+
+fn merge_related_task_meta(
+  meta: Option(actions.Meta),
+  task_id: String,
+) -> actions.Meta {
+  let fields = case meta {
+    Some(actions.Meta(fields)) -> fields
+    None -> dict.new()
+  }
+
+  actions.Meta(dict.insert(
+    fields,
+    "io.modelcontextprotocol/related-task",
+    related_task_value(task_id),
+  ))
+}
+
+fn related_task_value(task_id: String) -> jsonrpc.Value {
+  jsonrpc.VObject([#("taskId", jsonrpc.VString(task_id))])
 }
 
 fn dispatch_request(
@@ -969,7 +1046,7 @@ fn create_tool_task_result(
   server: Server,
   handler: RegisteredToolHandler,
   context: RequestContext,
-  arguments: Option(Dict(String, jsonrpc.Value)),
+  arguments: Option(dict.Dict(String, jsonrpc.Value)),
   ttl_ms: Option(Int),
 ) -> actions.ClientActionResult {
   let created = task_store.create(server.task_store, ttl_ms)
@@ -1012,7 +1089,7 @@ fn run_tool_handler(
   server: Server,
   handler: RegisteredToolHandler,
   context: RequestContext,
-  arguments: Option(Dict(String, jsonrpc.Value)),
+  arguments: Option(dict.Dict(String, jsonrpc.Value)),
 ) -> Result(actions.CallToolResult, jsonrpc.RpcError) {
   case handler {
     PlainToolHandler(tool_handler) -> tool_handler(arguments)
@@ -1048,7 +1125,7 @@ fn get_task_payload_result(
   params: actions.TaskIdParams,
 ) -> Result(actions.ClientActionResult, jsonrpc.RpcError) {
   let actions.TaskIdParams(task_id) = params
-  task_store.result(server.task_store, task_id)
+  task_result(server, task_id)
   |> result.map(actions.ClientResultTaskResult)
 }
 

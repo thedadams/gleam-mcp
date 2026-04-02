@@ -31,11 +31,22 @@ pub fn listen(
   timeout_ms: Int,
   on_event: fn(String) -> Result(Nil, String),
 ) -> Result(Option(String), String) {
+  request(http.Get, url, headers, "", timeout_ms, on_event)
+}
+
+pub fn request(
+  method: http.Method,
+  url: String,
+  headers: List(#(String, String)),
+  body: String,
+  timeout_ms: Int,
+  on_event: fn(String) -> Result(Nil, String),
+) -> Result(Option(String), String) {
   let mailbox = process.new_subject()
 
   use _stream <- result.try(
     url
-    |> request_builder(headers, timeout_ms, mailbox)
+    |> request_builder(method, headers, body, timeout_ms, mailbox)
     |> dream_client.start_stream,
   )
 
@@ -44,19 +55,23 @@ pub fn listen(
 
 fn request_builder(
   url: String,
+  method: http.Method,
   headers: List(#(String, String)),
-  _timeout_ms: Int,
+  body: String,
+  timeout_ms: Int,
   mailbox: process.Subject(StreamMessage),
 ) -> dream_client.ClientRequest {
   let #(scheme, host, port, path, query) = parse_url(url)
 
   dream_client.new()
-  |> dream_client.method(http.Get)
+  |> dream_client.method(method)
   |> dream_client.scheme(scheme)
   |> dream_client.host(host)
   |> apply_port(port)
   |> dream_client.path(path)
   |> apply_query(query)
+  |> dream_client.body(body)
+  |> dream_client.timeout(timeout_ms)
   |> add_headers(headers)
   |> dream_client.on_stream_start(fn(headers) {
     process.send(mailbox, StreamStarted(headers))

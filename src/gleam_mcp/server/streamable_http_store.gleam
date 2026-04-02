@@ -18,6 +18,7 @@ pub opaque type Store {
 pub type ListenerMessage {
   DeliverRequest(jsonrpc.Request(actions.ServerActionRequest))
   DeliverNotification(jsonrpc.Request(actions.ActionNotification))
+  DeliverResponse(String)
   CloseListener
 }
 

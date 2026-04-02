@@ -1,3 +1,4 @@
+import gleam/erlang/process
 import gleam/http
 import gleam/http/request
 import gleam/http/response
@@ -15,6 +16,7 @@ import gleam_mcp/client/codec as client_codec
 import gleam_mcp/client/http_stream
 import gleam_mcp/client/stdio_manager
 import gleam_mcp/jsonrpc.{type Request, type Response}
+import gleam_mcp/mcp
 import gleam_mcp/server/codec as server_codec
 
 pub type CompatibilityMode {
@@ -280,36 +282,134 @@ pub fn streamable_http_request(
   encode: fn(Request(action)) -> String,
   decode: fn(String, Request(action)) -> Result(Response(result), String),
 ) -> Result(TransportResponse(result), TransportError) {
-  let http_request =
-    build_post_request(
-      config,
-      session_id,
-      protocol_version,
-      encode(message),
-      accept_header: "application/json, text/event-stream",
-    )
-
-  use http_response <- result.try(send_http_request(config, http_request))
-  let next_session_id = session_id_from_response(http_response)
-  let response.Response(status:, ..) = http_response
-
-  case status {
-    200 ->
-      decode_post_response(
+  case should_stream_post_response(message) {
+    True ->
+      streamable_http_request_streaming(
         config,
         session_id,
         protocol_version,
         capability_config,
-        http_response,
         message,
+        encode,
         decode,
       )
-      |> result.map(fn(response) {
-        TransportResponse(response:, session_id: next_session_id)
-      })
-    202 -> Error(UnexpectedResponse("Expected a JSON-RPC response body"))
-    _ -> Error(http_status_error(status, http_response.body))
+    False -> {
+      let http_request =
+        build_post_request(
+          config,
+          session_id,
+          protocol_version,
+          encode(message),
+          accept_header: "application/json, text/event-stream",
+        )
+
+      use http_response <- result.try(send_http_request(config, http_request))
+      let next_session_id = session_id_from_response(http_response)
+      let response.Response(status:, ..) = http_response
+
+      case status {
+        200 ->
+          decode_post_response(
+            config,
+            session_id,
+            protocol_version,
+            capability_config,
+            http_response,
+            message,
+            decode,
+          )
+          |> result.map(fn(response) {
+            TransportResponse(response:, session_id: next_session_id)
+          })
+        202 -> Error(UnexpectedResponse("Expected a JSON-RPC response body"))
+        _ -> Error(http_status_error(status, http_response.body))
+      }
+    }
   }
+}
+
+fn streamable_http_request_streaming(
+  config: HttpConfig,
+  session_id: Option(String),
+  protocol_version: String,
+  capability_config: capabilities.Config,
+  message: Request(action),
+  encode: fn(Request(action)) -> String,
+  decode: fn(String, Request(action)) -> Result(Response(result), String),
+) -> Result(TransportResponse(result), TransportError) {
+  let HttpConfig(base_url:, timeout_ms:, ..) = config
+  let timeout_ms = case timeout_ms {
+    Some(timeout) -> timeout
+    None -> 30_000
+  }
+  let response_reply = process.new_subject()
+  let body = encode(message)
+
+  use next_session_id <- result.try(
+    http_stream.request(
+      http.Post,
+      base_url,
+      post_stream_headers(config, session_id, protocol_version),
+      body,
+      timeout_ms,
+      fn(payload) {
+        case decode(payload, message) {
+          Ok(response) -> {
+            process.send(response_reply, response)
+            Ok(Nil)
+          }
+          Error(_) -> {
+            process_server_message(
+              config,
+              session_id,
+              protocol_version,
+              capability_config,
+              payload,
+            )
+            |> result.map_error(transport_error_message)
+          }
+        }
+      },
+    )
+    |> result.map_error(map_stream_listener_error),
+  )
+
+  case process.receive(response_reply, 100) {
+    Ok(response) ->
+      Ok(TransportResponse(response:, session_id: next_session_id))
+    Error(Nil) ->
+      Error(UnexpectedResponse(
+        "SSE stream ended before a JSON-RPC response was received",
+      ))
+  }
+}
+
+fn should_stream_post_response(message: Request(action)) -> Bool {
+  case message {
+    jsonrpc.Request(_, method, _) -> method == mcp.method_get_task_result
+    jsonrpc.Notification(_, _) -> False
+  }
+}
+
+fn post_stream_headers(
+  config: HttpConfig,
+  session_id: Option(String),
+  protocol_version: String,
+) -> List(#(String, String)) {
+  let HttpConfig(headers:, ..) = config
+
+  [
+    #("accept", "application/json, text/event-stream"),
+    #("content-type", "application/json"),
+    #("mcp-protocol-version", protocol_version),
+  ]
+  |> prepend_optional_header("mcp-session-id", session_id)
+  |> list.append(
+    list.map(headers, fn(header) {
+      let #(key, value) = header
+      #(string.lowercase(key), value)
+    }),
+  )
 }
 
 pub fn streamable_http_notification(

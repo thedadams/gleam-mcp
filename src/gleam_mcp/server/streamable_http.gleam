@@ -1,5 +1,6 @@
 import gleam/bit_array
 import gleam/bytes_tree
+import gleam/erlang/process
 import gleam/http
 import gleam/http/request
 import gleam/http/response
@@ -153,8 +154,10 @@ fn handle_post(
             Ok(body) ->
               handle_post_body(
                 server,
+                req,
                 body,
                 request_session_id(req),
+                accepts_sse(req),
                 middleware,
               )
             Error(_) -> plain_response(400, "Request body was not valid UTF-8")
@@ -166,20 +169,38 @@ fn handle_post(
 
 fn handle_post_body(
   server: server.Server,
+  req: request.Request(mist.Connection),
   body: String,
   requested_session_id: Option(String),
+  accepts_sse_response: Bool,
   middleware: ClientActionMiddleware,
 ) -> response.Response(mist.ResponseData) {
   case codec.decode_message(body) {
     Ok(message) ->
       case session_id_for_message(server, requested_session_id, message) {
         Ok(session_id) ->
-          handle_decoded_message(server, body, session_id, message, middleware)
+          handle_decoded_message(
+            server,
+            req,
+            body,
+            session_id,
+            message,
+            accepts_sse_response,
+            middleware,
+          )
         Error(Nil) -> plain_response(404, "Unknown MCP session")
       }
     Error(_) ->
       case require_existing_session(server, requested_session_id) {
-        Ok(session_id) -> handle_message(server, body, session_id, middleware)
+        Ok(session_id) ->
+          handle_message(
+            server,
+            req,
+            body,
+            session_id,
+            accepts_sse_response,
+            middleware,
+          )
         Error(Nil) -> plain_response(404, "Unknown MCP session")
       }
   }
@@ -187,12 +208,38 @@ fn handle_post_body(
 
 fn handle_decoded_message(
   server: server.Server,
+  req: request.Request(mist.Connection),
   body: String,
   session_id: String,
-  _message: codec.Message,
+  message: codec.Message,
+  accepts_sse_response: Bool,
   middleware: ClientActionMiddleware,
 ) -> response.Response(mist.ResponseData) {
-  handle_message(server, body, session_id, middleware)
+  case message {
+    codec.ClientActionRequest(request) ->
+      case accepts_sse_response && should_stream_request_response(request) {
+        True ->
+          handle_streamed_request(server, req, session_id, request, middleware)
+        False ->
+          handle_message(
+            server,
+            req,
+            body,
+            session_id,
+            accepts_sse_response,
+            middleware,
+          )
+      }
+    _ ->
+      handle_message(
+        server,
+        req,
+        body,
+        session_id,
+        accepts_sse_response,
+        middleware,
+      )
+  }
 }
 
 fn session_id_for_message(
@@ -247,8 +294,10 @@ fn is_initialize_message(message: codec.Message) -> Bool {
 
 fn handle_message(
   server: server.Server,
+  req: request.Request(mist.Connection),
   body: String,
   session_id: String,
+  accepts_sse_response: Bool,
   middleware: ClientActionMiddleware,
 ) -> response.Response(mist.ResponseData) {
   let context =
@@ -258,13 +307,25 @@ fn handle_message(
     Ok(codec.ClientActionRequest(message)) ->
       case middleware(server, context, session_id, message) {
         Continue -> {
-          let #(_, rpc_response) =
-            server.handle_request_with_context(server, context, message)
-          json_response(
-            200,
-            codec.encode_response(rpc_response),
-            Some(session_id),
-          )
+          case accepts_sse_response && should_stream_request_response(message) {
+            True ->
+              handle_streamed_request(
+                server,
+                req,
+                session_id,
+                message,
+                middleware,
+              )
+            False -> {
+              let #(_, rpc_response) =
+                server.handle_request_with_context(server, context, message)
+              json_response(
+                200,
+                codec.encode_response(rpc_response),
+                Some(session_id),
+              )
+            }
+          }
         }
         RespondRpc(rpc_response) ->
           json_response(
@@ -295,6 +356,73 @@ fn handle_message(
         Error(jsonrpc.RpcError(message: response_error, ..)) ->
           plain_response(400, response_error)
       }
+  }
+}
+
+fn handle_streamed_request(
+  server: server.Server,
+  req: request.Request(mist.Connection),
+  session_id: String,
+  message: jsonrpc.Request(actions.ClientActionRequest),
+  middleware: ClientActionMiddleware,
+) -> response.Response(mist.ResponseData) {
+  let listener_id = server.new_streamable_http_listener_id()
+  let context =
+    server.RequestContext(session_id: Some(session_id), task_id: None)
+
+  case middleware(server, context, session_id, message) {
+    Continue ->
+      mist.server_sent_events(
+        request: req,
+        initial_response: response.new(200)
+          |> response.set_header(
+            "mcp-protocol-version",
+            jsonrpc.latest_protocol_version,
+          )
+          |> response.set_header("mcp-session-id", session_id),
+        init: fn(listener) {
+          server.register_streamable_http_listener(
+            server,
+            session_id,
+            listener_id,
+            listener,
+          )
+          let _ =
+            process.spawn(fn() {
+              let #(_, rpc_response) =
+                server.handle_request_with_context(server, context, message)
+              process.send(
+                listener,
+                streamable_http_store.DeliverResponse(codec.encode_response(
+                  rpc_response,
+                )),
+              )
+              Nil
+            })
+          SseState(server, session_id, listener_id)
+        },
+        loop: handle_sse_message,
+      )
+    RespondRpc(rpc_response) ->
+      json_response(200, codec.encode_response(rpc_response), Some(session_id))
+    RespondAccepted -> accepted_response(Some(session_id))
+    RespondPlain(status, response_body) -> plain_response(status, response_body)
+  }
+}
+
+fn should_stream_request_response(
+  request: jsonrpc.Request(actions.ClientActionRequest),
+) -> Bool {
+  case request {
+    jsonrpc.Request(_, _, Some(actions.ClientRequestGetTaskResult(_))) -> True
+    _ -> False
+  }
+}
+
+fn accepts_sse(req: request.Request(body)) -> Bool {
+  case request.get_header(req, "accept") {
+    Ok(value) -> string.contains(value, "text/event-stream")
+    Error(_) -> False
   }
 }
 
@@ -410,6 +538,24 @@ fn handle_sse_message(
           actor.stop()
         }
       }
+    streamable_http_store.DeliverResponse(payload) -> {
+      let _ =
+        server.unregister_streamable_http_listener(
+          app_server,
+          session_id,
+          listener_id,
+        )
+
+      case
+        mist.send_event(
+          connection,
+          mist.event(payload |> string_tree.from_string),
+        )
+      {
+        Ok(Nil) -> actor.stop()
+        Error(Nil) -> actor.stop()
+      }
+    }
     streamable_http_store.CloseListener -> {
       server.unregister_streamable_http_listener(
         app_server,

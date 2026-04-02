@@ -2,7 +2,7 @@ import client_integration_support
 import gleam/dict
 import gleam/erlang/process
 import gleam/list
-import gleam/option.{None, Some}
+import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
 import gleam_mcp/actions
@@ -418,6 +418,137 @@ pub fn sampling_server_sent_roundtrip_http_test() {
   }
 }
 
+pub fn task_result_streams_elicitation_for_input_required_http_test() {
+  let config =
+    transport.Http(transport.HttpConfig(
+      server_test_support.start_http_server_with_server(
+        server_sent_request_server(Elicitation),
+      ),
+      [],
+      Some(5000),
+    ))
+
+  let capability_config =
+    capabilities.none()
+    |> capabilities.with_elicit_form(fn(param) {
+      Ok(
+        capabilities.Elicit(actions.ElicitResult(
+          actions.ElicitAccept,
+          Some(
+            dict.from_list([
+              #(
+                "answer",
+                actions.ElicitString("elicited for " <> param.message),
+              ),
+            ]),
+          ),
+          None,
+        )),
+      )
+    })
+
+  let client = client.new(config, capability_config)
+  let #(client, _) = initialize_client(client)
+
+  let #(client, call_result) =
+    client.call_tool(
+      client,
+      actions.CallToolRequestParams(
+        "roundtrip-elicitation",
+        None,
+        Some(actions.TaskMetadata(Some(1000))),
+        None,
+      ),
+    )
+
+  let task_id = case call_result |> should.be_ok {
+    actions.CallToolTask(actions.CreateTaskResult(task:, ..)) -> task.task_id
+    _ -> panic as "Expected task-backed elicitation call"
+  }
+
+  let #(client, task) =
+    wait_for_task_status(client, task_id, actions.InputRequired, 8)
+  should.equal(task.status, actions.InputRequired)
+
+  let #(_, result) =
+    client.get_task_result(client, actions.TaskIdParams(task_id))
+
+  case result {
+    Ok(actions.TaskCallTool(actions.CallToolResult(content:, ..))) ->
+      should.be_true(has_text_content(
+        content,
+        "Elicited: elicited for Please provide a value for requst roundtrip-elicitation",
+      ))
+    _ -> panic as string.inspect(result)
+  }
+}
+
+pub fn task_result_streams_create_message_for_input_required_http_test() {
+  let config =
+    transport.Http(transport.HttpConfig(
+      server_test_support.start_http_server_with_server(
+        server_sent_request_server(Sampling),
+      ),
+      [],
+      Some(5000),
+    ))
+
+  let capability_config =
+    capabilities.none()
+    |> capabilities.with_create_message(fn(_) {
+      Ok(
+        capabilities.CreateMessage(actions.CreateMessageResult(
+          message: actions.SamplingMessage(
+            actions.Assistant,
+            actions.SingleSamplingContent(
+              actions.SamplingText(actions.TextContent(
+                "sampled value",
+                None,
+                None,
+              )),
+            ),
+            None,
+          ),
+          model: "integration-test-model",
+          stop_reason: None,
+          meta: None,
+        )),
+      )
+    })
+
+  let client = client.new(config, capability_config)
+  let #(client, _) = initialize_client(client)
+
+  let #(client, call_result) =
+    client.call_tool(
+      client,
+      actions.CallToolRequestParams(
+        "roundtrip-sampling",
+        None,
+        Some(actions.TaskMetadata(Some(1000))),
+        None,
+      ),
+    )
+
+  let task_id = case call_result |> should.be_ok {
+    actions.CallToolTask(actions.CreateTaskResult(task:, ..)) -> task.task_id
+    _ -> panic as "Expected task-backed sampling call"
+  }
+
+  let #(client, task) =
+    wait_for_task_status(client, task_id, actions.InputRequired, 8)
+  should.equal(task.status, actions.InputRequired)
+
+  let #(_, result) =
+    client.get_task_result(client, actions.TaskIdParams(task_id))
+
+  case result {
+    Ok(actions.TaskCallTool(actions.CallToolResult(content:, ..))) ->
+      should.be_true(has_text_content(content, "Sampled: sampled value"))
+    _ -> panic as string.inspect(result)
+  }
+}
+
 pub fn server_sent_requests_use_matching_http_session_test() {
   let base_url =
     server_test_support.start_http_server_with_server(
@@ -625,6 +756,13 @@ fn elicitation_tool_result(
   context: server.RequestContext,
   tool: String,
 ) -> Result(actions.CallToolResult, jsonrpc.RpcError) {
+  let _ =
+    set_task_status(
+      app_server,
+      context,
+      actions.InputRequired,
+      Some("Waiting for elicitation input."),
+    )
   server.elicit(
     app_server,
     context,
@@ -645,6 +783,13 @@ fn elicitation_tool_result(
     )),
   )
   |> result.map(fn(elicited) {
+    let _ =
+      set_task_status(
+        app_server,
+        context,
+        actions.Working,
+        Some("Continuing after elicitation input."),
+      )
     let actions.ElicitResult(_, content, _) = elicited
     let answer = case content {
       Some(fields) ->
@@ -674,6 +819,13 @@ fn sampling_tool_result(
   app_server: server.Server,
   context: server.RequestContext,
 ) -> Result(actions.CallToolResult, jsonrpc.RpcError) {
+  let _ =
+    set_task_status(
+      app_server,
+      context,
+      actions.InputRequired,
+      Some("Waiting for sampled message."),
+    )
   case
     server.create_message(
       app_server,
@@ -710,6 +862,13 @@ fn sampling_tool_result(
       message:,
       ..,
     ))) -> {
+      let _ =
+        set_task_status(
+          app_server,
+          context,
+          actions.Working,
+          Some("Continuing after sampled message."),
+        )
       let actions.SamplingMessage(content:, ..) = message
       case content {
         actions.SingleSamplingContent(actions.SamplingText(actions.TextContent(
@@ -739,6 +898,28 @@ fn sampling_tool_result(
         "Client returned an unexpected result for sampling request",
       ))
     Error(error) -> Error(error)
+  }
+}
+
+fn set_task_status(
+  app_server: server.Server,
+  context: server.RequestContext,
+  status: actions.TaskStatus,
+  status_message: Option(String),
+) -> Nil {
+  case server.task_id(context) {
+    Some(task_id) -> {
+      let _ =
+        server.update_task_status(
+          app_server,
+          context,
+          task_id,
+          status,
+          status_message,
+        )
+      Nil
+    }
+    None -> Nil
   }
 }
 
@@ -793,6 +974,40 @@ fn wait_for_completed_task(
 
           process.sleep(poll_interval_ms)
           wait_for_completed_task(next_client, task_id, attempts_left - 1)
+        }
+      }
+    }
+  }
+}
+
+fn wait_for_task_status(
+  current_client: client.Client,
+  task_id: String,
+  expected_status: actions.TaskStatus,
+  attempts_left: Int,
+) -> #(client.Client, actions.Task) {
+  case attempts_left {
+    0 -> panic as "Timed out waiting for expected task status"
+    _ -> {
+      let #(next_client, task_result) =
+        client.get_task(current_client, actions.TaskIdParams(task_id))
+      let task = task_result |> should.be_ok
+
+      case task.task.status == expected_status {
+        True -> #(next_client, task.task)
+        False -> {
+          let poll_interval_ms = case task.task.poll_interval_ms {
+            Some(value) -> value
+            None -> 1000
+          }
+
+          process.sleep(poll_interval_ms)
+          wait_for_task_status(
+            next_client,
+            task_id,
+            expected_status,
+            attempts_left - 1,
+          )
         }
       }
     }
