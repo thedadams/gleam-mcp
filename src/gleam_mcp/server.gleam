@@ -681,26 +681,34 @@ pub fn update_task_status(
 
   case updated {
     Ok(task) -> {
-      let _ = case session_id(context) {
-        Some(_) ->
-          send_notification(
-            server,
-            context,
-            jsonrpc.Notification(
-              mcp.method_notify_task_status,
-              Some(
-                actions.NotifyTaskStatus(actions.TaskStatusNotificationParams(
-                  task,
-                  None,
-                )),
-              ),
-            ),
-          )
-        None -> Ok(Nil)
-      }
+      let _ = send_task_status_notification(server, context, task)
       Ok(task)
     }
     Error(error) -> Error(error)
+  }
+}
+
+fn send_task_status_notification(
+  server: Server,
+  context: RequestContext,
+  task: actions.Task,
+) -> Result(Nil, jsonrpc.RpcError) {
+  case session_id(context) {
+    Some(_) ->
+      send_notification(
+        server,
+        context,
+        jsonrpc.Notification(
+          mcp.method_notify_task_status,
+          Some(
+            actions.NotifyTaskStatus(actions.TaskStatusNotificationParams(
+              task,
+              None,
+            )),
+          ),
+        ),
+      )
+    None -> Ok(Nil)
   }
 }
 
@@ -785,7 +793,7 @@ fn dispatch_request(
     actions.ClientRequestGetTaskResult(params) ->
       get_task_payload_result(server, params)
     actions.ClientRequestCancelTask(params) ->
-      cancel_task_result(server, params)
+      cancel_task_result(server, context, params)
   }
 }
 
@@ -973,10 +981,23 @@ fn create_tool_task_result(
       let outcome =
         run_tool_handler(server, handler, task_context, arguments)
         |> result.map(actions.TaskCallTool)
-      let _ = task_store.complete(server.task_store, created.task_id, outcome)
+      let _ = complete_task(server, task_context, created.task_id, outcome)
       Nil
     })
   actions.ClientResultCreateTask(actions.CreateTaskResult(created, None))
+}
+
+fn complete_task(
+  server: Server,
+  context: RequestContext,
+  task_id: String,
+  outcome: Result(actions.TaskResult, jsonrpc.RpcError),
+) -> Result(actions.Task, jsonrpc.RpcError) {
+  task_store.complete(server.task_store, task_id, outcome)
+  |> result.map(fn(task) {
+    let _ = send_task_status_notification(server, context, task)
+    task
+  })
 }
 
 fn tool_task_support(tool: actions.Tool) -> Option(actions.TaskSupport) {
@@ -1033,10 +1054,15 @@ fn get_task_payload_result(
 
 fn cancel_task_result(
   server: Server,
+  context: RequestContext,
   params: actions.TaskIdParams,
 ) -> Result(actions.ClientActionResult, jsonrpc.RpcError) {
   let actions.TaskIdParams(task_id) = params
   task_store.cancel(server.task_store, task_id)
+  |> result.map(fn(task) {
+    let _ = send_task_status_notification(server, context, task)
+    task
+  })
   |> result.map(fn(task) {
     actions.ClientResultCancelTask(actions.CancelTaskResult(task, None))
   })

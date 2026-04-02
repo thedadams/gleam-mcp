@@ -1,7 +1,7 @@
 import gleam/dict
 import gleam/erlang/process
 import gleam/list
-import gleam/option.{None, Some}
+import gleam/option.{type Option, None, Some}
 import gleam/string
 import gleam_mcp/actions
 import gleam_mcp/client/capabilities
@@ -570,10 +570,174 @@ pub fn update_task_status_without_session_skips_notification_test() {
   )
 }
 
-fn create_task_id(sample_server: server.Server) -> String {
+pub fn task_completion_sends_notification_for_http_session_test() {
+  let sample_server = task_status_test_server()
+  let session_id = server.ensure_streamable_http_session(sample_server, None)
+  let listener_id = server.new_streamable_http_listener_id()
+  let listener = process.new_subject()
+
+  server.register_streamable_http_listener(
+    sample_server,
+    session_id,
+    listener_id,
+    listener,
+  )
+
   let #(_, create_response) =
-    server.handle_request(
+    server.handle_request_with_context(
       sample_server,
+      server.RequestContext(session_id: Some(session_id), task_id: None),
+      jsonrpc.Request(
+        jsonrpc.StringId("task-create-completed"),
+        mcp.method_call_tool,
+        Some(
+          actions.ClientRequestCallTool(actions.CallToolRequestParams(
+            "echo",
+            Some(dict.from_list([#("message", jsonrpc.VString("hello"))])),
+            Some(actions.TaskMetadata(Some(1000))),
+            None,
+          )),
+        ),
+      ),
+    )
+
+  let task_id = case create_response {
+    jsonrpc.ResultResponse(
+      _,
+      actions.ClientResultCreateTask(actions.CreateTaskResult(task:, ..)),
+    ) -> task.task_id
+    _ -> panic as string.inspect(create_response)
+  }
+
+  expect_task_status_notification(listener, task_id, actions.Completed, None)
+
+  server.unregister_streamable_http_listener(
+    sample_server,
+    session_id,
+    listener_id,
+  )
+}
+
+pub fn task_failure_sends_notification_for_http_session_test() {
+  let sample_server = task_status_test_server()
+  let session_id = server.ensure_streamable_http_session(sample_server, None)
+  let listener_id = server.new_streamable_http_listener_id()
+  let listener = process.new_subject()
+
+  server.register_streamable_http_listener(
+    sample_server,
+    session_id,
+    listener_id,
+    listener,
+  )
+
+  let #(_, create_response) =
+    server.handle_request_with_context(
+      sample_server,
+      server.RequestContext(session_id: Some(session_id), task_id: None),
+      jsonrpc.Request(
+        jsonrpc.StringId("task-create-failed"),
+        mcp.method_call_tool,
+        Some(
+          actions.ClientRequestCallTool(actions.CallToolRequestParams(
+            "fail",
+            None,
+            Some(actions.TaskMetadata(Some(1000))),
+            None,
+          )),
+        ),
+      ),
+    )
+
+  let task_id = case create_response {
+    jsonrpc.ResultResponse(
+      _,
+      actions.ClientResultCreateTask(actions.CreateTaskResult(task:, ..)),
+    ) -> task.task_id
+    _ -> panic as string.inspect(create_response)
+  }
+
+  expect_task_status_notification(
+    listener,
+    task_id,
+    actions.Failed,
+    Some("Tool failed."),
+  )
+
+  server.unregister_streamable_http_listener(
+    sample_server,
+    session_id,
+    listener_id,
+  )
+}
+
+pub fn cancel_task_sends_notification_for_http_session_test() {
+  let sample_server = task_status_test_server()
+  let session_id = server.ensure_streamable_http_session(sample_server, None)
+  let listener_id = server.new_streamable_http_listener_id()
+  let listener = process.new_subject()
+
+  server.register_streamable_http_listener(
+    sample_server,
+    session_id,
+    listener_id,
+    listener,
+  )
+
+  let task_id =
+    create_task_id_with_context(
+      sample_server,
+      server.RequestContext(session_id: Some(session_id), task_id: None),
+    )
+
+  let #(_, cancel_response) =
+    server.handle_request_with_context(
+      sample_server,
+      server.RequestContext(session_id: Some(session_id), task_id: None),
+      jsonrpc.Request(
+        jsonrpc.StringId("task-cancel-notify"),
+        mcp.method_cancel_task,
+        Some(actions.ClientRequestCancelTask(actions.TaskIdParams(task_id))),
+      ),
+    )
+
+  case cancel_response {
+    jsonrpc.ResultResponse(
+      _,
+      actions.ClientResultCancelTask(actions.CancelTaskResult(task:, ..)),
+    ) -> should.equal(task.status, actions.Cancelled)
+    _ -> should.fail()
+  }
+
+  expect_task_status_notification(
+    listener,
+    task_id,
+    actions.Cancelled,
+    Some("The task was cancelled by request."),
+  )
+
+  server.unregister_streamable_http_listener(
+    sample_server,
+    session_id,
+    listener_id,
+  )
+}
+
+fn create_task_id(sample_server: server.Server) -> String {
+  create_task_id_with_context(
+    sample_server,
+    server.RequestContext(session_id: None, task_id: None),
+  )
+}
+
+fn create_task_id_with_context(
+  sample_server: server.Server,
+  context: server.RequestContext,
+) -> String {
+  let #(_, create_response) =
+    server.handle_request_with_context(
+      sample_server,
+      context,
       jsonrpc.Request(
         jsonrpc.StringId("task-create"),
         mcp.method_call_tool,
@@ -597,6 +761,30 @@ fn create_task_id(sample_server: server.Server) -> String {
   }
 }
 
+fn expect_task_status_notification(
+  listener: process.Subject(streamable_http_store.ListenerMessage),
+  expected_task_id: String,
+  expected_status: actions.TaskStatus,
+  expected_status_message: Option(String),
+) -> Nil {
+  case process.receive(listener, 1000) {
+    Ok(streamable_http_store.DeliverNotification(jsonrpc.Notification(
+      method,
+      Some(actions.NotifyTaskStatus(actions.TaskStatusNotificationParams(
+        task,
+        meta,
+      ))),
+    ))) -> {
+      should.equal(method, mcp.method_notify_task_status)
+      should.equal(task.task_id, expected_task_id)
+      should.equal(task.status, expected_status)
+      should.equal(task.status_message, expected_status_message)
+      should.equal(meta, None)
+    }
+    _ -> should.fail()
+  }
+}
+
 fn task_status_test_server() -> server.Server {
   example_server.sample_server()
   |> server.add_tool(
@@ -613,5 +801,11 @@ fn task_status_test_server() -> server.Server {
         meta: None,
       ))
     },
+  )
+  |> server.add_tool(
+    "fail",
+    "Fail immediately",
+    jsonrpc.VObject([#("type", jsonrpc.VString("object"))]),
+    fn(_) { Error(jsonrpc.invalid_params_error("Tool failed.")) },
   )
 }
