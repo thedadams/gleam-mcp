@@ -64,6 +64,9 @@ pub type TransportResponse(result) {
   TransportResponse(response: Response(result), session_id: Option(String))
 }
 
+const default_http_timeout_ms = 30_000
+const minimum_stream_listener_timeout_ms = 3_600_000
+
 pub type Runners {
   Runners(
     stdio_request: fn(
@@ -449,14 +452,10 @@ pub fn streamable_http_listen(
   protocol_version: String,
   capability_config: capabilities.Config,
 ) -> Result(Option(String), TransportError) {
-  let HttpConfig(base_url:, timeout_ms:, ..) = config
-  let timeout_ms = case timeout_ms {
-    Some(value) -> value
-    None -> 30_000
-  }
+  let HttpConfig(base_url:, ..) = config
   let headers = streamable_get_headers(config, session_id, protocol_version)
 
-  http_stream.listen(base_url, headers, timeout_ms, fn(payload) {
+  http_stream.listen(base_url, headers, stream_listener_timeout_ms(config), fn(payload) {
     process_server_message(
       config,
       session_id,
@@ -544,6 +543,22 @@ fn send_http_request(
   }
 
   httpc.dispatch(http_config, request) |> result.map_error(map_http_error)
+}
+
+fn stream_listener_timeout_ms(config: HttpConfig) -> Int {
+  let timeout = http_timeout_ms(config)
+  case timeout < minimum_stream_listener_timeout_ms {
+    True -> minimum_stream_listener_timeout_ms
+    False -> timeout
+  }
+}
+
+fn http_timeout_ms(config: HttpConfig) -> Int {
+  let HttpConfig(timeout_ms:, ..) = config
+  case timeout_ms {
+    Some(timeout) -> timeout
+    None -> default_http_timeout_ms
+  }
 }
 
 fn decode_post_response(

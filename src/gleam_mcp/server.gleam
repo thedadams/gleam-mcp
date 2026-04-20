@@ -109,34 +109,10 @@ pub fn new(implementation: actions.Implementation) -> Server {
 }
 
 pub fn with_instructions(server: Server, instructions: String) -> Server {
-  let Server(
-    implementation: implementation,
-    authorization: authorization,
-    task_store: tasks,
-    http_store: http_store,
-    tools: tools,
-    resources: resources,
-    resource_templates: resource_templates,
-    prompts: prompts,
-    completion_handler: completion_handler,
-    logging_handler: logging_handler,
-    task_result_request_handler: task_result_request_handler,
-    ..,
-  ) = server
-
-  Server(
-    implementation,
-    Some(instructions),
-    authorization,
-    tasks,
-    http_store,
-    tools,
-    resources,
-    resource_templates,
-    prompts,
-    completion_handler,
-    logging_handler,
-    task_result_request_handler,
+  with_server_metadata(
+    server,
+    instructions: Some(instructions),
+    authorization: header_authorization(server),
   )
 }
 
@@ -145,34 +121,11 @@ pub fn with_header_authorization(
   header: String,
   validate: fn(String) -> Bool,
 ) -> Server {
-  let Server(
-    implementation: implementation,
+  let Server(instructions: instructions, ..) = server
+  with_server_metadata(
+    server,
     instructions: instructions,
-    task_store: tasks,
-    http_store: http_store,
-    tools: tools,
-    resources: resources,
-    resource_templates: resource_templates,
-    prompts: prompts,
-    completion_handler: completion_handler,
-    logging_handler: logging_handler,
-    task_result_request_handler: task_result_request_handler,
-    ..,
-  ) = server
-
-  Server(
-    implementation,
-    instructions,
-    Some(HeaderAuthorization(header, validate)),
-    tasks,
-    http_store,
-    tools,
-    resources,
-    resource_templates,
-    prompts,
-    completion_handler,
-    logging_handler,
-    task_result_request_handler,
+    authorization: Some(HeaderAuthorization(header, validate)),
   )
 }
 
@@ -324,34 +277,13 @@ pub fn add_resource(
       meta: None,
     )
 
-  let Server(
-    implementation: server_info,
-    instructions: instructions,
-    authorization: authorization,
-    task_store: tasks,
-    http_store: http_store,
-    tools: tools,
-    resources: resources,
-    resource_templates: resource_templates,
-    prompts: prompts,
-    completion_handler: completion_handler,
-    logging_handler: logging_handler,
-    task_result_request_handler: task_result_request_handler,
-  ) = server
-
-  Server(
-    server_info,
-    instructions,
-    authorization,
-    tasks,
-    http_store,
-    tools,
-    [RegisteredResource(resource, implementation), ..resources],
-    resource_templates,
-    prompts,
-    completion_handler,
-    logging_handler,
-    task_result_request_handler,
+  let Server(resources: resources, ..) = server
+  with_server_registry(
+    server,
+    tools: server.tools,
+    resources: [RegisteredResource(resource, implementation), ..resources],
+    resource_templates: server.resource_templates,
+    prompts: server.prompts,
   )
 }
 
@@ -375,37 +307,16 @@ pub fn add_resource_template(
       meta: None,
     )
 
-  let Server(
-    implementation: server_info,
-    instructions: instructions,
-    authorization: authorization,
-    task_store: tasks,
-    http_store: http_store,
-    tools: tools,
-    resources: resources,
-    resource_templates: resource_templates,
-    prompts: prompts,
-    completion_handler: completion_handler,
-    logging_handler: logging_handler,
-    task_result_request_handler: task_result_request_handler,
-  ) = server
-
-  Server(
-    server_info,
-    instructions,
-    authorization,
-    tasks,
-    http_store,
-    tools,
-    resources,
-    [
+  let Server(resource_templates: resource_templates, ..) = server
+  with_server_registry(
+    server,
+    tools: server.tools,
+    resources: server.resources,
+    resource_templates: [
       RegisteredResourceTemplate(resource_template, implementation),
       ..resource_templates
     ],
-    prompts,
-    completion_handler,
-    logging_handler,
-    task_result_request_handler,
+    prompts: server.prompts,
   )
 }
 
@@ -426,34 +337,13 @@ pub fn add_prompt(
       meta: None,
     )
 
-  let Server(
-    implementation: server_info,
-    instructions: instructions,
-    authorization: authorization,
-    task_store: tasks,
-    http_store: http_store,
-    tools: tools,
-    resources: resources,
-    resource_templates: resource_templates,
-    prompts: prompts,
-    completion_handler: completion_handler,
-    logging_handler: logging_handler,
-    task_result_request_handler: task_result_request_handler,
-  ) = server
-
-  Server(
-    server_info,
-    instructions,
-    authorization,
-    tasks,
-    http_store,
-    tools,
-    resources,
-    resource_templates,
-    [RegisteredPrompt(prompt, implementation), ..prompts],
-    completion_handler,
-    logging_handler,
-    task_result_request_handler,
+  let Server(prompts: prompts, ..) = server
+  with_server_registry(
+    server,
+    tools: server.tools,
+    resources: server.resources,
+    resource_templates: server.resource_templates,
+    prompts: [RegisteredPrompt(prompt, implementation), ..prompts],
   )
 }
 
@@ -461,66 +351,20 @@ pub fn set_completion_handler(
   server: Server,
   handler: CompletionHandler,
 ) -> Server {
-  let Server(
-    implementation: implementation,
-    instructions: instructions,
-    authorization: authorization,
-    task_store: tasks,
-    http_store: http_store,
-    tools: tools,
-    resources: resources,
-    resource_templates: resource_templates,
-    prompts: prompts,
-    logging_handler: logging_handler,
-    task_result_request_handler: task_result_request_handler,
-    ..,
-  ) = server
-
-  Server(
-    implementation,
-    instructions,
-    authorization,
-    tasks,
-    http_store,
-    tools,
-    resources,
-    resource_templates,
-    prompts,
-    Some(handler),
-    logging_handler,
-    task_result_request_handler,
+  with_server_handlers(
+    server,
+    completion_handler: Some(handler),
+    logging_handler: server.logging_handler,
+    task_result_request_handler: server.task_result_request_handler,
   )
 }
 
 pub fn set_logging_handler(server: Server, handler: LoggingHandler) -> Server {
-  let Server(
-    implementation: implementation,
-    instructions: instructions,
-    authorization: authorization,
-    task_store: tasks,
-    http_store: http_store,
-    tools: tools,
-    resources: resources,
-    resource_templates: resource_templates,
-    prompts: prompts,
-    completion_handler: completion_handler,
-    task_result_request_handler: task_result_request_handler,
-    ..,
-  ) = server
-
-  Server(
-    implementation,
-    instructions,
-    authorization,
-    tasks,
-    http_store,
-    tools,
-    resources,
-    resource_templates,
-    prompts,
-    completion_handler,
-    Some(handler),
-    task_result_request_handler,
+  with_server_handlers(
+    server,
+    completion_handler: server.completion_handler,
+    logging_handler: Some(handler),
+    task_result_request_handler: server.task_result_request_handler,
   )
 }
 
@@ -528,34 +372,11 @@ pub fn set_task_result_request_handler(
   server: Server,
   handler: TaskResultRequestHandler,
 ) -> Server {
-  let Server(
-    implementation: implementation,
-    instructions: instructions,
-    authorization: authorization,
-    task_store: tasks,
-    http_store: http_store,
-    tools: tools,
-    resources: resources,
-    resource_templates: resource_templates,
-    prompts: prompts,
-    completion_handler: completion_handler,
-    logging_handler: logging_handler,
-    ..,
-  ) = server
-
-  Server(
-    implementation,
-    instructions,
-    authorization,
-    tasks,
-    http_store,
-    tools,
-    resources,
-    resource_templates,
-    prompts,
-    completion_handler,
-    logging_handler,
-    Some(handler),
+  with_server_handlers(
+    server,
+    completion_handler: server.completion_handler,
+    logging_handler: server.logging_handler,
+    task_result_request_handler: Some(handler),
   )
 }
 
@@ -958,13 +779,10 @@ fn initialization_result(server: Server) -> actions.ClientActionResult {
 
 fn list_resources_result(server: Server) -> actions.ClientActionResult {
   let Server(resources: resources, ..) = server
-  let listed =
-    resources
-    |> list.reverse
-    |> list.map(fn(registered) {
-      let RegisteredResource(resource, _) = registered
-      resource
-    })
+  let listed = listed_entries(resources, fn(registered) {
+    let RegisteredResource(resource, _) = registered
+    resource
+  })
 
   actions.ClientResultListResources(actions.ListResourcesResult(
     resources: listed,
@@ -975,11 +793,8 @@ fn list_resources_result(server: Server) -> actions.ClientActionResult {
 
 fn list_resource_templates_result(server: Server) -> actions.ClientActionResult {
   let Server(resource_templates: resource_templates, ..) = server
-  let listed =
-    resource_templates
-    |> list.reverse
-    |> list.map(fn(registered) {
-      let RegisteredResourceTemplate(resource_template, _) = registered
+  let listed = listed_entries(resource_templates, fn(registered) {
+    let RegisteredResourceTemplate(resource_template, _) = registered
       resource_template
     })
 
@@ -1023,13 +838,10 @@ fn read_resource_result(
 
 fn list_prompts_result(server: Server) -> actions.ClientActionResult {
   let Server(prompts: prompts, ..) = server
-  let listed =
-    prompts
-    |> list.reverse
-    |> list.map(fn(registered) {
-      let RegisteredPrompt(prompt, _) = registered
-      prompt
-    })
+  let listed = listed_entries(prompts, fn(registered) {
+    let RegisteredPrompt(prompt, _) = registered
+    prompt
+  })
 
   actions.ClientResultListPrompts(actions.ListPromptsResult(
     prompts: listed,
@@ -1055,13 +867,10 @@ fn get_prompt_result(
 
 fn list_tools_result(server: Server) -> actions.ClientActionResult {
   let Server(tools: tools, ..) = server
-  let listed =
-    tools
-    |> list.reverse
-    |> list.map(fn(registered) {
-      let RegisteredTool(tool, _) = registered
-      tool
-    })
+  let listed = listed_entries(tools, fn(registered) {
+    let RegisteredTool(tool, _) = registered
+    tool
+  })
 
   actions.ClientResultListTools(actions.ListToolsResult(
     tools: listed,
@@ -1244,64 +1053,163 @@ fn find_tool(
   tools: List(RegisteredTool),
   name: String,
 ) -> Result(RegisteredTool, Nil) {
-  case tools {
-    [] -> Error(Nil)
-    [tool, ..rest] -> {
-      let RegisteredTool(tool: descriptor, ..) = tool
-      case descriptor.name == name {
-        True -> Ok(tool)
-        False -> find_tool(rest, name)
-      }
-    }
-  }
+  find_entry(tools, fn(registered) {
+    let RegisteredTool(tool: descriptor, ..) = registered
+    descriptor.name == name
+  })
 }
 
 fn find_prompt(
   prompts: List(RegisteredPrompt),
   name: String,
 ) -> Result(RegisteredPrompt, Nil) {
-  case prompts {
-    [] -> Error(Nil)
-    [prompt, ..rest] -> {
-      let RegisteredPrompt(prompt: descriptor, ..) = prompt
-      case descriptor.name == name {
-        True -> Ok(prompt)
-        False -> find_prompt(rest, name)
-      }
-    }
-  }
+  find_entry(prompts, fn(registered) {
+    let RegisteredPrompt(prompt: descriptor, ..) = registered
+    descriptor.name == name
+  })
 }
 
 fn find_resource(
   resources: List(RegisteredResource),
   uri: String,
 ) -> Result(RegisteredResource, Nil) {
-  case resources {
-    [] -> Error(Nil)
-    [resource, ..rest] -> {
-      let RegisteredResource(resource: descriptor, ..) = resource
-      case descriptor.uri == uri {
-        True -> Ok(resource)
-        False -> find_resource(rest, uri)
-      }
-    }
-  }
+  find_entry(resources, fn(registered) {
+    let RegisteredResource(resource: descriptor, ..) = registered
+    descriptor.uri == uri
+  })
 }
 
 fn find_resource_template(
   templates: List(RegisteredResourceTemplate),
   uri: String,
 ) -> Result(RegisteredResourceTemplate, Nil) {
-  case templates {
+  find_entry(templates, fn(registered) {
+    let RegisteredResourceTemplate(resource_template: descriptor, ..) = registered
+    matches_template(descriptor.uri_template, uri)
+  })
+}
+
+fn with_server_metadata(
+  server: Server,
+  instructions instructions: Option(String),
+  authorization authorization: Option(HeaderAuthorization),
+) -> Server {
+  let Server(
+    implementation: implementation,
+    task_store: tasks,
+    http_store: http_store,
+    tools: tools,
+    resources: resources,
+    resource_templates: resource_templates,
+    prompts: prompts,
+    completion_handler: completion_handler,
+    logging_handler: logging_handler,
+    task_result_request_handler: task_result_request_handler,
+    ..,
+  ) = server
+
+  Server(
+    implementation,
+    instructions,
+    authorization,
+    tasks,
+    http_store,
+    tools,
+    resources,
+    resource_templates,
+    prompts,
+    completion_handler,
+    logging_handler,
+    task_result_request_handler,
+  )
+}
+
+fn with_server_registry(
+  server: Server,
+  tools tools: List(RegisteredTool),
+  resources resources: List(RegisteredResource),
+  resource_templates resource_templates: List(RegisteredResourceTemplate),
+  prompts prompts: List(RegisteredPrompt),
+) -> Server {
+  let Server(
+    implementation: implementation,
+    instructions: instructions,
+    authorization: authorization,
+    task_store: tasks,
+    http_store: http_store,
+    completion_handler: completion_handler,
+    logging_handler: logging_handler,
+    task_result_request_handler: task_result_request_handler,
+    ..,
+  ) = server
+
+  Server(
+    implementation,
+    instructions,
+    authorization,
+    tasks,
+    http_store,
+    tools,
+    resources,
+    resource_templates,
+    prompts,
+    completion_handler,
+    logging_handler,
+    task_result_request_handler,
+  )
+}
+
+fn with_server_handlers(
+  server: Server,
+  completion_handler completion_handler: Option(CompletionHandler),
+  logging_handler logging_handler: Option(LoggingHandler),
+  task_result_request_handler task_result_request_handler: Option(
+    TaskResultRequestHandler,
+  ),
+) -> Server {
+  let Server(
+    implementation: implementation,
+    instructions: instructions,
+    authorization: authorization,
+    task_store: tasks,
+    http_store: http_store,
+    tools: tools,
+    resources: resources,
+    resource_templates: resource_templates,
+    prompts: prompts,
+    ..,
+  ) = server
+
+  Server(
+    implementation,
+    instructions,
+    authorization,
+    tasks,
+    http_store,
+    tools,
+    resources,
+    resource_templates,
+    prompts,
+    completion_handler,
+    logging_handler,
+    task_result_request_handler,
+  )
+}
+
+fn listed_entries(entries: List(a), extract: fn(a) -> b) -> List(b) {
+  entries
+  |> list.reverse
+  |> list.map(extract)
+}
+
+fn find_entry(entries: List(a), matches: fn(a) -> Bool) -> Result(a, Nil) {
+  case entries {
     [] -> Error(Nil)
-    [resource_template, ..rest] -> {
-      let RegisteredResourceTemplate(resource_template: descriptor, ..) =
-        resource_template
-      case matches_template(descriptor.uri_template, uri) {
-        True -> Ok(resource_template)
-        False -> find_resource_template(rest, uri)
+    [entry, ..rest] ->
+      case matches(entry) {
+        True -> Ok(entry)
+        False -> find_entry(rest, matches)
       }
-    }
   }
 }
 

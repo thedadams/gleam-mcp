@@ -99,44 +99,14 @@ pub fn with_list_roots(
   config: Config,
   handler: fn(Option(actions.RequestMeta)) -> Result(List(Root), RpcError),
 ) -> Config {
-  let Config(
-    notify_cancelled: notify_cancelled,
-    notify_progress: notify_progress,
-    notify_resource_list_changed: notify_resource_list_changed,
-    notify_resource_updated: notify_resource_updated,
-    notify_prompt_list_changed: notify_prompt_list_changed,
-    notify_tool_list_changed: notify_tool_list_changed,
-    notify_logging_message: notify_logging_message,
-    notify_roots_list_changed: notify_roots_list_changed,
-    notify_elicitation_complete: notify_elicitation_complete,
-    notify_task_status: notify_task_status,
-    task_store: tasks,
-    create_message: create_message,
-    sampling_tools: sampling_tools,
-    sampling_context: sampling_context,
-    elicit_form: elicit_form,
-    elicit_url: elicit_url,
-    ..,
-  ) = config
-
-  Config(
-    Some(handler),
-    notify_cancelled,
-    notify_progress,
-    notify_resource_list_changed,
-    notify_resource_updated,
-    notify_prompt_list_changed,
-    notify_tool_list_changed,
-    notify_logging_message,
-    notify_roots_list_changed,
-    notify_elicitation_complete,
-    notify_task_status,
-    tasks,
-    create_message,
-    sampling_tools,
-    sampling_context,
-    elicit_form,
-    elicit_url,
+  update_handlers(
+    config,
+    list_roots: Some(handler),
+    create_message: None,
+    sampling_tools: None,
+    sampling_context: None,
+    elicit_form: None,
+    elicit_url: None,
   )
 }
 
@@ -337,44 +307,14 @@ pub fn with_create_message(
   handler: fn(actions.CreateMessageRequestParams) ->
     Result(CreateMessageHandlerResult, RpcError),
 ) -> Config {
-  let Config(
-    list_roots: list_roots,
-    notify_cancelled: notify_cancelled,
-    notify_progress: notify_progress,
-    notify_resource_list_changed: notify_resource_list_changed,
-    notify_resource_updated: notify_resource_updated,
-    notify_prompt_list_changed: notify_prompt_list_changed,
-    notify_tool_list_changed: notify_tool_list_changed,
-    notify_logging_message: notify_logging_message,
-    notify_roots_list_changed: notify_roots_list_changed,
-    notify_elicitation_complete: notify_elicitation_complete,
-    notify_task_status: notify_task_status,
-    task_store: tasks,
-    sampling_tools: sampling_tools,
-    sampling_context: sampling_context,
-    elicit_form: elicit_form,
-    elicit_url: elicit_url,
-    ..,
-  ) = config
-
-  Config(
-    list_roots,
-    notify_cancelled,
-    notify_progress,
-    notify_resource_list_changed,
-    notify_resource_updated,
-    notify_prompt_list_changed,
-    notify_tool_list_changed,
-    notify_logging_message,
-    notify_roots_list_changed,
-    notify_elicitation_complete,
-    notify_task_status,
-    tasks,
-    Some(handler),
-    sampling_tools,
-    sampling_context,
-    elicit_form,
-    elicit_url,
+  update_handlers(
+    config,
+    list_roots: None,
+    create_message: Some(handler),
+    sampling_tools: None,
+    sampling_context: None,
+    elicit_form: None,
+    elicit_url: None,
   )
 }
 
@@ -382,44 +322,14 @@ pub fn with_sampling_tools(
   config: Config,
   handler: fn(Value) -> Result(Nil, RpcError),
 ) -> Config {
-  let Config(
-    list_roots: list_roots,
-    notify_cancelled: notify_cancelled,
-    notify_progress: notify_progress,
-    notify_resource_list_changed: notify_resource_list_changed,
-    notify_resource_updated: notify_resource_updated,
-    notify_prompt_list_changed: notify_prompt_list_changed,
-    notify_tool_list_changed: notify_tool_list_changed,
-    notify_logging_message: notify_logging_message,
-    notify_roots_list_changed: notify_roots_list_changed,
-    notify_elicitation_complete: notify_elicitation_complete,
-    notify_task_status: notify_task_status,
-    task_store: tasks,
-    create_message: create_message,
-    sampling_context: sampling_context,
-    elicit_form: elicit_form,
-    elicit_url: elicit_url,
-    ..,
-  ) = config
-
-  Config(
-    list_roots,
-    notify_cancelled,
-    notify_progress,
-    notify_resource_list_changed,
-    notify_resource_updated,
-    notify_prompt_list_changed,
-    notify_tool_list_changed,
-    notify_logging_message,
-    notify_roots_list_changed,
-    notify_elicitation_complete,
-    notify_task_status,
-    tasks,
-    create_message,
-    Some(handler),
-    sampling_context,
-    elicit_form,
-    elicit_url,
+  update_handlers(
+    config,
+    list_roots: None,
+    create_message: None,
+    sampling_tools: Some(handler),
+    sampling_context: None,
+    elicit_form: None,
+    elicit_url: None,
   )
 }
 
@@ -427,44 +337,14 @@ pub fn with_sampling_context(
   config: Config,
   handler: fn(Value) -> Result(Nil, RpcError),
 ) -> Config {
-  let Config(
-    list_roots: list_roots,
-    notify_cancelled: notify_cancelled,
-    notify_progress: notify_progress,
-    notify_resource_list_changed: notify_resource_list_changed,
-    notify_resource_updated: notify_resource_updated,
-    notify_prompt_list_changed: notify_prompt_list_changed,
-    notify_tool_list_changed: notify_tool_list_changed,
-    notify_logging_message: notify_logging_message,
-    notify_roots_list_changed: notify_roots_list_changed,
-    notify_elicitation_complete: notify_elicitation_complete,
-    notify_task_status: notify_task_status,
-    task_store: tasks,
-    create_message: create_message,
-    sampling_tools: sampling_tools,
-    elicit_form: elicit_form,
-    elicit_url: elicit_url,
-    ..,
-  ) = config
-
-  Config(
-    list_roots,
-    notify_cancelled,
-    notify_progress,
-    notify_resource_list_changed,
-    notify_resource_updated,
-    notify_prompt_list_changed,
-    notify_tool_list_changed,
-    notify_logging_message,
-    notify_roots_list_changed,
-    notify_elicitation_complete,
-    notify_task_status,
-    tasks,
-    create_message,
-    sampling_tools,
-    Some(handler),
-    elicit_form,
-    elicit_url,
+  update_handlers(
+    config,
+    list_roots: None,
+    create_message: None,
+    sampling_tools: None,
+    sampling_context: Some(handler),
+    elicit_form: None,
+    elicit_url: None,
   )
 }
 
@@ -473,44 +353,14 @@ pub fn with_elicit_form(
   handler: fn(actions.ElicitRequestFormParams) ->
     Result(ElicitHandlerResult, RpcError),
 ) -> Config {
-  let Config(
-    list_roots: list_roots,
-    notify_cancelled: notify_cancelled,
-    notify_progress: notify_progress,
-    notify_resource_list_changed: notify_resource_list_changed,
-    notify_resource_updated: notify_resource_updated,
-    notify_prompt_list_changed: notify_prompt_list_changed,
-    notify_tool_list_changed: notify_tool_list_changed,
-    notify_logging_message: notify_logging_message,
-    notify_roots_list_changed: notify_roots_list_changed,
-    notify_elicitation_complete: notify_elicitation_complete,
-    notify_task_status: notify_task_status,
-    task_store: tasks,
-    create_message: create_message,
-    sampling_tools: sampling_tools,
-    sampling_context: sampling_context,
-    elicit_url: elicit_url,
-    ..,
-  ) = config
-
-  Config(
-    list_roots,
-    notify_cancelled,
-    notify_progress,
-    notify_resource_list_changed,
-    notify_resource_updated,
-    notify_prompt_list_changed,
-    notify_tool_list_changed,
-    notify_logging_message,
-    notify_roots_list_changed,
-    notify_elicitation_complete,
-    notify_task_status,
-    tasks,
-    create_message,
-    sampling_tools,
-    sampling_context,
-    Some(handler),
-    elicit_url,
+  update_handlers(
+    config,
+    list_roots: None,
+    create_message: None,
+    sampling_tools: None,
+    sampling_context: None,
+    elicit_form: Some(handler),
+    elicit_url: None,
   )
 }
 
@@ -519,44 +369,14 @@ pub fn with_elicit_url(
   handler: fn(actions.ElicitRequestUrlParams) ->
     Result(ElicitHandlerResult, RpcError),
 ) -> Config {
-  let Config(
-    list_roots: list_roots,
-    notify_cancelled: notify_cancelled,
-    notify_progress: notify_progress,
-    notify_resource_list_changed: notify_resource_list_changed,
-    notify_resource_updated: notify_resource_updated,
-    notify_prompt_list_changed: notify_prompt_list_changed,
-    notify_tool_list_changed: notify_tool_list_changed,
-    notify_logging_message: notify_logging_message,
-    notify_roots_list_changed: notify_roots_list_changed,
-    notify_elicitation_complete: notify_elicitation_complete,
-    notify_task_status: notify_task_status,
-    task_store: tasks,
-    create_message: create_message,
-    sampling_tools: sampling_tools,
-    sampling_context: sampling_context,
-    elicit_form: elicit_form,
-    ..,
-  ) = config
-
-  Config(
-    list_roots,
-    notify_cancelled,
-    notify_progress,
-    notify_resource_list_changed,
-    notify_resource_updated,
-    notify_prompt_list_changed,
-    notify_tool_list_changed,
-    notify_logging_message,
-    notify_roots_list_changed,
-    notify_elicitation_complete,
-    notify_task_status,
-    tasks,
-    create_message,
-    sampling_tools,
-    sampling_context,
-    elicit_form,
-    Some(handler),
+  update_handlers(
+    config,
+    list_roots: None,
+    create_message: None,
+    sampling_tools: None,
+    sampling_context: None,
+    elicit_form: None,
+    elicit_url: Some(handler),
   )
 }
 
@@ -1045,6 +865,65 @@ fn update_callbacks(
     sampling_context,
     elicit_form,
     elicit_url,
+  )
+}
+
+fn update_handlers(
+  config: Config,
+  list_roots list_roots: Option(
+    fn(Option(actions.RequestMeta)) -> Result(List(Root), RpcError),
+  ),
+  create_message create_message: Option(
+    fn(actions.CreateMessageRequestParams) ->
+      Result(CreateMessageHandlerResult, RpcError),
+  ),
+  sampling_tools sampling_tools: Option(fn(Value) -> Result(Nil, RpcError)),
+  sampling_context sampling_context: Option(fn(Value) -> Result(Nil, RpcError)),
+  elicit_form elicit_form: Option(
+    fn(actions.ElicitRequestFormParams) -> Result(ElicitHandlerResult, RpcError),
+  ),
+  elicit_url elicit_url: Option(
+    fn(actions.ElicitRequestUrlParams) -> Result(ElicitHandlerResult, RpcError),
+  ),
+) -> Config {
+  let Config(
+    list_roots: current_list_roots,
+    notify_cancelled: notify_cancelled,
+    notify_progress: notify_progress,
+    notify_resource_list_changed: notify_resource_list_changed,
+    notify_resource_updated: notify_resource_updated,
+    notify_prompt_list_changed: notify_prompt_list_changed,
+    notify_tool_list_changed: notify_tool_list_changed,
+    notify_logging_message: notify_logging_message,
+    notify_roots_list_changed: notify_roots_list_changed,
+    notify_elicitation_complete: notify_elicitation_complete,
+    notify_task_status: notify_task_status,
+    task_store: task_store,
+    create_message: current_create_message,
+    sampling_tools: current_sampling_tools,
+    sampling_context: current_sampling_context,
+    elicit_form: current_elicit_form,
+    elicit_url: current_elicit_url,
+  ) = config
+
+  Config(
+    choose_callback(list_roots, current_list_roots),
+    notify_cancelled,
+    notify_progress,
+    notify_resource_list_changed,
+    notify_resource_updated,
+    notify_prompt_list_changed,
+    notify_tool_list_changed,
+    notify_logging_message,
+    notify_roots_list_changed,
+    notify_elicitation_complete,
+    notify_task_status,
+    task_store,
+    choose_callback(create_message, current_create_message),
+    choose_callback(sampling_tools, current_sampling_tools),
+    choose_callback(sampling_context, current_sampling_context),
+    choose_callback(elicit_form, current_elicit_form),
+    choose_callback(elicit_url, current_elicit_url),
   )
 }
 

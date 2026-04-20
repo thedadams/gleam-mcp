@@ -64,10 +64,7 @@ fn start_store(reply_to: process.Subject(process.Subject(Message))) {
 }
 
 pub fn create(store: Store, ttl_ms: Option(Int)) -> actions.Task {
-  let Store(subject) = store
-  let reply_to = process.new_subject()
-  process.send(subject, Create(ttl_ms, reply_to))
-  expect_ok(process.receive(reply_to, 1000))
+  call(store, fn(reply_to) { Create(ttl_ms, reply_to) })
 }
 
 pub fn complete(
@@ -75,10 +72,7 @@ pub fn complete(
   task_id: String,
   outcome: Result(actions.TaskResult, jsonrpc.RpcError),
 ) -> Result(actions.Task, jsonrpc.RpcError) {
-  let Store(subject) = store
-  let reply_to = process.new_subject()
-  process.send(subject, Complete(task_id, outcome, reply_to))
-  expect_ok(process.receive(reply_to, 1000))
+  call(store, fn(reply_to) { Complete(task_id, outcome, reply_to) })
 }
 
 pub fn update_status(
@@ -87,27 +81,20 @@ pub fn update_status(
   status: actions.TaskStatus,
   status_message: Option(String),
 ) -> Result(actions.Task, jsonrpc.RpcError) {
-  let Store(subject) = store
-  let reply_to = process.new_subject()
-  process.send(subject, UpdateStatus(task_id, status, status_message, reply_to))
-  expect_ok(process.receive(reply_to, 1000))
+  call(store, fn(reply_to) {
+    UpdateStatus(task_id, status, status_message, reply_to)
+  })
 }
 
 pub fn list(store: Store) -> List(actions.Task) {
-  let Store(subject) = store
-  let reply_to = process.new_subject()
-  process.send(subject, List(reply_to))
-  expect_ok(process.receive(reply_to, 1000))
+  call(store, List)
 }
 
 pub fn get(
   store: Store,
   task_id: String,
 ) -> Result(actions.Task, jsonrpc.RpcError) {
-  let Store(subject) = store
-  let reply_to = process.new_subject()
-  process.send(subject, Get(task_id, reply_to))
-  expect_ok(process.receive(reply_to, 1000))
+  call(store, fn(reply_to) { Get(task_id, reply_to) })
 }
 
 pub fn result(
@@ -124,9 +111,13 @@ pub fn cancel(
   store: Store,
   task_id: String,
 ) -> Result(actions.Task, jsonrpc.RpcError) {
+  call(store, fn(reply_to) { Cancel(task_id, reply_to) })
+}
+
+fn call(store: Store, message: fn(process.Subject(reply)) -> Message) -> reply {
   let Store(subject) = store
   let reply_to = process.new_subject()
-  process.send(subject, Cancel(task_id, reply_to))
+  process.send(subject, message(reply_to))
   expect_ok(process.receive(reply_to, 1000))
 }
 
@@ -134,14 +125,12 @@ fn loop(subject: process.Subject(Message), entries: Dict(String, Entry)) -> Nil 
   case process.receive_forever(subject) {
     Create(ttl_ms, reply_to) -> {
       let task =
-        actions.Task(
-          task_id: uuid.v4_string(),
-          status: actions.Working,
-          status_message: None,
-          created_at: default_timestamp,
-          last_updated_at: default_timestamp,
-          ttl_ms: ttl_ms,
-          poll_interval_ms: Some(default_poll_interval_ms),
+        new_task(
+          uuid.v4_string(),
+          actions.Working,
+          None,
+          ttl_ms,
+          Some(default_poll_interval_ms),
         )
       process.send(reply_to, task)
       loop(subject, dict.insert(entries, task.task_id, Entry(task, None, [])))
@@ -202,16 +191,7 @@ fn update_task_status(
     Ok(Entry(task:, outcome:, waiters:)) -> {
       let updated = case is_terminal(task.status) {
         True -> task
-        False ->
-          actions.Task(
-            task_id: task.task_id,
-            status: status,
-            status_message: status_message,
-            created_at: task.created_at,
-            last_updated_at: default_timestamp,
-            ttl_ms: task.ttl_ms,
-            poll_interval_ms: task.poll_interval_ms,
-          )
+        False -> set_task_status(task, status, status_message)
       }
       #(
         dict.insert(entries, task_id, Entry(updated, outcome, waiters)),
@@ -275,14 +255,10 @@ fn cancel_task(
         True -> #(entries, Error(cannot_cancel_error(task)))
         False -> {
           let cancelled =
-            actions.Task(
-              task_id: task.task_id,
-              status: actions.Cancelled,
-              status_message: Some("The task was cancelled by request."),
-              created_at: task.created_at,
-              last_updated_at: default_timestamp,
-              ttl_ms: task.ttl_ms,
-              poll_interval_ms: task.poll_interval_ms,
+            set_task_status(
+              task,
+              actions.Cancelled,
+              Some("The task was cancelled by request."),
             )
           let next_entry = Entry(cancelled, outcome, [])
           notify_waiters(waiters, Error(cancelled_task_error(task_id)))
@@ -331,17 +307,43 @@ fn terminal_task(
     True -> task
     False -> {
       let #(status, status_message) = terminal_status(outcome)
-      actions.Task(
-        task_id: task.task_id,
-        status: status,
-        status_message: status_message,
-        created_at: task.created_at,
-        last_updated_at: default_timestamp,
-        ttl_ms: task.ttl_ms,
-        poll_interval_ms: task.poll_interval_ms,
-      )
+      set_task_status(task, status, status_message)
     }
   }
+}
+
+fn new_task(
+  task_id: String,
+  status: actions.TaskStatus,
+  status_message: Option(String),
+  ttl_ms: Option(Int),
+  poll_interval_ms: Option(Int),
+) -> actions.Task {
+  actions.Task(
+    task_id: task_id,
+    status: status,
+    status_message: status_message,
+    created_at: default_timestamp,
+    last_updated_at: default_timestamp,
+    ttl_ms: ttl_ms,
+    poll_interval_ms: poll_interval_ms,
+  )
+}
+
+fn set_task_status(
+  task: actions.Task,
+  status: actions.TaskStatus,
+  status_message: Option(String),
+) -> actions.Task {
+  actions.Task(
+    task_id: task.task_id,
+    status: status,
+    status_message: status_message,
+    created_at: task.created_at,
+    last_updated_at: default_timestamp,
+    ttl_ms: task.ttl_ms,
+    poll_interval_ms: task.poll_interval_ms,
+  )
 }
 
 fn terminal_status(

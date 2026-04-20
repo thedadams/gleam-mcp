@@ -162,292 +162,258 @@ pub fn list_resources(
   client: Client,
   params: Option(actions.PaginatedRequestParams),
 ) -> #(Client, Result(actions.ListResourcesResult, ClientError)) {
-  let resource_params = case params {
-    Some(p) -> p
-    None -> actions.PaginatedRequestParams(None, None)
-  }
-  send_request(
+  request_paginated(
     client,
     mcp.method_list_resources,
-    Some(actions.ClientRequestListResources(resource_params)),
+    params,
+    actions.ClientRequestListResources,
+    fn(result) {
+      case result {
+        actions.ClientResultListResources(value) -> Some(value)
+        _ -> None
+      }
+    },
   )
-  |> expect_result("resources/list", fn(result) {
-    case result {
-      actions.ClientResultListResources(value) -> Some(value)
-      _ -> None
-    }
-  })
 }
 
 pub fn list_resource_templates(
   client: Client,
   params: Option(actions.PaginatedRequestParams),
 ) -> #(Client, Result(actions.ListResourceTemplatesResult, ClientError)) {
-  let template_params = case params {
-    Some(p) -> p
-    None -> actions.PaginatedRequestParams(None, None)
-  }
-  send_request(
+  request_paginated(
     client,
     mcp.method_list_resource_templates,
-    Some(actions.ClientRequestListResourceTemplates(template_params)),
+    params,
+    actions.ClientRequestListResourceTemplates,
+    fn(result) {
+      case result {
+        actions.ClientResultListResourceTemplates(value) -> Some(value)
+        _ -> None
+      }
+    },
   )
-  |> expect_result("resources/templates/list", fn(result) {
-    case result {
-      actions.ClientResultListResourceTemplates(value) -> Some(value)
-      _ -> None
-    }
-  })
 }
 
 pub fn read_resource(
   client: Client,
   params: actions.ReadResourceRequestParams,
 ) -> #(Client, Result(actions.ReadResourceResult, ClientError)) {
-  send_request(
+  request_action(
     client,
     mcp.method_read_resource,
-    Some(actions.ClientRequestReadResource(params)),
+    actions.ClientRequestReadResource(params),
+    fn(result) {
+      case result {
+        actions.ClientResultReadResource(value) -> Some(value)
+        _ -> None
+      }
+    },
   )
-  |> expect_result("resources/read", fn(result) {
-    case result {
-      actions.ClientResultReadResource(value) -> Some(value)
-      _ -> None
-    }
-  })
 }
 
 pub fn subscribe_resource(
   client: Client,
   params: actions.SubscribeRequestParams,
 ) -> #(Client, Result(Nil, ClientError)) {
-  send_request(
-    client,
-    mcp.method_subscribe_resource,
-    Some(actions.ClientRequestSubscribeResource(params)),
-  )
-  |> expect_empty_result
+  request_empty(client, mcp.method_subscribe_resource, actions.ClientRequestSubscribeResource(params))
 }
 
 pub fn unsubscribe_resource(
   client: Client,
   params: actions.UnsubscribeRequestParams,
 ) -> #(Client, Result(Nil, ClientError)) {
-  send_request(
+  request_empty(
     client,
     mcp.method_unsubscribe_resource,
-    Some(actions.ClientRequestUnsubscribeResource(params)),
+    actions.ClientRequestUnsubscribeResource(params),
   )
-  |> expect_empty_result
 }
 
 pub fn list_prompts(
   client: Client,
   params: Option(actions.PaginatedRequestParams),
 ) -> #(Client, Result(actions.ListPromptsResult, ClientError)) {
-  let prompt_params = case params {
-    Some(p) -> p
-    None -> actions.PaginatedRequestParams(None, None)
-  }
-  send_request(
+  request_paginated(
     client,
     mcp.method_list_prompts,
-    Some(actions.ClientRequestListPrompts(prompt_params)),
+    params,
+    actions.ClientRequestListPrompts,
+    fn(result) {
+      case result {
+        actions.ClientResultListPrompts(value) -> Some(value)
+        _ -> None
+      }
+    },
   )
-  |> expect_result("prompts/list", fn(result) {
-    case result {
-      actions.ClientResultListPrompts(value) -> Some(value)
-      _ -> None
-    }
-  })
 }
 
 pub fn get_prompt(
   client: Client,
   params: actions.GetPromptRequestParams,
 ) -> #(Client, Result(actions.GetPromptResult, ClientError)) {
-  send_request(
+  request_action(
     client,
     mcp.method_get_prompt,
-    Some(actions.ClientRequestGetPrompt(params)),
+    actions.ClientRequestGetPrompt(params),
+    fn(result) {
+      case result {
+        actions.ClientResultGetPrompt(value) -> Some(value)
+        _ -> None
+      }
+    },
   )
-  |> expect_result("prompts/get", fn(result) {
-    case result {
-      actions.ClientResultGetPrompt(value) -> Some(value)
-      _ -> None
-    }
-  })
 }
 
 pub fn list_tools(
   client: Client,
   params: Option(actions.PaginatedRequestParams),
 ) -> #(Client, Result(actions.ListToolsResult, ClientError)) {
-  let request_params = case params {
-    Some(p) -> p
-    None -> actions.PaginatedRequestParams(None, None)
-  }
-  send_request(
+  request_paginated(
     client,
     mcp.method_list_tools,
-    Some(actions.ClientRequestListTools(request_params)),
+    params,
+    actions.ClientRequestListTools,
+    fn(result) {
+      case result {
+        actions.ClientResultListTools(value) -> Some(value)
+        _ -> None
+      }
+    },
   )
-  |> expect_result("tools/list", fn(result) {
-    case result {
-      actions.ClientResultListTools(value) -> Some(value)
-      _ -> None
-    }
-  })
 }
 
 pub fn call_tool(
   client: Client,
   params: actions.CallToolRequestParams,
 ) -> #(Client, Result(actions.CallToolResponse, ClientError)) {
-  send_request(
+  request_action(
     client,
     mcp.method_call_tool,
-    Some(actions.ClientRequestCallTool(params)),
+    actions.ClientRequestCallTool(params),
+    fn(result) {
+      case result {
+        actions.ClientResultCallTool(res) -> Some(actions.CallTool(res))
+        actions.ClientResultCreateTask(res) -> Some(actions.CallToolTask(res))
+        _ -> None
+      }
+    },
   )
-  |> expect_result("tools/call", fn(result) {
-    case result {
-      actions.ClientResultCallTool(res) -> Some(actions.CallTool(res))
-      actions.ClientResultCreateTask(res) -> Some(actions.CallToolTask(res))
-      _ -> None
-    }
-  })
 }
 
 pub fn complete(
   client: Client,
   params: actions.CompleteRequestParams,
 ) -> #(Client, Result(actions.CompleteResult, ClientError)) {
-  send_request(
+  request_action(
     client,
     mcp.method_complete,
-    Some(actions.ClientRequestComplete(params)),
+    actions.ClientRequestComplete(params),
+    fn(result) {
+      case result {
+        actions.ClientResultComplete(value) -> Some(value)
+        _ -> None
+      }
+    },
   )
-  |> expect_result("completion/complete", fn(result) {
-    case result {
-      actions.ClientResultComplete(value) -> Some(value)
-      _ -> None
-    }
-  })
 }
 
 pub fn set_logging_level(
   client: Client,
   params: actions.SetLevelRequestParams,
 ) -> #(Client, Result(Nil, ClientError)) {
-  send_request(
-    client,
-    mcp.method_set_logging_level,
-    Some(actions.ClientRequestSetLoggingLevel(params)),
-  )
-  |> expect_empty_result
+  request_empty(client, mcp.method_set_logging_level, actions.ClientRequestSetLoggingLevel(params))
 }
 
 pub fn list_tasks(
   client: Client,
   params: Option(actions.PaginatedRequestParams),
 ) -> #(Client, Result(actions.ListTasksResult, ClientError)) {
-  let request_params = case params {
-    Some(p) -> p
-    None -> actions.PaginatedRequestParams(None, None)
-  }
-  send_request(
+  request_paginated(
     client,
     mcp.method_list_tasks,
-    Some(actions.ClientRequestListTasks(request_params)),
+    params,
+    actions.ClientRequestListTasks,
+    fn(result) {
+      case result {
+        actions.ClientResultListTasks(value) -> Some(value)
+        _ -> None
+      }
+    },
   )
-  |> expect_result("tasks/list", fn(result) {
-    case result {
-      actions.ClientResultListTasks(value) -> Some(value)
-      _ -> None
-    }
-  })
 }
 
 pub fn get_task(
   client: Client,
   params: actions.TaskIdParams,
 ) -> #(Client, Result(actions.GetTaskResult, ClientError)) {
-  send_request(
+  request_action(
     client,
     mcp.method_get_task,
-    Some(actions.ClientRequestGetTask(params)),
+    actions.ClientRequestGetTask(params),
+    fn(result) {
+      case result {
+        actions.ClientResultGetTask(value) -> Some(value)
+        _ -> None
+      }
+    },
   )
-  |> expect_result("tasks/get", fn(result) {
-    case result {
-      actions.ClientResultGetTask(value) -> Some(value)
-      _ -> None
-    }
-  })
 }
 
 pub fn get_task_result(
   client: Client,
   params: actions.TaskIdParams,
 ) -> #(Client, Result(actions.TaskResult, ClientError)) {
-  send_request(
+  request_action(
     client,
     mcp.method_get_task_result,
-    Some(actions.ClientRequestGetTaskResult(params)),
+    actions.ClientRequestGetTaskResult(params),
+    fn(result) {
+      case result {
+        actions.ClientResultTaskResult(value) -> Some(value)
+        _ -> None
+      }
+    },
   )
-  |> expect_result("tasks/result", fn(result) {
-    case result {
-      actions.ClientResultTaskResult(value) -> Some(value)
-      _ -> None
-    }
-  })
 }
 
 pub fn cancel_task(
   client: Client,
   params: actions.TaskIdParams,
 ) -> #(Client, Result(actions.CancelTaskResult, ClientError)) {
-  send_request(
+  request_action(
     client,
     mcp.method_cancel_task,
-    Some(actions.ClientRequestCancelTask(params)),
+    actions.ClientRequestCancelTask(params),
+    fn(result) {
+      case result {
+        actions.ClientResultCancelTask(value) -> Some(value)
+        _ -> None
+      }
+    },
   )
-  |> expect_result("tasks/cancel", fn(result) {
-    case result {
-      actions.ClientResultCancelTask(value) -> Some(value)
-      _ -> None
-    }
-  })
 }
 
 pub fn cancelled(
   client: Client,
   params: actions.CancelledNotificationParams,
 ) -> #(Client, Result(Nil, ClientError)) {
-  send_notification(
-    client,
-    mcp.method_notify_cancelled,
-    Some(actions.NotifyCancelled(params)),
-  )
+  notify_action(client, mcp.method_notify_cancelled, actions.NotifyCancelled(params))
 }
 
 pub fn progress(
   client: Client,
   params: actions.ProgressNotificationParams,
 ) -> #(Client, Result(Nil, ClientError)) {
-  send_notification(
-    client,
-    mcp.method_notify_progress,
-    Some(actions.NotifyProgress(params)),
-  )
+  notify_action(client, mcp.method_notify_progress, actions.NotifyProgress(params))
 }
 
 pub fn resource_list_changed(
   client: Client,
 ) -> #(Client, Result(Nil, ClientError)) {
-  send_notification(
+  notify_action(
     client,
     mcp.method_notify_resource_list_changed,
-    Some(actions.NotifyResourceListChanged(None)),
+    actions.NotifyResourceListChanged(None),
   )
 }
 
@@ -455,28 +421,28 @@ pub fn resource_updated(
   client: Client,
   params: actions.ResourceUpdatedNotificationParams,
 ) -> #(Client, Result(Nil, ClientError)) {
-  send_notification(
+  notify_action(
     client,
     mcp.method_notify_resource_updated,
-    Some(actions.NotifyResourceUpdated(params)),
+    actions.NotifyResourceUpdated(params),
   )
 }
 
 pub fn prompt_list_changed(
   client: Client,
 ) -> #(Client, Result(Nil, ClientError)) {
-  send_notification(
+  notify_action(
     client,
     mcp.method_notify_prompts_list_changed,
-    Some(actions.NotifyPromptListChanged(None)),
+    actions.NotifyPromptListChanged(None),
   )
 }
 
 pub fn tool_list_changed(client: Client) -> #(Client, Result(Nil, ClientError)) {
-  send_notification(
+  notify_action(
     client,
     mcp.method_notify_tools_list_changed,
-    Some(actions.NotifyToolListChanged(None)),
+    actions.NotifyToolListChanged(None),
   )
 }
 
@@ -484,18 +450,18 @@ pub fn logging_message(
   client: Client,
   params: actions.LoggingMessageNotificationParams,
 ) -> #(Client, Result(Nil, ClientError)) {
-  send_notification(
+  notify_action(
     client,
     mcp.method_notify_logging_message,
-    Some(actions.NotifyLoggingMessage(params)),
+    actions.NotifyLoggingMessage(params),
   )
 }
 
 pub fn roots_list_changed(client: Client) -> #(Client, Result(Nil, ClientError)) {
-  send_notification(
+  notify_action(
     client,
     mcp.method_notify_roots_list_changed,
-    Some(actions.NotifyRootsListChanged(None)),
+    actions.NotifyRootsListChanged(None),
   )
 }
 
@@ -503,10 +469,10 @@ pub fn elicitation_complete(
   client: Client,
   params: actions.ElicitationCompleteNotificationParams,
 ) -> #(Client, Result(Nil, ClientError)) {
-  send_notification(
+  notify_action(
     client,
     mcp.method_notify_elicitation_complete,
-    Some(actions.NotifyElicitationComplete(params)),
+    actions.NotifyElicitationComplete(params),
   )
 }
 
@@ -514,11 +480,53 @@ pub fn task_status(
   client: Client,
   params: actions.TaskStatusNotificationParams,
 ) -> #(Client, Result(Nil, ClientError)) {
-  send_notification(
-    client,
-    mcp.method_notify_task_status,
-    Some(actions.NotifyTaskStatus(params)),
-  )
+  notify_action(client, mcp.method_notify_task_status, actions.NotifyTaskStatus(params))
+}
+
+fn request_paginated(
+  client: Client,
+  method: String,
+  params: Option(actions.PaginatedRequestParams),
+  wrap: fn(actions.PaginatedRequestParams) -> actions.ClientActionRequest,
+  extract: fn(actions.ClientActionResult) -> Option(result),
+) -> #(Client, Result(result, ClientError)) {
+  request_action(client, method, wrap(default_paginated_params(params)), extract)
+}
+
+fn request_action(
+  client: Client,
+  method: String,
+  action: actions.ClientActionRequest,
+  extract: fn(actions.ClientActionResult) -> Option(result),
+) -> #(Client, Result(result, ClientError)) {
+  send_request(client, method, Some(action))
+  |> expect_result(method, extract)
+}
+
+fn request_empty(
+  client: Client,
+  method: String,
+  action: actions.ClientActionRequest,
+) -> #(Client, Result(Nil, ClientError)) {
+  send_request(client, method, Some(action))
+  |> expect_empty_result
+}
+
+fn notify_action(
+  client: Client,
+  method: String,
+  action: ActionNotification,
+) -> #(Client, Result(Nil, ClientError)) {
+  send_notification(client, method, Some(action))
+}
+
+fn default_paginated_params(
+  params: Option(actions.PaginatedRequestParams),
+) -> actions.PaginatedRequestParams {
+  case params {
+    Some(value) -> value
+    None -> actions.PaginatedRequestParams(None, None)
+  }
 }
 
 fn expect_empty_result(

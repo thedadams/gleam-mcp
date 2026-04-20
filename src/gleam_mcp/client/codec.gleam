@@ -7,6 +7,7 @@ import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
 import gleam_mcp/actions
+import gleam_mcp/codec_common
 import gleam_mcp/jsonrpc
 import gleam_mcp/mcp
 
@@ -663,44 +664,7 @@ fn encode_client_task_request_capabilities(
 }
 
 fn encode_implementation(implementation: actions.Implementation) -> json.Json {
-  let actions.Implementation(
-    name,
-    version,
-    title,
-    description,
-    website_url,
-    icons,
-  ) = implementation
-
-  [#("name", json.string(name)), #("version", json.string(version))]
-  |> append_optional("title", option_map(title, json.string))
-  |> append_optional("description", option_map(description, json.string))
-  |> append_optional("websiteUrl", option_map(website_url, json.string))
-  |> append_optional("icons", case icons {
-    [] -> None
-    _ -> Some(json.array(icons, encode_icon))
-  })
-  |> json.object
-}
-
-fn encode_icon(icon: actions.Icon) -> json.Json {
-  let actions.Icon(src, mime_type, sizes, theme) = icon
-
-  [#("src", json.string(src))]
-  |> append_optional("mimeType", option_map(mime_type, json.string))
-  |> append_optional("sizes", case sizes {
-    [] -> None
-    _ -> Some(json.array(sizes, json.string))
-  })
-  |> append_optional("theme", option_map(theme, encode_icon_theme))
-  |> json.object
-}
-
-fn encode_icon_theme(theme: actions.IconTheme) -> json.Json {
-  case theme {
-    actions.LightTheme -> json.string("light")
-    actions.DarkTheme -> json.string("dark")
-  }
+  codec_common.encode_implementation(implementation)
 }
 
 fn encode_task_metadata(metadata: actions.TaskMetadata) -> json.Json {
@@ -820,13 +784,7 @@ fn encode_sampling_content(content: actions.SamplingContent) -> json.Json {
 fn encode_sampling_message_content_block(
   block: actions.SamplingMessageContentBlock,
 ) -> json.Json {
-  case block {
-    actions.SamplingText(content) -> encode_text_content(content)
-    actions.SamplingImage(content) -> encode_image_content(content)
-    actions.SamplingAudio(content) -> encode_audio_content(content)
-    actions.SamplingToolUse(content) -> encode_tool_use_content(content)
-    actions.SamplingToolResult(content) -> encode_tool_result_content(content)
-  }
+  codec_common.encode_sampling_message_content_block(block)
 }
 
 fn encode_tool_choice(choice: actions.ToolChoice) -> json.Json {
@@ -847,223 +805,11 @@ fn encode_tool_choice(choice: actions.ToolChoice) -> json.Json {
 }
 
 fn encode_tool(tool: actions.Tool) -> json.Json {
-  let actions.Tool(
-    name,
-    title,
-    description,
-    input_schema,
-    execution,
-    output_schema,
-    annotations,
-    icons,
-    meta,
-  ) = tool
-
-  [#("name", json.string(name)), #("inputSchema", encode_value(input_schema))]
-  |> append_optional("title", option_map(title, json.string))
-  |> append_optional("description", option_map(description, json.string))
-  |> append_optional("execution", option_map(execution, encode_tool_execution))
-  |> append_optional("outputSchema", option_map(output_schema, encode_value))
-  |> append_optional(
-    "annotations",
-    option_map(annotations, encode_tool_annotations),
-  )
-  |> append_optional("icons", case icons {
-    [] -> None
-    _ -> Some(json.array(icons, encode_icon))
-  })
-  |> append_optional("_meta", option_map(meta, encode_meta))
-  |> json.object
-}
-
-fn encode_tool_execution(execution: actions.ToolExecution) -> json.Json {
-  let actions.ToolExecution(task_support) = execution
-
-  []
-  |> append_optional(
-    "taskSupport",
-    option_map(task_support, fn(task_support) {
-      case task_support {
-        actions.TaskForbidden -> json.string("forbidden")
-        actions.TaskOptional -> json.string("optional")
-        actions.TaskRequired -> json.string("required")
-      }
-    }),
-  )
-  |> json.object
-}
-
-fn encode_tool_annotations(annotations: actions.ToolAnnotations) -> json.Json {
-  let actions.ToolAnnotations(
-    title,
-    read_only_hint,
-    destructive_hint,
-    idempotent_hint,
-    open_world_hint,
-  ) = annotations
-
-  []
-  |> append_optional("title", option_map(title, json.string))
-  |> append_optional("readOnlyHint", option_map(read_only_hint, json.bool))
-  |> append_optional("destructiveHint", option_map(destructive_hint, json.bool))
-  |> append_optional("idempotentHint", option_map(idempotent_hint, json.bool))
-  |> append_optional("openWorldHint", option_map(open_world_hint, json.bool))
-  |> json.object
-}
-
-fn encode_tool_use_content(content: actions.ToolUseContent) -> json.Json {
-  let actions.ToolUseContent(id, name, input, meta) = content
-
-  [
-    #("type", json.string("tool_use")),
-    #("id", json.string(id)),
-    #("name", json.string(name)),
-    #(
-      "input",
-      dict.to_list(input)
-        |> list.map(fn(entry) {
-          let #(key, value) = entry
-          #(key, encode_value(value))
-        })
-        |> json.object,
-    ),
-  ]
-  |> append_optional("_meta", option_map(meta, encode_meta))
-  |> json.object
-}
-
-fn encode_tool_result_content(content: actions.ToolResultContent) -> json.Json {
-  let actions.ToolResultContent(
-    tool_use_id,
-    blocks,
-    structured_content,
-    is_error,
-    meta,
-  ) = content
-
-  [
-    #("type", json.string("tool_result")),
-    #("toolUseId", json.string(tool_use_id)),
-    #("content", json.array(blocks, encode_content_block)),
-  ]
-  |> append_optional(
-    "structuredContent",
-    option_map(structured_content, fn(fields) {
-      dict.to_list(fields)
-      |> list.map(fn(entry) {
-        let #(key, value) = entry
-        #(key, encode_value(value))
-      })
-      |> json.object
-    }),
-  )
-  |> append_optional("isError", option_map(is_error, json.bool))
-  |> append_optional("_meta", option_map(meta, encode_meta))
-  |> json.object
-}
-
-fn encode_content_block(block: actions.ContentBlock) -> json.Json {
-  case block {
-    actions.TextBlock(content) -> encode_text_content(content)
-    actions.ImageBlock(content) -> encode_image_content(content)
-    actions.AudioBlock(content) -> encode_audio_content(content)
-    actions.ResourceLinkBlock(link) -> encode_resource_link(link)
-    actions.EmbeddedResourceBlock(resource) ->
-      encode_embedded_resource(resource)
-  }
-}
-
-fn encode_text_content(content: actions.TextContent) -> json.Json {
-  let actions.TextContent(text, annotations, meta) = content
-
-  [#("type", json.string("text")), #("text", json.string(text))]
-  |> append_optional("annotations", option_map(annotations, encode_annotations))
-  |> append_optional("_meta", option_map(meta, encode_meta))
-  |> json.object
-}
-
-fn encode_image_content(content: actions.ImageContent) -> json.Json {
-  let actions.ImageContent(data, mime_type, annotations, meta) = content
-
-  [
-    #("type", json.string("image")),
-    #("data", json.string(data)),
-    #("mimeType", json.string(mime_type)),
-  ]
-  |> append_optional("annotations", option_map(annotations, encode_annotations))
-  |> append_optional("_meta", option_map(meta, encode_meta))
-  |> json.object
-}
-
-fn encode_audio_content(content: actions.AudioContent) -> json.Json {
-  let actions.AudioContent(data, mime_type, annotations, meta) = content
-
-  [
-    #("type", json.string("audio")),
-    #("data", json.string(data)),
-    #("mimeType", json.string(mime_type)),
-  ]
-  |> append_optional("annotations", option_map(annotations, encode_annotations))
-  |> append_optional("_meta", option_map(meta, encode_meta))
-  |> json.object
-}
-
-fn encode_resource_link(link: actions.ResourceLink) -> json.Json {
-  let actions.ResourceLink(resource) = link
-  resource_fields(resource)
-  |> prepend_field(#("type", json.string("resource_link")))
-  |> json.object
-}
-
-fn encode_embedded_resource(resource: actions.EmbeddedResource) -> json.Json {
-  let actions.EmbeddedResource(resource, annotations, meta) = resource
-
-  [
-    #("type", json.string("resource")),
-    #("resource", encode_resource_contents(resource)),
-  ]
-  |> append_optional("annotations", option_map(annotations, encode_annotations))
-  |> append_optional("_meta", option_map(meta, encode_meta))
-  |> json.object
-}
-
-fn encode_resource_contents(contents: actions.ResourceContents) -> json.Json {
-  case contents {
-    actions.TextResourceContents(uri, mime_type, text, meta) ->
-      [#("uri", json.string(uri)), #("text", json.string(text))]
-      |> append_optional("mimeType", option_map(mime_type, json.string))
-      |> append_optional("_meta", option_map(meta, encode_meta))
-      |> json.object
-    actions.BlobResourceContents(uri, mime_type, blob, meta) ->
-      [#("uri", json.string(uri)), #("blob", json.string(blob))]
-      |> append_optional("mimeType", option_map(mime_type, json.string))
-      |> append_optional("_meta", option_map(meta, encode_meta))
-      |> json.object
-  }
-}
-
-fn encode_annotations(annotations: actions.Annotations) -> json.Json {
-  let actions.Annotations(audience, priority, last_modified) = annotations
-
-  []
-  |> append_optional("audience", case audience {
-    [] -> None
-    _ -> Some(json.array(audience, encode_role))
-  })
-  |> append_optional("priority", option_map(priority, json.float))
-  |> append_optional("lastModified", option_map(last_modified, json.string))
-  |> json.object
+  codec_common.encode_tool(tool)
 }
 
 fn encode_meta(meta: actions.Meta) -> json.Json {
-  let actions.Meta(fields) = meta
-
-  dict.to_list(fields)
-  |> list.map(fn(entry) {
-    let #(key, value) = entry
-    #(key, encode_value(value))
-  })
-  |> json.object
+  codec_common.encode_meta(meta)
 }
 
 fn encode_role(role: actions.Role) -> json.Json {
@@ -1074,43 +820,19 @@ fn encode_role(role: actions.Role) -> json.Json {
 }
 
 fn encode_cursor(cursor: actions.Cursor) -> json.Json {
-  let actions.Cursor(value) = cursor
-  json.string(value)
+  codec_common.encode_cursor(cursor)
 }
 
 fn encode_task_status(status: actions.TaskStatus) -> json.Json {
-  case status {
-    actions.Working -> json.string("working")
-    actions.InputRequired -> json.string("input_required")
-    actions.Completed -> json.string("completed")
-    actions.Failed -> json.string("failed")
-    actions.Cancelled -> json.string("cancelled")
-  }
+  codec_common.encode_task_status(status)
 }
 
 fn encode_value(value: jsonrpc.Value) -> json.Json {
-  case value {
-    jsonrpc.VNull -> json.null()
-    jsonrpc.VString(value) -> json.string(value)
-    jsonrpc.VInt(value) -> json.int(value)
-    jsonrpc.VFloat(value) -> json.float(value)
-    jsonrpc.VBool(value) -> json.bool(value)
-    jsonrpc.VArray(values) -> json.array(values, encode_value)
-    jsonrpc.VObject(values) ->
-      values
-      |> list.map(fn(entry) {
-        let #(key, value) = entry
-        #(key, encode_value(value))
-      })
-      |> json.object
-  }
+  codec_common.encode_value(value)
 }
 
 fn encode_request_id(id: jsonrpc.RequestId) -> json.Json {
-  case id {
-    jsonrpc.IntId(value) -> json.int(value)
-    jsonrpc.StringId(value) -> json.string(value)
-  }
+  codec_common.encode_request_id(id)
 }
 
 fn response_decoder(
@@ -1203,207 +925,146 @@ fn server_message_decoder() -> decode.Decoder(ServerMessage) {
 }
 
 fn ping_message_decoder() -> decode.Decoder(ServerMessage) {
-  decode_server_request_message(
+  decode_optional_server_request_message(
     mcp.method_ping,
-    {
-      use params <- decode.optional_field(
-        "params",
-        None,
-        decode.optional(request_meta_decoder()),
-      )
-      decode.success(params)
-    },
-    fn(params) { actions.ServerRequestPing(params) },
+    None,
+    decode.optional(request_meta_decoder()),
+    actions.ServerRequestPing,
   )
 }
 
 fn list_roots_message_decoder() -> decode.Decoder(ServerMessage) {
-  decode_server_request_message(
+  decode_optional_server_request_message(
     mcp.method_list_roots,
-    {
-      use params <- decode.optional_field(
-        "params",
-        None,
-        decode.optional(request_meta_decoder()),
-      )
-      decode.success(params)
-    },
-    fn(params) { actions.ServerRequestListRoots(params) },
+    None,
+    decode.optional(request_meta_decoder()),
+    actions.ServerRequestListRoots,
   )
 }
 
 fn create_message_message_decoder() -> decode.Decoder(ServerMessage) {
-  decode_server_request_message(
+  decode_required_server_request_message(
     mcp.method_create_message,
-    {
-      use params <- decode.field(
-        "params",
-        create_message_request_params_decoder(),
-      )
-      decode.success(params)
-    },
-    fn(params) { actions.ServerRequestCreateMessage(params) },
+    create_message_request_params_decoder(),
+    actions.ServerRequestCreateMessage,
   )
 }
 
 fn elicit_message_decoder() -> decode.Decoder(ServerMessage) {
-  decode_server_request_message(
+  decode_required_server_request_message(
     mcp.method_elicit,
-    {
-      use params <- decode.field("params", elicit_request_params_decoder())
-      decode.success(params)
-    },
-    fn(params) { actions.ServerRequestElicit(params) },
+    elicit_request_params_decoder(),
+    actions.ServerRequestElicit,
   )
 }
 
 fn list_tasks_message_decoder() -> decode.Decoder(ServerMessage) {
-  decode_server_request_message(
+  decode_optional_server_request_message(
     mcp.method_list_tasks,
-    {
-      use params <- decode.optional_field(
-        "params",
-        actions.PaginatedRequestParams(None, None),
-        paginated_request_params_decoder(),
-      )
-      decode.success(params)
-    },
-    fn(params) { actions.ServerRequestListTasks(params) },
+    actions.PaginatedRequestParams(None, None),
+    paginated_request_params_decoder(),
+    actions.ServerRequestListTasks,
   )
 }
 
 fn get_task_message_decoder() -> decode.Decoder(ServerMessage) {
-  decode_server_request_message(
+  decode_required_server_request_message(
     mcp.method_get_task,
-    {
-      use params <- decode.field("params", task_id_params_decoder())
-      decode.success(params)
-    },
-    fn(params) { actions.ServerRequestGetTask(params) },
+    task_id_params_decoder(),
+    actions.ServerRequestGetTask,
   )
 }
 
 fn get_task_result_message_decoder() -> decode.Decoder(ServerMessage) {
-  decode_server_request_message(
+  decode_required_server_request_message(
     mcp.method_get_task_result,
-    {
-      use params <- decode.field("params", task_id_params_decoder())
-      decode.success(params)
-    },
-    fn(params) { actions.ServerRequestGetTaskResult(params) },
+    task_id_params_decoder(),
+    actions.ServerRequestGetTaskResult,
   )
 }
 
 fn cancel_task_message_decoder() -> decode.Decoder(ServerMessage) {
-  decode_server_request_message(
+  decode_required_server_request_message(
     mcp.method_cancel_task,
-    {
-      use params <- decode.field("params", task_id_params_decoder())
-      decode.success(params)
-    },
-    fn(params) { actions.ServerRequestCancelTask(params) },
+    task_id_params_decoder(),
+    actions.ServerRequestCancelTask,
   )
 }
 
 fn roots_list_changed_notification_decoder() -> decode.Decoder(ServerMessage) {
-  decode_server_notification_message(mcp.method_notify_roots_list_changed, {
-    use meta <- decode.optional_field(
-      "params",
-      None,
-      notification_meta_only_decoder(),
-    )
-    decode.success(actions.NotifyRootsListChanged(meta))
-  })
+  decode_meta_server_notification_message(
+    mcp.method_notify_roots_list_changed,
+    actions.NotifyRootsListChanged,
+  )
 }
 
 fn cancelled_notification_decoder() -> decode.Decoder(ServerMessage) {
-  decode_server_notification_message(mcp.method_notify_cancelled, {
-    use params <- decode.field(
-      "params",
-      cancelled_notification_params_decoder(),
-    )
-    decode.success(actions.NotifyCancelled(params))
-  })
+  decode_required_server_notification_message(
+    mcp.method_notify_cancelled,
+    cancelled_notification_params_decoder(),
+    actions.NotifyCancelled,
+  )
 }
 
 fn progress_notification_decoder() -> decode.Decoder(ServerMessage) {
-  decode_server_notification_message(mcp.method_notify_progress, {
-    use params <- decode.field("params", progress_notification_params_decoder())
-    decode.success(actions.NotifyProgress(params))
-  })
+  decode_required_server_notification_message(
+    mcp.method_notify_progress,
+    progress_notification_params_decoder(),
+    actions.NotifyProgress,
+  )
 }
 
 fn resource_list_changed_notification_decoder() -> decode.Decoder(ServerMessage) {
-  decode_server_notification_message(mcp.method_notify_resource_list_changed, {
-    use meta <- decode.optional_field(
-      "params",
-      None,
-      notification_meta_only_decoder(),
-    )
-    decode.success(actions.NotifyResourceListChanged(meta))
-  })
+  decode_meta_server_notification_message(
+    mcp.method_notify_resource_list_changed,
+    actions.NotifyResourceListChanged,
+  )
 }
 
 fn resource_updated_notification_decoder() -> decode.Decoder(ServerMessage) {
-  decode_server_notification_message(mcp.method_notify_resource_updated, {
-    use params <- decode.field(
-      "params",
-      resource_updated_notification_params_decoder(),
-    )
-    decode.success(actions.NotifyResourceUpdated(params))
-  })
+  decode_required_server_notification_message(
+    mcp.method_notify_resource_updated,
+    resource_updated_notification_params_decoder(),
+    actions.NotifyResourceUpdated,
+  )
 }
 
 fn prompt_list_changed_notification_decoder() -> decode.Decoder(ServerMessage) {
-  decode_server_notification_message(mcp.method_notify_prompts_list_changed, {
-    use meta <- decode.optional_field(
-      "params",
-      None,
-      notification_meta_only_decoder(),
-    )
-    decode.success(actions.NotifyPromptListChanged(meta))
-  })
+  decode_meta_server_notification_message(
+    mcp.method_notify_prompts_list_changed,
+    actions.NotifyPromptListChanged,
+  )
 }
 
 fn tool_list_changed_notification_decoder() -> decode.Decoder(ServerMessage) {
-  decode_server_notification_message(mcp.method_notify_tools_list_changed, {
-    use meta <- decode.optional_field(
-      "params",
-      None,
-      notification_meta_only_decoder(),
-    )
-    decode.success(actions.NotifyToolListChanged(meta))
-  })
+  decode_meta_server_notification_message(
+    mcp.method_notify_tools_list_changed,
+    actions.NotifyToolListChanged,
+  )
 }
 
 fn logging_message_notification_decoder() -> decode.Decoder(ServerMessage) {
-  decode_server_notification_message(mcp.method_notify_logging_message, {
-    use params <- decode.field(
-      "params",
-      logging_message_notification_params_decoder(),
-    )
-    decode.success(actions.NotifyLoggingMessage(params))
-  })
+  decode_required_server_notification_message(
+    mcp.method_notify_logging_message,
+    logging_message_notification_params_decoder(),
+    actions.NotifyLoggingMessage,
+  )
 }
 
 fn elicitation_complete_notification_decoder() -> decode.Decoder(ServerMessage) {
-  decode_server_notification_message(mcp.method_notify_elicitation_complete, {
-    use params <- decode.field(
-      "params",
-      elicitation_complete_notification_params_decoder(),
-    )
-    decode.success(actions.NotifyElicitationComplete(params))
-  })
+  decode_required_server_notification_message(
+    mcp.method_notify_elicitation_complete,
+    elicitation_complete_notification_params_decoder(),
+    actions.NotifyElicitationComplete,
+  )
 }
 
 fn task_status_notification_decoder() -> decode.Decoder(ServerMessage) {
-  decode_server_notification_message(mcp.method_notify_task_status, {
-    use params <- decode.field(
-      "params",
-      task_status_notification_params_decoder(),
-    )
-    decode.success(actions.NotifyTaskStatus(params))
-  })
+  decode_required_server_notification_message(
+    mcp.method_notify_task_status,
+    task_status_notification_params_decoder(),
+    actions.NotifyTaskStatus,
+  )
 }
 
 fn decode_server_notification_message(
@@ -1435,6 +1096,65 @@ fn decode_server_notification_message(
       })
     },
   )
+}
+
+fn decode_required_server_request_message(
+  method: String,
+  decoder: decode.Decoder(params),
+  wrap: fn(params) -> actions.ServerActionRequest,
+) -> decode.Decoder(ServerMessage) {
+  decode_server_request_message(method, required_params_decoder(decoder), wrap)
+}
+
+fn decode_optional_server_request_message(
+  method: String,
+  default: params,
+  decoder: decode.Decoder(params),
+  wrap: fn(params) -> actions.ServerActionRequest,
+) -> decode.Decoder(ServerMessage) {
+  decode_server_request_message(
+    method,
+    optional_params_decoder(default, decoder),
+    wrap,
+  )
+}
+
+fn decode_required_server_notification_message(
+  method: String,
+  decoder: decode.Decoder(params),
+  wrap: fn(params) -> actions.ActionNotification,
+) -> decode.Decoder(ServerMessage) {
+  decode_server_notification_message(
+    method,
+    decode.map(required_params_decoder(decoder), wrap),
+  )
+}
+
+fn decode_meta_server_notification_message(
+  method: String,
+  wrap: fn(Option(actions.NotificationMeta)) -> actions.ActionNotification,
+) -> decode.Decoder(ServerMessage) {
+  decode_server_notification_message(
+    method,
+    decode.map(optional_params_decoder(None, notification_meta_only_decoder()), wrap),
+  )
+}
+
+fn required_params_decoder(decoder: decode.Decoder(a)) -> decode.Decoder(a) {
+  {
+    use params <- decode.field("params", decoder)
+    decode.success(params)
+  }
+}
+
+fn optional_params_decoder(
+  default: a,
+  decoder: decode.Decoder(a),
+) -> decode.Decoder(a) {
+  {
+    use params <- decode.optional_field("params", default, decoder)
+    decode.success(params)
+  }
 }
 
 fn notification_method(notification: actions.ActionNotification) -> String {
@@ -1630,58 +1350,26 @@ fn result_response_decoder(
   original_id: jsonrpc.RequestId,
   decoder result_decoder: decode.Decoder(actions.ClientActionResult),
 ) -> decode.Decoder(jsonrpc.Response(actions.ClientActionResult)) {
-  {
-    use version <- decode.field("jsonrpc", decode.string)
-    use _id <- decode.field("id", request_id_decoder())
-    use result <- decode.field("result", result_decoder)
-    let _ = version
-    decode.success(jsonrpc.ResultResponse(original_id, result))
-  }
+  successful_response_decoder(original_id, result_decoder)
 }
 
 fn error_response_decoder() -> decode.Decoder(
   jsonrpc.Response(actions.ClientActionResult),
 ) {
-  {
-    use version <- decode.field("jsonrpc", decode.string)
-    use id <- decode.optional_field(
-      "id",
-      None,
-      decode.optional(request_id_decoder()),
-    )
-    use error <- decode.field("error", error_decoder())
-    let _ = version
-    decode.success(jsonrpc.ErrorResponse(id, error))
-  }
+  failed_response_decoder()
 }
 
 fn server_result_response_decoder(
   original_id: jsonrpc.RequestId,
   decoder result_decoder: decode.Decoder(actions.ServerActionResult),
 ) -> decode.Decoder(jsonrpc.Response(actions.ServerActionResult)) {
-  {
-    use version <- decode.field("jsonrpc", decode.string)
-    use _id <- decode.field("id", request_id_decoder())
-    use result <- decode.field("result", result_decoder)
-    let _ = version
-    decode.success(jsonrpc.ResultResponse(original_id, result))
-  }
+  successful_response_decoder(original_id, result_decoder)
 }
 
 fn server_error_response_decoder() -> decode.Decoder(
   jsonrpc.Response(actions.ServerActionResult),
 ) {
-  {
-    use version <- decode.field("jsonrpc", decode.string)
-    use id <- decode.optional_field(
-      "id",
-      None,
-      decode.optional(request_id_decoder()),
-    )
-    use error <- decode.field("error", error_decoder())
-    let _ = version
-    decode.success(jsonrpc.ErrorResponse(id, error))
-  }
+  failed_response_decoder()
 }
 
 fn action_result_decoder(
@@ -1780,11 +1468,44 @@ fn server_action_result_decoder(
 }
 
 fn empty_result_decoder() -> decode.Decoder(actions.ClientActionResult) {
-  decode.map(meta_only_decoder(), actions.ClientResultEmpty)
+  meta_result_decoder(actions.ClientResultEmpty)
 }
 
 fn server_empty_result_decoder() -> decode.Decoder(actions.ServerActionResult) {
-  decode.map(meta_only_decoder(), actions.ServerResultEmpty)
+  meta_result_decoder(actions.ServerResultEmpty)
+}
+
+fn successful_response_decoder(
+  original_id: jsonrpc.RequestId,
+  result_decoder: decode.Decoder(result),
+) -> decode.Decoder(jsonrpc.Response(result)) {
+  {
+    use version <- decode.field("jsonrpc", decode.string)
+    use _id <- decode.field("id", request_id_decoder())
+    use result <- decode.field("result", result_decoder)
+    let _ = version
+    decode.success(jsonrpc.ResultResponse(original_id, result))
+  }
+}
+
+fn failed_response_decoder() -> decode.Decoder(jsonrpc.Response(result)) {
+  {
+    use version <- decode.field("jsonrpc", decode.string)
+    use id <- decode.optional_field(
+      "id",
+      None,
+      decode.optional(request_id_decoder()),
+    )
+    use error <- decode.field("error", error_decoder())
+    let _ = version
+    decode.success(jsonrpc.ErrorResponse(id, error))
+  }
+}
+
+fn meta_result_decoder(
+  wrap: fn(Option(actions.Meta)) -> result,
+) -> decode.Decoder(result) {
+  decode.map(meta_only_decoder(), wrap)
 }
 
 fn initialize_result_decoder() -> decode.Decoder(actions.InitializeResult) {
@@ -3393,39 +3114,6 @@ fn decode_path_suffix(path: List(String)) -> String {
     [] -> ""
     _ -> " at " <> string.join(path, ".")
   }
-}
-
-fn prepend_field(
-  fields: List(#(String, json.Json)),
-  field: #(String, json.Json),
-) -> List(#(String, json.Json)) {
-  [field, ..fields]
-}
-
-fn resource_fields(resource: actions.Resource) -> List(#(String, json.Json)) {
-  let actions.Resource(
-    uri,
-    name,
-    title,
-    description,
-    mime_type,
-    annotations,
-    size,
-    icons,
-    meta,
-  ) = resource
-
-  [#("uri", json.string(uri)), #("name", json.string(name))]
-  |> append_optional("title", option_map(title, json.string))
-  |> append_optional("description", option_map(description, json.string))
-  |> append_optional("mimeType", option_map(mime_type, json.string))
-  |> append_optional("annotations", option_map(annotations, encode_annotations))
-  |> append_optional("size", option_map(size, json.int))
-  |> append_optional("icons", case icons {
-    [] -> None
-    _ -> Some(json.array(icons, encode_icon))
-  })
-  |> append_optional("_meta", option_map(meta, encode_meta))
 }
 
 fn task_fields(task: actions.Task) -> List(#(String, json.Json)) {
