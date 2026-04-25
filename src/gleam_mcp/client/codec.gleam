@@ -1136,7 +1136,10 @@ fn decode_meta_server_notification_message(
 ) -> decode.Decoder(ServerMessage) {
   decode_server_notification_message(
     method,
-    decode.map(optional_params_decoder(None, notification_meta_only_decoder()), wrap),
+    decode.map(
+      optional_params_decoder(None, notification_meta_only_decoder()),
+      wrap,
+    ),
   )
 }
 

@@ -779,10 +779,11 @@ fn initialization_result(server: Server) -> actions.ClientActionResult {
 
 fn list_resources_result(server: Server) -> actions.ClientActionResult {
   let Server(resources: resources, ..) = server
-  let listed = listed_entries(resources, fn(registered) {
-    let RegisteredResource(resource, _) = registered
-    resource
-  })
+  let listed =
+    listed_entries(resources, fn(registered) {
+      let RegisteredResource(resource, _) = registered
+      resource
+    })
 
   actions.ClientResultListResources(actions.ListResourcesResult(
     resources: listed,
@@ -793,8 +794,9 @@ fn list_resources_result(server: Server) -> actions.ClientActionResult {
 
 fn list_resource_templates_result(server: Server) -> actions.ClientActionResult {
   let Server(resource_templates: resource_templates, ..) = server
-  let listed = listed_entries(resource_templates, fn(registered) {
-    let RegisteredResourceTemplate(resource_template, _) = registered
+  let listed =
+    listed_entries(resource_templates, fn(registered) {
+      let RegisteredResourceTemplate(resource_template, _) = registered
       resource_template
     })
 
@@ -838,10 +840,11 @@ fn read_resource_result(
 
 fn list_prompts_result(server: Server) -> actions.ClientActionResult {
   let Server(prompts: prompts, ..) = server
-  let listed = listed_entries(prompts, fn(registered) {
-    let RegisteredPrompt(prompt, _) = registered
-    prompt
-  })
+  let listed =
+    listed_entries(prompts, fn(registered) {
+      let RegisteredPrompt(prompt, _) = registered
+      prompt
+    })
 
   actions.ClientResultListPrompts(actions.ListPromptsResult(
     prompts: listed,
@@ -867,10 +870,11 @@ fn get_prompt_result(
 
 fn list_tools_result(server: Server) -> actions.ClientActionResult {
   let Server(tools: tools, ..) = server
-  let listed = listed_entries(tools, fn(registered) {
-    let RegisteredTool(tool, _) = registered
-    tool
-  })
+  let listed =
+    listed_entries(tools, fn(registered) {
+      let RegisteredTool(tool, _) = registered
+      tool
+    })
 
   actions.ClientResultListTools(actions.ListToolsResult(
     tools: listed,
@@ -1084,7 +1088,8 @@ fn find_resource_template(
   uri: String,
 ) -> Result(RegisteredResourceTemplate, Nil) {
   find_entry(templates, fn(registered) {
-    let RegisteredResourceTemplate(resource_template: descriptor, ..) = registered
+    let RegisteredResourceTemplate(resource_template: descriptor, ..) =
+      registered
     matches_template(descriptor.uri_template, uri)
   })
 }

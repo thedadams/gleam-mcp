@@ -65,6 +65,7 @@ pub type TransportResponse(result) {
 }
 
 const default_http_timeout_ms = 30_000
+
 const minimum_stream_listener_timeout_ms = 3_600_000
 
 pub type Runners {
@@ -455,16 +456,21 @@ pub fn streamable_http_listen(
   let HttpConfig(base_url:, ..) = config
   let headers = streamable_get_headers(config, session_id, protocol_version)
 
-  http_stream.listen(base_url, headers, stream_listener_timeout_ms(config), fn(payload) {
-    process_server_message(
-      config,
-      session_id,
-      protocol_version,
-      capability_config,
-      payload,
-    )
-    |> result.map_error(transport_error_message)
-  })
+  http_stream.listen(
+    base_url,
+    headers,
+    stream_listener_timeout_ms(config),
+    fn(payload) {
+      process_server_message(
+        config,
+        session_id,
+        protocol_version,
+        capability_config,
+        payload,
+      )
+      |> result.map_error(transport_error_message)
+    },
+  )
   |> result.map_error(map_stream_listener_error)
 }
 

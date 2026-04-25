@@ -5,7 +5,9 @@ import gleam/option.{type Option, None, Some}
 import gleam_mcp/actions
 import gleam_mcp/jsonrpc
 
-pub fn encode_implementation(implementation: actions.Implementation) -> json.Json {
+pub fn encode_implementation(
+  implementation: actions.Implementation,
+) -> json.Json {
   let actions.Implementation(
     name,
     version,
@@ -84,7 +86,9 @@ pub fn encode_tool_execution(execution: actions.ToolExecution) -> json.Json {
   |> json.object
 }
 
-pub fn encode_tool_annotations(annotations: actions.ToolAnnotations) -> json.Json {
+pub fn encode_tool_annotations(
+  annotations: actions.ToolAnnotations,
+) -> json.Json {
   let actions.ToolAnnotations(
     title,
     read_only_hint,
@@ -127,7 +131,9 @@ pub fn encode_tool_use_content(content: actions.ToolUseContent) -> json.Json {
   |> json.object
 }
 
-pub fn encode_tool_result_content(content: actions.ToolResultContent) -> json.Json {
+pub fn encode_tool_result_content(
+  content: actions.ToolResultContent,
+) -> json.Json {
   let actions.ToolResultContent(
     tool_use_id,
     blocks,
@@ -158,7 +164,8 @@ pub fn encode_content_block(block: actions.ContentBlock) -> json.Json {
     actions.ImageBlock(content) -> encode_image_content(content)
     actions.AudioBlock(content) -> encode_audio_content(content)
     actions.ResourceLinkBlock(link) -> encode_resource_link(link)
-    actions.EmbeddedResourceBlock(resource) -> encode_embedded_resource(resource)
+    actions.EmbeddedResourceBlock(resource) ->
+      encode_embedded_resource(resource)
   }
 }
 

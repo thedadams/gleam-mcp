@@ -215,7 +215,11 @@ pub fn subscribe_resource(
   client: Client,
   params: actions.SubscribeRequestParams,
 ) -> #(Client, Result(Nil, ClientError)) {
-  request_empty(client, mcp.method_subscribe_resource, actions.ClientRequestSubscribeResource(params))
+  request_empty(
+    client,
+    mcp.method_subscribe_resource,
+    actions.ClientRequestSubscribeResource(params),
+  )
 }
 
 pub fn unsubscribe_resource(
@@ -321,7 +325,11 @@ pub fn set_logging_level(
   client: Client,
   params: actions.SetLevelRequestParams,
 ) -> #(Client, Result(Nil, ClientError)) {
-  request_empty(client, mcp.method_set_logging_level, actions.ClientRequestSetLoggingLevel(params))
+  request_empty(
+    client,
+    mcp.method_set_logging_level,
+    actions.ClientRequestSetLoggingLevel(params),
+  )
 }
 
 pub fn list_tasks(
@@ -397,14 +405,22 @@ pub fn cancelled(
   client: Client,
   params: actions.CancelledNotificationParams,
 ) -> #(Client, Result(Nil, ClientError)) {
-  notify_action(client, mcp.method_notify_cancelled, actions.NotifyCancelled(params))
+  notify_action(
+    client,
+    mcp.method_notify_cancelled,
+    actions.NotifyCancelled(params),
+  )
 }
 
 pub fn progress(
   client: Client,
   params: actions.ProgressNotificationParams,
 ) -> #(Client, Result(Nil, ClientError)) {
-  notify_action(client, mcp.method_notify_progress, actions.NotifyProgress(params))
+  notify_action(
+    client,
+    mcp.method_notify_progress,
+    actions.NotifyProgress(params),
+  )
 }
 
 pub fn resource_list_changed(
@@ -480,7 +496,11 @@ pub fn task_status(
   client: Client,
   params: actions.TaskStatusNotificationParams,
 ) -> #(Client, Result(Nil, ClientError)) {
-  notify_action(client, mcp.method_notify_task_status, actions.NotifyTaskStatus(params))
+  notify_action(
+    client,
+    mcp.method_notify_task_status,
+    actions.NotifyTaskStatus(params),
+  )
 }
 
 fn request_paginated(
@@ -490,7 +510,12 @@ fn request_paginated(
   wrap: fn(actions.PaginatedRequestParams) -> actions.ClientActionRequest,
   extract: fn(actions.ClientActionResult) -> Option(result),
 ) -> #(Client, Result(result, ClientError)) {
-  request_action(client, method, wrap(default_paginated_params(params)), extract)
+  request_action(
+    client,
+    method,
+    wrap(default_paginated_params(params)),
+    extract,
+  )
 }
 
 fn request_action(

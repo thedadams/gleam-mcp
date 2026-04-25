@@ -271,7 +271,10 @@ fn decode_notification_message(
           Some(request_id) -> decode.success(UnknownRequest(request_id, method))
           None ->
             decode.success(
-              ActionNotification(jsonrpc.Notification(method, Some(wrap(params)))),
+              ActionNotification(jsonrpc.Notification(
+                method,
+                Some(wrap(params)),
+              )),
             )
         }
       })
