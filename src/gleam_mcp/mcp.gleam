@@ -8,7 +8,8 @@ pub const method_discover = "server/discover"
 
 pub const method_subscriptions_listen = "subscriptions/listen"
 
-pub const method_notify_subscriptions_acknowledged = "notifications/subscriptions/acknowledged"
+pub const method_notify_subscriptions_acknowledged =
+  "notifications/subscriptions/acknowledged"
 
 pub const method_update_task = "tasks/update"
 
@@ -24,7 +25,8 @@ pub const method_list_resources = "resources/list"
 
 pub const method_list_resource_templates = "resources/templates/list"
 
-pub const method_notify_resource_list_changed = "notifications/resources/list_changed"
+pub const method_notify_resource_list_changed =
+  "notifications/resources/list_changed"
 
 pub const method_read_resource = "resources/read"
 
@@ -50,13 +52,15 @@ pub const method_notify_roots_list_changed = "notifications/roots/list_changed"
 
 pub const method_elicit = "elicitation/create"
 
-pub const method_notify_elicitation_complete = "notifications/elicitation/complete"
+pub const method_notify_elicitation_complete =
+  "notifications/elicitation/complete"
 
 pub const method_set_logging_level = "logging/setLevel"
 
 pub const method_notify_logging_message = "notifications/message"
 
-pub const method_notify_prompts_list_changed = "notifications/prompts/list_changed"
+pub const method_notify_prompts_list_changed =
+  "notifications/prompts/list_changed"
 
 pub const method_list_tasks = "tasks/list"
 

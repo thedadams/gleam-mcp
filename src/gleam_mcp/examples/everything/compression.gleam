@@ -13,7 +13,8 @@ import gleam_mcp/mcp
 import gleam_mcp/server
 import gzlib
 
-const default_data = "https://raw.githubusercontent.com/modelcontextprotocol/servers/refs/heads/main/README.md"
+const default_data =
+  "https://raw.githubusercontent.com/modelcontextprotocol/servers/refs/heads/main/README.md"
 
 pub fn register_tools(
   app: server.Server,

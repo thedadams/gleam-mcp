@@ -18,7 +18,7 @@ jobs:
       - name: Set up Gleam
         uses: gleam-lang/setup-gleam@v1
         with:
-          gleam-version: latest
+          gleam-version: "1.19.0"
 
       - name: Set up Erlang/OTP
         uses: erlef/setup-beam@v1

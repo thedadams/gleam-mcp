@@ -9,9 +9,11 @@ import gleam_mcp/server
 import gleam_mcp/server/stdio
 import gleeunit/should
 
-const initialized = "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}"
+const initialized =
+  "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}"
 
-const initialize = "{\"jsonrpc\":\"2.0\",\"id\":\"init\",\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{\"roots\":{}},\"clientInfo\":{\"name\":\"wire-client\",\"version\":\"1\"}}}"
+const initialize =
+  "{\"jsonrpc\":\"2.0\",\"id\":\"init\",\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{\"roots\":{}},\"clientInfo\":{\"name\":\"wire-client\",\"version\":\"1\"}}}"
 
 type Input {
   Line(String)

@@ -10,7 +10,8 @@ import gleam_mcp/server
 import gleeunit/should
 import server_test_support
 
-const initialize_body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\"clientInfo\":{\"name\":\"wire-test\",\"version\":\"1\"}}}"
+const initialize_body =
+  "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\"clientInfo\":{\"name\":\"wire-test\",\"version\":\"1\"}}}"
 
 pub fn origin_and_version_headers_are_checked_before_dispatch_test() {
   let url = server_test_support.start_http_server()
