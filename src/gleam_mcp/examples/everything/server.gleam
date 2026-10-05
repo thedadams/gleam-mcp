@@ -13,9 +13,19 @@ pub fn make_server() -> server.Server {
 pub fn make_server_with_http_logger(
   logger: Option(http_logging.Logger),
 ) -> server.Server {
+  base_server() |> tools.register_tools(logger)
+}
+
+/// The logger and HTTP handler share the same stores and session metadata.
+pub fn make_http_server() -> #(server.Server, http_logging.Logger) {
+  let app_server = base_server()
+  let logger = http_logging.new_logger(app_server)
+  #(tools.register_tools(app_server, Some(logger)), logger)
+}
+
+fn base_server() -> server.Server {
   server.new(implementation())
   |> server.with_instructions(instructions())
-  |> tools.register_tools(logger)
   |> resources.register_resources
   |> prompts.register_prompts
   |> server.set_completion_handler(prompts.completion_handler)

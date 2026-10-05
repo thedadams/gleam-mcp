@@ -2,7 +2,6 @@ import argv
 import gleam/erlang/process
 import gleam/int
 import gleam/io
-import gleam/option.{Some}
 import gleam/string
 import gleam_mcp/examples/everything/http_logging
 import gleam_mcp/examples/everything/server as everything_server
@@ -33,9 +32,7 @@ pub fn main() -> Nil {
 }
 
 fn run_streamable_http(port: Int) -> Nil {
-  let base_server = everything_server.make_server()
-  let logger = http_logging.new_logger(base_server)
-  let app_server = everything_server.make_server_with_http_logger(Some(logger))
+  let #(app_server, logger) = everything_server.make_http_server()
   let builder =
     mist.new(streamable_http.handler_with_middleware(
       app_server,
