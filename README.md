@@ -162,8 +162,33 @@ schema objects and does not fetch external `$ref` URLs. Legacy HTTP SSE event
 history is not retained for replay.
 
 Run `gleam check`, `gleam test`, and `gleam format --check src test`. Local tests
-cover both protocol versions and transports. Optional official SDK compatibility
-tests use these environment variables:
+cover both protocol versions and transports.
+
+Run `scripts/run-conformance.sh` to exercise the dedicated server and client in
+`test/conformance` against the official MCP conformance runner. By default it runs
+the required scenarios for both supported revisions, using a pinned runner commit.
+The script starts the Gleam server, launches the Gleam client for each scenario,
+and saves raw results and pass/fail summaries outside the repository. It needs
+Bash, Git, Node.js 20 or later, npm, Gleam, curl, and pgrep.
+
+Use `scripts/run-conformance.sh --mode optional` for schema preservation, HTTP
+header validation, and the tasks extension. Use `--mode all` to run both required
+and selected optional scenarios. The reports keep the required score and optional
+results separate, include the official unscored reason, and identify excluded
+scenarios. An upstream optional skip remains visible without failing the run.
+
+`MCP_CONFORMANCE_OPTIONAL_GROUPS` selects space-separated groups; its default is
+`schema headers tasks`. Groups `auth`, `legacy`, and `other` are also available for
+broader gap reports; `all` selects every official unscored scenario. Schema
+coverage checks keyword preservation through the SDK, while general JSON Schema
+validation remains separate work.
+
+Use `scripts/run-conformance.sh --help` for output-directory and runner overrides.
+Set `MCP_CONFORMANCE_LEGS=server` or `client` to select one role, or
+`MCP_CONFORMANCE_REVISIONS=2026-07-28` to select one revision. Exit status 1 means
+a selected scenario failed; status 2 means setup failed or results are incomplete.
+
+Optional official SDK compatibility tests use these environment variables:
 
 - `MCP_EVERYTHING_URL`, `MCP_EVERYTHING_STDIO_COMMAND`, and
   `MCP_EVERYTHING_STDIO_ARGS` for the legacy Everything server.
