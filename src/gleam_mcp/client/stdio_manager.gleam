@@ -2,6 +2,7 @@ import child_process
 import child_process/stdio as process_stdio
 import gleam/bit_array
 import gleam/dict
+import gleam/dynamic.{type Dynamic}
 import gleam/dynamic/decode
 import gleam/erlang/process
 import gleam/int
@@ -126,6 +127,26 @@ type StoppableReply {
   Stopped
 }
 
+type FrameField(value) {
+  MissingField
+  NullField
+  InvalidField
+  PresentField(value)
+}
+
+type Frame {
+  Frame(
+    payload: String,
+    id: FrameField(jsonrpc.RequestId),
+    subscription_id: FrameField(jsonrpc.RequestId),
+    cancelled_id: FrameField(jsonrpc.RequestId),
+    method: FrameField(String),
+    modern: Bool,
+    error_without_id: Bool,
+    looks_like_response: Bool,
+  )
+}
+
 pub fn start() -> Manager {
   let reply_to = process.new_subject()
   let _pid = process.spawn(fn() { manager_worker(reply_to) })
@@ -191,6 +212,7 @@ pub fn request_until_stopped(
   stop: process.Subject(Nil),
 ) -> Result(#(String, Option(String)), String) {
   let Manager(subject) = manager
+  let id = describe_frame(payload).id |> field_value
   let reply = process.new_subject()
   process.send(
     subject,
@@ -203,11 +225,11 @@ pub fn request_until_stopped(
   case process.selector_receive(selector, manager_timeout_ms(config)) {
     Ok(Reply(response)) -> response
     Ok(Stopped) -> {
-      process.send(subject, AbortRequest(session_id, message_id(payload)))
+      process.send(subject, AbortRequest(session_id, id))
       Error("cancelled")
     }
     Error(_) -> {
-      process.send(subject, AbortRequest(session_id, message_id(payload)))
+      process.send(subject, AbortRequest(session_id, id))
       Error("timeout")
     }
   }
@@ -313,14 +335,8 @@ fn loop(
         }
         Ok(#(next_sessions, id)) -> {
           let assert Ok(Session(session)) = dict.get(next_sessions, id)
-          let ready = process.new_subject()
-          let _ =
-            process.spawn_unlinked(fn() {
-              let reply = process.new_subject()
-              process.send(ready, reply)
-              let response =
-                process.receive(reply, timeout_ms(config) + 100)
-                |> result.unwrap(Error("timeout"))
+          let reply =
+            reply_receiver(timeout_ms(config) + 100, fn(response) {
               case response {
                 Error("cancelled") | Error("Stdio transport is busy") -> Nil
                 Error(_) -> process.send(subject, SessionFailed(id))
@@ -337,7 +353,7 @@ fn loop(
               payload,
               timeout_ms(config),
               capability_config,
-              process.receive_forever(ready),
+              reply,
             ),
           )
           loop(subject, next_sessions)
@@ -352,23 +368,13 @@ fn loop(
         }
         Ok(#(next_sessions, id)) -> {
           let assert Ok(Session(session)) = dict.get(next_sessions, id)
-          let ready = process.new_subject()
-          let _ =
-            process.spawn_unlinked(fn() {
-              let reply = process.new_subject()
-              process.send(ready, reply)
-              let response =
-                process.receive(reply, timeout_ms(config) + 100)
-                |> result.unwrap(Error("timeout"))
+          let reply =
+            reply_receiver(timeout_ms(config) + 100, fn(response) {
               process.send(reply_to, result.map(response, fn(_) { Some(id) }))
             })
           process.send(
             session,
-            PerformNotification(
-              payload,
-              capability_config,
-              process.receive_forever(ready),
-            ),
+            PerformNotification(payload, capability_config, reply),
           )
           loop(subject, next_sessions)
         }
@@ -382,20 +388,11 @@ fn loop(
         }
         Ok(#(next_sessions, id)) -> {
           let assert Ok(Session(session)) = dict.get(next_sessions, id)
-          let ready = process.new_subject()
-          let _ =
-            process.spawn_unlinked(fn() {
-              let reply = process.new_subject()
-              process.send(ready, reply)
-              let response =
-                process.receive(reply, timeout_ms(config) + 100)
-                |> result.unwrap(Error("timeout"))
+          let reply =
+            reply_receiver(timeout_ms(config) + 100, fn(response) {
               process.send(reply_to, result.map(response, fn(_) { Some(id) }))
             })
-          process.send(
-            session,
-            PerformListen(capability_config, process.receive_forever(ready)),
-          )
+          process.send(session, PerformListen(capability_config, reply))
           loop(subject, next_sessions)
         }
       }
@@ -408,20 +405,11 @@ fn loop(
         }
         Ok(#(next_sessions, id)) -> {
           let assert Ok(Session(session)) = dict.get(next_sessions, id)
-          let ready = process.new_subject()
-          let _ =
-            process.spawn_unlinked(fn() {
-              let reply = process.new_subject()
-              process.send(ready, reply)
-              let outcome =
-                process.receive(reply, timeout_ms(config) + 100)
-                |> result.unwrap(Error("timeout"))
+          let reply =
+            reply_receiver(timeout_ms(config) + 100, fn(outcome) {
               process.send(reply_to, result.map(outcome, fn(_) { Some(id) }))
             })
-          process.send(
-            session,
-            PerformSubscribe(payload, events, process.receive_forever(ready)),
-          )
+          process.send(session, PerformSubscribe(payload, events, reply))
           loop(subject, next_sessions)
         }
       }
@@ -439,6 +427,24 @@ fn loop(
       loop(subject, sessions)
     }
   }
+}
+
+/// The relay creates and receives its own subject. The manager waits only for
+/// registration, then remains free to dispatch cancellation and shutdown.
+fn reply_receiver(
+  timeout: Int,
+  complete: fn(Result(value, String)) -> Nil,
+) -> process.Subject(Result(value, String)) {
+  let ready = process.new_subject()
+  let _ =
+    process.spawn_unlinked(fn() {
+      let reply = process.new_subject()
+      process.send(ready, reply)
+      process.receive(reply, timeout)
+      |> result.unwrap(Error("timeout"))
+      |> complete
+    })
+  process.receive_forever(ready)
 }
 
 fn ensure_session(
@@ -573,6 +579,7 @@ fn session_loop(
         None ->
           case child_process.writeln(handle, payload) {
             Ok(Nil) -> {
+              let frame = describe_frame(payload)
               let token = uuid.v4_string()
               let timer =
                 process.send_after(subject, timeout, RequestTimeout(token))
@@ -585,10 +592,10 @@ fn session_loop(
                   token,
                   timer,
                   capability_config,
-                  message_id(payload),
-                  modern_request(payload),
+                  field_value(frame.id),
+                  frame.modern,
                 )),
-                case modern_request(payload), listener {
+                case frame.modern, listener {
                   True, Some(Subscription(_, _, _)) -> listener
                   True, _ -> Some(ModernIdle(capability_config))
                   False, _ -> listener
@@ -603,21 +610,12 @@ fn session_loop(
       case child_process.writeln(handle, payload) {
         Ok(Nil) -> {
           process.send(reply_to, Ok(Nil))
-          let cancelled =
-            json.parse(
-              payload,
-              decode.at(
-                ["params", "requestId"],
-                decode.one_of(decode.map(decode.string, jsonrpc.StringId), [
-                  decode.map(decode.int, jsonrpc.IntId),
-                ]),
-              ),
-            )
-            |> option.from_result
-          let method = json.parse(payload, decode.at(["method"], decode.string))
+          let frame = describe_frame(payload)
+          let cancelled = field_value(frame.cancelled_id)
           let listener = case listener {
             Some(Subscription(id, _, config))
-              if cancelled == Some(id) && method == Ok("notifications/cancelled")
+              if cancelled == Some(id)
+              && frame.method == PresentField("notifications/cancelled")
             -> Some(ModernIdle(config))
             _ -> listener
           }
@@ -647,7 +645,8 @@ fn session_loop(
         }
       }
     Ok(SessionEvent(PerformSubscribe(payload, events, reply_to))) -> {
-      case listener, message_id(payload) {
+      let id = describe_frame(payload).id |> field_value
+      case listener, id {
         None, Some(id) | Some(ModernIdle(_)), Some(id) -> {
           let config = listener_config(pending, listener)
           case child_process.writeln(handle, payload) {
@@ -752,19 +751,17 @@ fn process_line(
   case string.starts_with(string.trim(line), "{") {
     False -> Ok(#(pending, listener))
     True -> {
-      let observed_id = message_id(line)
+      let frame = describe_frame(line)
+      let observed_id = field_value(frame.id)
       let null_error =
-        json.parse(line, decode.at(["id"], decode.optional(decode.string)))
-        == Ok(None)
-        && string.contains(line, "\"error\"")
-      let missing_id_error = error_without_id(line)
-      case looks_like_jsonrpc_response(line), pending, listener {
+        frame.id == NullField && string.contains(line, "\"error\"")
+      case frame.looks_like_response, pending, listener {
         True,
           Some(PendingRequest(reply_to:, timer:, request_id:, modern:, ..)),
           _
           if observed_id == request_id
           || null_error
-          || { modern && missing_id_error }
+          || { modern && frame.error_without_id }
         -> {
           let _ = process.cancel_timer(timer)
           process.send(reply_to, Ok(line))
@@ -778,7 +775,7 @@ fn process_line(
         }
         True, _, _ -> Ok(#(pending, listener))
         _, _, _ ->
-          handle_server_message(subject, handle, line, pending, listener)
+          handle_server_message(subject, handle, frame, pending, listener)
       }
     }
   }
@@ -787,18 +784,19 @@ fn process_line(
 fn handle_server_message(
   subject: process.Subject(SessionCommand),
   handle: child_process.Process,
-  line: String,
+  frame: Frame,
   pending: Option(PendingRequest),
   listener: Option(Listener),
 ) -> Result(#(Option(PendingRequest), Option(Listener)), String) {
+  let line = frame.payload
   let capability_config = listener_config(pending, listener)
   let modern = case pending, listener {
     Some(request), _ -> request.modern
     _, Some(Subscription(_, _, _)) | _, Some(ModernIdle(_)) -> True
     _, _ -> False
   }
-  let tagged = has_subscription_id(line)
-  let tagged_id = subscription_id(line)
+  let tagged = frame.subscription_id != MissingField
+  let tagged_id = field_value(frame.subscription_id)
   let subscription = case listener {
     Some(Subscription(id, events, _)) if tagged && tagged_id == Some(id) ->
       Some(events)
@@ -874,40 +872,72 @@ fn listener_config(
   }
 }
 
-fn error_without_id(line: String) -> Bool {
-  case json.parse(line, decode.dict(decode.string, decode.dynamic)) {
-    Ok(fields) ->
-      dict.has_key(fields, "error")
+/// Parse JSON once for routing, retaining absent, null, and invalid fields.
+/// The raw response heuristic remains unchanged; wire validation happens later.
+fn describe_frame(payload: String) -> Frame {
+  let parsed = json.parse(payload, decode.dynamic) |> option.from_result
+  let id_decoder =
+    decode.one_of(decode.map(decode.string, jsonrpc.StringId), [
+      decode.map(decode.int, jsonrpc.IntId),
+    ])
+  let fields =
+    parsed
+    |> option.then(fn(value) {
+      decode.run(value, decode.dict(decode.string, decode.dynamic))
+      |> option.from_result
+    })
+    |> option.unwrap(dict.new())
+  let modern =
+    frame_field(
+      parsed,
+      ["params", "_meta", "io.modelcontextprotocol/protocolVersion"],
+      decode.string,
+    )
+    == PresentField("2026-07-28")
+  Frame(
+    payload: payload,
+    id: frame_field(parsed, ["id"], id_decoder),
+    subscription_id: frame_field(
+      parsed,
+      ["params", "_meta", "io.modelcontextprotocol/subscriptionId"],
+      id_decoder,
+    ),
+    cancelled_id: frame_field(parsed, ["params", "requestId"], id_decoder),
+    method: frame_field(parsed, ["method"], decode.string),
+    modern: modern,
+    error_without_id: dict.has_key(fields, "error")
       && !dict.has_key(fields, "id")
-      && !dict.has_key(fields, "method")
-    Error(_) -> False
+      && !dict.has_key(fields, "method"),
+    looks_like_response: looks_like_jsonrpc_response(payload),
+  )
+}
+
+fn frame_field(
+  parsed: Option(Dynamic),
+  path: List(String),
+  decoder: decode.Decoder(value),
+) -> FrameField(value) {
+  let value =
+    parsed
+    |> option.then(fn(value) {
+      decode.run(value, decode.at(path, decode.dynamic)) |> option.from_result
+    })
+  case value {
+    None -> MissingField
+    Some(value) ->
+      case decode.run(value, decode.optional(decoder)) {
+        Ok(None) -> NullField
+        Ok(Some(value)) -> PresentField(value)
+        Error(_) -> InvalidField
+      }
   }
 }
 
-fn subscription_id(payload: String) -> Option(jsonrpc.RequestId) {
-  json.parse(
-    payload,
-    decode.at(
-      ["params", "_meta", "io.modelcontextprotocol/subscriptionId"],
-      decode.one_of(decode.map(decode.string, jsonrpc.StringId), [
-        decode.map(decode.int, jsonrpc.IntId),
-      ]),
-    ),
-  )
-  |> option.from_result
-}
-
-fn message_id(payload: String) -> Option(jsonrpc.RequestId) {
-  json.parse(
-    payload,
-    decode.at(
-      ["id"],
-      decode.one_of(decode.map(decode.string, jsonrpc.StringId), [
-        decode.map(decode.int, jsonrpc.IntId),
-      ]),
-    ),
-  )
-  |> option.from_result
+fn field_value(field: FrameField(value)) -> Option(value) {
+  case field {
+    PresentField(value) -> Some(value)
+    MissingField | NullField | InvalidField -> None
+  }
 }
 
 fn cancellation_payload(id: jsonrpc.RequestId) -> String {
@@ -918,28 +948,6 @@ fn cancellation_payload(id: jsonrpc.RequestId) -> String {
   "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":"
   <> json.to_string(id)
   <> "}}"
-}
-
-fn modern_request(payload: String) -> Bool {
-  json.parse(
-    payload,
-    decode.at(
-      ["params", "_meta", "io.modelcontextprotocol/protocolVersion"],
-      decode.string,
-    ),
-  )
-  == Ok("2026-07-28")
-}
-
-fn has_subscription_id(payload: String) -> Bool {
-  json.parse(
-    payload,
-    decode.at(
-      ["params", "_meta", "io.modelcontextprotocol/subscriptionId"],
-      decode.dynamic,
-    ),
-  )
-  |> result.is_ok
 }
 
 fn send_server_message(

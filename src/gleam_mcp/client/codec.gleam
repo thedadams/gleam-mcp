@@ -1,13 +1,14 @@
 import gleam/dict
 import gleam/dynamic/decode
-import gleam/int
 import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
-import gleam/string
 import gleam_mcp/actions
 import gleam_mcp/codec_common
+import gleam_mcp/codec_decode
+import gleam_mcp/codec_encode
+import gleam_mcp/codec_value
 import gleam_mcp/jsonrpc
 import gleam_mcp/mcp
 
@@ -22,24 +23,24 @@ pub fn encode_request(
   request: jsonrpc.Request(actions.ClientActionRequest),
 ) -> String {
   request
-  |> encode_action_request
-  |> json.to_string
+  |> encode_jsonrpc_request(encode_request_params)
+  |> codec_value.to_string
 }
 
 pub fn encode_server_request(
   request: jsonrpc.Request(actions.ServerActionRequest),
 ) -> String {
   request
-  |> encode_server_action_request
-  |> json.to_string
+  |> encode_jsonrpc_request(encode_server_request_params)
+  |> codec_value.to_string
 }
 
 pub fn encode_notification(
   notification: jsonrpc.Request(actions.ActionNotification),
 ) -> String {
   notification
-  |> encode_action_notification
-  |> json.to_string
+  |> encode_jsonrpc_request(encode_notification_params)
+  |> codec_value.to_string
 }
 
 pub fn decode_response(
@@ -47,7 +48,7 @@ pub fn decode_response(
   request: jsonrpc.Request(actions.ClientActionRequest),
 ) -> Result(jsonrpc.Response(actions.ClientActionResult), String) {
   json.parse(body, response_decoder(request))
-  |> result.map_error(json_error_message)
+  |> result.map_error(codec_decode.json_error_message)
 }
 
 pub fn decode_server_response(
@@ -55,148 +56,94 @@ pub fn decode_server_response(
   request: jsonrpc.Request(actions.ServerActionRequest),
 ) -> Result(jsonrpc.Response(actions.ServerActionResult), String) {
   json.parse(body, server_response_decoder(request))
-  |> result.map_error(json_error_message)
+  |> result.map_error(codec_decode.json_error_message)
 }
 
 pub fn decode_server_message(body: String) -> Result(ServerMessage, String) {
   json.parse(body, server_message_decoder())
-  |> result.map_error(json_error_message)
+  |> result.map_error(codec_decode.json_error_message)
 }
 
 pub fn encode_client_capabilities_value(
   capabilities: actions.ClientCapabilities,
 ) -> jsonrpc.Value {
-  let assert Ok(value) =
-    json.parse(
-      json.to_string(encode_client_capabilities(capabilities)),
-      value_decoder(),
-    )
-  value
+  encode_client_capabilities(capabilities) |> codec_value.normalize
 }
 
 pub fn decode_server_capabilities(
   value: jsonrpc.Value,
 ) -> Result(actions.ServerCapabilities, String) {
-  json.parse(json.to_string(encode_value(value)), server_capabilities_decoder())
-  |> result.map_error(json_error_message)
+  codec_decode.decode_value(value, server_capabilities_decoder())
 }
 
 pub fn decode_implementation(
   value: jsonrpc.Value,
 ) -> Result(actions.Implementation, String) {
-  json.parse(json.to_string(encode_value(value)), implementation_decoder())
-  |> result.map_error(json_error_message)
+  codec_decode.decode_value(value, codec_decode.implementation_decoder())
 }
 
-fn encode_action_request(
-  request: jsonrpc.Request(actions.ClientActionRequest),
-) -> json.Json {
+fn encode_jsonrpc_request(
+  request: jsonrpc.Request(a),
+  encode_params: fn(a) -> jsonrpc.Value,
+) -> jsonrpc.Value {
   case request {
     jsonrpc.Request(id, method, params) ->
-      base_request_fields(
-        method,
-        Some(id),
-        option_map(params, encode_request_params),
-      )
-      |> json.object
+      base_request_fields(method, Some(id), option_map(params, encode_params))
+      |> codec_value.object
     jsonrpc.Notification(method, params) ->
-      base_request_fields(
-        method,
-        None,
-        option_map(params, encode_request_params),
-      )
-      |> json.object
-  }
-}
-
-fn encode_server_action_request(
-  request: jsonrpc.Request(actions.ServerActionRequest),
-) -> json.Json {
-  case request {
-    jsonrpc.Request(id, method, params) ->
-      base_request_fields(
-        method,
-        Some(id),
-        option_map(params, encode_server_request_params),
-      )
-      |> json.object
-    jsonrpc.Notification(method, params) ->
-      base_request_fields(
-        method,
-        None,
-        option_map(params, encode_server_request_params),
-      )
-      |> json.object
-  }
-}
-
-fn encode_action_notification(
-  request: jsonrpc.Request(actions.ActionNotification),
-) -> json.Json {
-  case request {
-    jsonrpc.Request(id, method, params) ->
-      base_request_fields(
-        method,
-        Some(id),
-        option_map(params, encode_notification_params),
-      )
-      |> json.object
-    jsonrpc.Notification(method, params) ->
-      base_request_fields(
-        method,
-        None,
-        option_map(params, encode_notification_params),
-      )
-      |> json.object
+      base_request_fields(method, None, option_map(params, encode_params))
+      |> codec_value.object
   }
 }
 
 fn base_request_fields(
   method: String,
   id: Option(jsonrpc.RequestId),
-  params: Option(json.Json),
-) -> List(#(String, json.Json)) {
+  params: Option(jsonrpc.Value),
+) -> List(#(String, jsonrpc.Value)) {
   [
-    #("jsonrpc", json.string(jsonrpc.jsonrpc_version)),
-    #("method", json.string(method)),
+    #("jsonrpc", codec_value.string(jsonrpc.jsonrpc_version)),
+    #("method", codec_value.string(method)),
   ]
-  |> prepend_optional("id", option_map(id, encode_request_id))
+  |> prepend_optional("id", option_map(id, codec_encode.encode_request_id))
   |> append_optional("params", params)
 }
 
-fn encode_request_params(request: actions.ClientActionRequest) -> json.Json {
+fn encode_request_params(
+  request: actions.ClientActionRequest,
+) -> jsonrpc.Value {
   case request {
     actions.ClientRequestDiscover(meta) -> encode_request_meta_only(meta)
     actions.ClientRequestSubscriptionsListen(params) ->
       []
       |> append_optional(
         "notifications",
-        option_map(params.notifications, encode_value),
+        option_map(params.notifications, codec_encode.encode_value),
       )
       |> append_optional("_meta", option_map(params.meta, encode_request_meta))
-      |> json.object
+      |> codec_value.object
     actions.ClientRequestWithInput(inner, state, responses) ->
       encode_request_params(inner)
-      |> encoded_object_fields
+      |> codec_value.object_fields
       |> list.filter(fn(field) {
         field.0 != "requestState" && field.0 != "inputResponses"
       })
-      |> append_optional("requestState", option_map(state, json.string))
+      |> append_optional("requestState", option_map(state, codec_value.string))
       |> append_optional(
         "inputResponses",
         option_map(responses, fn(fields) {
-          codec_common.encode_value_object(dict.to_list(fields))
+          codec_encode.encode_value_object(dict.to_list(fields))
         }),
       )
-      |> json.object
+      |> codec_value.object
     actions.ClientRequestUpdateTask(params) ->
-      [#("taskId", json.string(params.task_id))]
+      [#("taskId", codec_value.string(params.task_id))]
       |> append_optional(
         "inputResponses",
-        option_map(params.input, encode_value),
+        option_map(params.input, codec_encode.encode_value),
       )
       |> append_optional("_meta", option_map(params.meta, encode_request_meta))
-      |> json.object
+      |> codec_value.object
     actions.ClientRequestInitialize(params) ->
       encode_initialize_request_params(params)
     actions.ClientRequestPing(meta) -> encode_request_meta_only(meta)
@@ -232,7 +179,7 @@ fn encode_request_params(request: actions.ClientActionRequest) -> json.Json {
 
 fn encode_server_request_params(
   request: actions.ServerActionRequest,
-) -> json.Json {
+) -> jsonrpc.Value {
   case request {
     actions.ServerRequestPing(meta) -> encode_request_meta_only(meta)
     actions.ServerRequestListRoots(meta) -> encode_request_meta_only(meta)
@@ -249,25 +196,25 @@ fn encode_server_request_params(
 
 fn encode_notification_params(
   notification: actions.ActionNotification,
-) -> json.Json {
+) -> jsonrpc.Value {
   case notification {
     actions.NotifyTaskModern(value, meta) ->
       value
-      |> encode_value
-      |> encoded_object_fields
+      |> codec_encode.encode_value
+      |> codec_value.object_fields
       |> list.filter(fn(field) { field.0 != "_meta" })
       |> append_optional("_meta", option_map(meta, encode_notification_meta))
-      |> json.object
+      |> codec_value.object
     actions.NotifySubscriptionsAcknowledged(meta) ->
       encode_notification_meta_only(meta)
     actions.NotifySubscriptionsAcknowledgedWithFilter(notifications, meta) ->
       []
       |> append_optional(
         "notifications",
-        option_map(notifications, encode_value),
+        option_map(notifications, codec_encode.encode_value),
       )
       |> append_optional("_meta", option_map(meta, encode_notification_meta))
-      |> json.object
+      |> codec_value.object
     actions.NotifyInitialized(meta) -> encode_notification_meta_only(meta)
     actions.NotifyCancelled(params) ->
       encode_cancelled_notification_params(params)
@@ -291,7 +238,7 @@ fn encode_notification_params(
 
 fn encode_initialize_request_params(
   params: actions.InitializeRequestParams,
-) -> json.Json {
+) -> jsonrpc.Value {
   let actions.InitializeRequestParams(
     protocol_version: protocol_version,
     capabilities: capabilities,
@@ -300,117 +247,120 @@ fn encode_initialize_request_params(
   ) = params
 
   [
-    #("protocolVersion", json.string(protocol_version)),
+    #("protocolVersion", codec_value.string(protocol_version)),
     #("capabilities", encode_client_capabilities(capabilities)),
-    #("clientInfo", encode_implementation(client_info)),
+    #("clientInfo", codec_encode.encode_implementation(client_info)),
   ]
   |> append_optional("_meta", option_map(meta, encode_request_meta))
-  |> json.object
+  |> codec_value.object
 }
 
-fn encode_request_meta_only(meta: Option(actions.RequestMeta)) -> json.Json {
+fn encode_request_meta_only(
+  meta: Option(actions.RequestMeta),
+) -> jsonrpc.Value {
   case meta {
-    Some(value) -> json.object([#("_meta", encode_request_meta(value))])
-    None -> json.object([])
+    Some(value) -> codec_value.object([#("_meta", encode_request_meta(value))])
+    None -> codec_value.object([])
   }
 }
 
 fn encode_notification_meta_only(
   meta: Option(actions.NotificationMeta),
-) -> json.Json {
+) -> jsonrpc.Value {
   case meta {
-    Some(value) -> json.object([#("_meta", encode_notification_meta(value))])
-    None -> json.object([])
+    Some(value) ->
+      codec_value.object([#("_meta", encode_notification_meta(value))])
+    None -> codec_value.object([])
   }
 }
 
 fn encode_paginated_request_params(
   params: actions.PaginatedRequestParams,
-) -> json.Json {
+) -> jsonrpc.Value {
   let actions.PaginatedRequestParams(cursor, meta) = params
 
   []
-  |> append_optional("cursor", option_map(cursor, encode_cursor))
+  |> append_optional("cursor", option_map(cursor, codec_encode.encode_cursor))
   |> append_optional("_meta", option_map(meta, encode_request_meta))
-  |> json.object
+  |> codec_value.object
 }
 
 fn encode_read_resource_request_params(
   params: actions.ReadResourceRequestParams,
-) -> json.Json {
+) -> jsonrpc.Value {
   let actions.ReadResourceRequestParams(uri, meta) = params
 
-  [#("uri", json.string(uri))]
+  [#("uri", codec_value.string(uri))]
   |> append_optional("_meta", option_map(meta, encode_request_meta))
-  |> json.object
+  |> codec_value.object
 }
 
 fn encode_subscribe_request_params(
   params: actions.SubscribeRequestParams,
-) -> json.Json {
+) -> jsonrpc.Value {
   let actions.SubscribeRequestParams(uri, meta) = params
 
-  [#("uri", json.string(uri))]
+  [#("uri", codec_value.string(uri))]
   |> append_optional("_meta", option_map(meta, encode_request_meta))
-  |> json.object
+  |> codec_value.object
 }
 
 fn encode_unsubscribe_request_params(
   params: actions.UnsubscribeRequestParams,
-) -> json.Json {
+) -> jsonrpc.Value {
   let actions.UnsubscribeRequestParams(uri, meta) = params
 
-  [#("uri", json.string(uri))]
+  [#("uri", codec_value.string(uri))]
   |> append_optional("_meta", option_map(meta, encode_request_meta))
-  |> json.object
+  |> codec_value.object
 }
 
 fn encode_get_prompt_request_params(
   params: actions.GetPromptRequestParams,
-) -> json.Json {
+) -> jsonrpc.Value {
   let actions.GetPromptRequestParams(name, arguments, meta) = params
 
-  [#("name", json.string(name))]
+  [#("name", codec_value.string(name))]
   |> append_optional(
     "arguments",
     option_map(arguments, fn(arguments) {
       dict.to_list(arguments)
       |> list.map(fn(entry) {
         let #(key, value) = entry
-        #(key, json.string(value))
+        #(key, codec_value.string(value))
       })
-      |> json.object
+      |> codec_value.object
     }),
   )
   |> append_optional("_meta", option_map(meta, encode_request_meta))
-  |> json.object
+  |> codec_value.object
 }
 
 fn encode_call_tool_request_params(
   params: actions.CallToolRequestParams,
-) -> json.Json {
+) -> jsonrpc.Value {
   let actions.CallToolRequestParams(name, arguments, task, meta) = params
 
-  [#("name", json.string(name))]
+  [#("name", codec_value.string(name))]
   |> append_optional(
     "arguments",
     option_map(arguments, fn(arguments) {
       dict.to_list(arguments)
       |> list.map(fn(entry) {
         let #(key, value) = entry
-        #(key, encode_value(value))
+        #(key, codec_encode.encode_value(value))
       })
-      |> json.object
+      |> codec_value.object
     }),
   )
   |> append_optional("task", option_map(task, encode_task_metadata))
   |> append_optional("_meta", option_map(meta, encode_request_meta))
-  |> json.object
+  |> codec_value.object
 }
 
 fn encode_complete_request_params(
   params: actions.CompleteRequestParams,
-) -> json.Json {
+) -> jsonrpc.Value {
   let actions.CompleteRequestParams(ref, argument, context, meta) = params
 
   [
@@ -419,22 +369,22 @@ fn encode_complete_request_params(
   ]
   |> append_optional("context", option_map(context, encode_complete_context))
   |> append_optional("_meta", option_map(meta, encode_request_meta))
-  |> json.object
+  |> codec_value.object
 }
 
 fn encode_set_level_request_params(
   params: actions.SetLevelRequestParams,
-) -> json.Json {
+) -> jsonrpc.Value {
   let actions.SetLevelRequestParams(level, meta) = params
 
   [#("level", encode_logging_level(level))]
   |> append_optional("_meta", option_map(meta, encode_request_meta))
-  |> json.object
+  |> codec_value.object
 }
 
 fn encode_create_message_request_params(
   params: actions.CreateMessageRequestParams,
-) -> json.Json {
+) -> jsonrpc.Value {
   let actions.CreateMessageRequestParams(
     messages: messages,
     model_preferences: model_preferences,
@@ -451,37 +401,43 @@ fn encode_create_message_request_params(
   ) = params
 
   [
-    #("messages", json.array(messages, encode_sampling_message)),
-    #("maxTokens", json.int(max_tokens)),
+    #("messages", codec_value.array(messages, encode_sampling_message)),
+    #("maxTokens", codec_value.int(max_tokens)),
   ]
   |> append_optional(
     "modelPreferences",
     option_map(model_preferences, encode_model_preferences),
   )
-  |> append_optional("systemPrompt", option_map(system_prompt, json.string))
+  |> append_optional(
+    "systemPrompt",
+    option_map(system_prompt, codec_value.string),
+  )
   |> append_optional(
     "includeContext",
     option_map(include_context, encode_include_context),
   )
-  |> append_optional("temperature", option_map(temperature, json.float))
+  |> append_optional("temperature", option_map(temperature, codec_value.float))
   |> append_optional("stopSequences", case stop_sequences {
     [] -> None
-    _ -> Some(json.array(stop_sequences, json.string))
+    _ -> Some(codec_value.array(stop_sequences, codec_value.string))
   })
-  |> append_optional("metadata", option_map(metadata, encode_value))
+  |> append_optional(
+    "metadata",
+    option_map(metadata, codec_encode.encode_value),
+  )
   |> append_optional("tools", case tools {
     [] -> None
-    _ -> Some(json.array(tools, encode_tool))
+    _ -> Some(codec_value.array(tools, codec_encode.encode_tool))
   })
   |> append_optional("toolChoice", option_map(tool_choice, encode_tool_choice))
   |> append_optional("task", option_map(task, encode_task_metadata))
   |> append_optional("_meta", option_map(meta, encode_request_meta))
-  |> json.object
+  |> codec_value.object
 }
 
 fn encode_elicit_request_params(
   params: actions.ElicitRequestParams,
-) -> json.Json {
+) -> jsonrpc.Value {
   case params {
     actions.ElicitRequestForm(form) -> encode_elicit_request_form_params(form)
     actions.ElicitRequestUrl(url) -> encode_elicit_request_url_params(url)
@@ -490,33 +446,36 @@ fn encode_elicit_request_params(
 
 fn encode_elicit_request_form_params(
   params: actions.ElicitRequestFormParams,
-) -> json.Json {
+) -> jsonrpc.Value {
   let actions.ElicitRequestFormParams(message, requested_schema, task, meta) =
     params
 
   [
-    #("message", json.string(message)),
-    #("requestedSchema", encode_value(requested_schema)),
+    #("message", codec_value.string(message)),
+    #("requestedSchema", codec_encode.encode_value(requested_schema)),
   ]
   |> append_optional("task", option_map(task, encode_task_metadata))
   |> append_optional("_meta", option_map(meta, encode_request_meta))
-  |> json.object
+  |> codec_value.object
 }
 
 fn encode_elicit_request_url_params(
   params: actions.ElicitRequestUrlParams,
-) -> json.Json {
+) -> jsonrpc.Value {
   let elicitation_id = case params {
     actions.ElicitRequestUrlParams(_, id, _, _, _) -> Some(id)
     actions.ElicitRequestUrlParamsWithoutId(..) -> None
   }
 
   [
-    #("mode", json.string("url")),
-    #("message", json.string(params.message)),
-    #("url", json.string(actions.elicit_url(params))),
+    #("mode", codec_value.string("url")),
+    #("message", codec_value.string(params.message)),
+    #("url", codec_value.string(actions.elicit_url(params))),
   ]
-  |> append_optional("elicitationId", option_map(elicitation_id, json.string))
+  |> append_optional(
+    "elicitationId",
+    option_map(elicitation_id, codec_value.string),
+  )
   |> append_optional(
     "task",
     option_map(actions.elicit_url_task(params), encode_task_metadata),
@@ -525,41 +484,36 @@ fn encode_elicit_request_url_params(
     "_meta",
     option_map(actions.elicit_url_meta(params), encode_request_meta),
   )
-  |> json.object
+  |> codec_value.object
 }
 
-fn encode_task_id_params(params: actions.TaskIdParams) -> json.Json {
-  [#("taskId", json.string(actions.task_id(params)))]
+fn encode_task_id_params(params: actions.TaskIdParams) -> jsonrpc.Value {
+  [#("taskId", codec_value.string(actions.task_id(params)))]
   |> append_optional(
     "_meta",
     option_map(actions.task_id_meta(params), encode_request_meta),
   )
-  |> json.object
-}
-
-fn encoded_object_fields(value: json.Json) -> List(#(String, json.Json)) {
-  let assert Ok(fields) =
-    json.parse(json.to_string(value), value_dict_decoder())
-  fields
-  |> dict.to_list
-  |> list.map(fn(field) { #(field.0, encode_value(field.1)) })
+  |> codec_value.object
 }
 
 fn encode_cancelled_notification_params(
   params: actions.CancelledNotificationParams,
-) -> json.Json {
+) -> jsonrpc.Value {
   let actions.CancelledNotificationParams(request_id, reason, meta) = params
 
   []
-  |> append_optional("requestId", option_map(request_id, encode_request_id))
-  |> append_optional("reason", option_map(reason, json.string))
+  |> append_optional(
+    "requestId",
+    option_map(request_id, codec_encode.encode_request_id),
+  )
+  |> append_optional("reason", option_map(reason, codec_value.string))
   |> append_optional("_meta", option_map(meta, encode_notification_meta))
-  |> json.object
+  |> codec_value.object
 }
 
 fn encode_progress_notification_params(
   params: actions.ProgressNotificationParams,
-) -> json.Json {
+) -> jsonrpc.Value {
   let actions.ProgressNotificationParams(
     progress_token,
     progress,
@@ -569,44 +523,47 @@ fn encode_progress_notification_params(
   ) = params
 
   [
-    #("progressToken", encode_request_id(progress_token)),
-    #("progress", json.float(progress)),
+    #("progressToken", codec_encode.encode_request_id(progress_token)),
+    #("progress", codec_value.float(progress)),
   ]
-  |> append_optional("total", option_map(total, json.float))
-  |> append_optional("message", option_map(message, json.string))
+  |> append_optional("total", option_map(total, codec_value.float))
+  |> append_optional("message", option_map(message, codec_value.string))
   |> append_optional("_meta", option_map(meta, encode_notification_meta))
-  |> json.object
+  |> codec_value.object
 }
 
 fn encode_resource_updated_notification_params(
   params: actions.ResourceUpdatedNotificationParams,
-) -> json.Json {
+) -> jsonrpc.Value {
   let actions.ResourceUpdatedNotificationParams(uri, meta) = params
 
-  [#("uri", json.string(uri))]
+  [#("uri", codec_value.string(uri))]
   |> append_optional("_meta", option_map(meta, encode_notification_meta))
-  |> json.object
+  |> codec_value.object
 }
 
 fn encode_logging_message_notification_params(
   params: actions.LoggingMessageNotificationParams,
-) -> json.Json {
+) -> jsonrpc.Value {
   let actions.LoggingMessageNotificationParams(level, logger, data, meta) =
     params
 
-  [#("level", encode_logging_level(level)), #("data", encode_value(data))]
-  |> append_optional("logger", option_map(logger, json.string))
+  [
+    #("level", encode_logging_level(level)),
+    #("data", codec_encode.encode_value(data)),
+  ]
+  |> append_optional("logger", option_map(logger, codec_value.string))
   |> append_optional("_meta", option_map(meta, encode_notification_meta))
-  |> json.object
+  |> codec_value.object
 }
 
 fn encode_elicitation_complete_notification_params(
   params: actions.ElicitationCompleteNotificationParams,
-) -> json.Json {
+) -> jsonrpc.Value {
   [
     #(
       "elicitationId",
-      json.string(actions.elicitation_complete_notification_id(params)),
+      codec_value.string(actions.elicitation_complete_notification_id(params)),
     ),
   ]
   |> append_optional(
@@ -616,40 +573,40 @@ fn encode_elicitation_complete_notification_params(
       encode_notification_meta,
     ),
   )
-  |> json.object
+  |> codec_value.object
 }
 
 fn encode_task_status_notification_params(
   params: actions.TaskStatusNotificationParams,
-) -> json.Json {
+) -> jsonrpc.Value {
   let actions.TaskStatusNotificationParams(task, meta) = params
 
-  task_fields(task)
+  codec_encode.task_fields(task)
   |> append_optional("_meta", option_map(meta, encode_notification_meta))
-  |> json.object
+  |> codec_value.object
 }
 
-fn encode_request_meta(meta: actions.RequestMeta) -> json.Json {
+fn encode_request_meta(meta: actions.RequestMeta) -> jsonrpc.Value {
   let actions.RequestMeta(progress_token, extra) = meta
 
   []
   |> append_optional(
     "progressToken",
-    option_map(progress_token, encode_request_id),
+    option_map(progress_token, codec_encode.encode_request_id),
   )
   |> append_meta_fields(extra)
-  |> json.object
+  |> codec_value.object
 }
 
-fn encode_notification_meta(meta: actions.NotificationMeta) -> json.Json {
+fn encode_notification_meta(meta: actions.NotificationMeta) -> jsonrpc.Value {
   let actions.NotificationMeta(extra) = meta
-  [] |> append_meta_fields(extra) |> json.object
+  [] |> append_meta_fields(extra) |> codec_value.object
 }
 
 fn append_meta_fields(
-  entries: List(#(String, json.Json)),
+  entries: List(#(String, jsonrpc.Value)),
   meta: Option(actions.Meta),
-) -> List(#(String, json.Json)) {
+) -> List(#(String, jsonrpc.Value)) {
   case meta {
     Some(actions.Meta(fields)) ->
       list.append(
@@ -657,7 +614,7 @@ fn append_meta_fields(
         dict.to_list(fields)
           |> list.map(fn(entry) {
             let #(key, value) = entry
-            #(key, encode_value(value))
+            #(key, codec_encode.encode_value(value))
           }),
       )
     None -> entries
@@ -666,7 +623,7 @@ fn append_meta_fields(
 
 fn encode_client_capabilities(
   capabilities: actions.ClientCapabilities,
-) -> json.Json {
+) -> jsonrpc.Value {
   let actions.ClientCapabilities(
     experimental,
     roots,
@@ -679,7 +636,7 @@ fn encode_client_capabilities(
   |> append_optional(
     "experimental",
     option_map(experimental, fn(fields) {
-      encode_value(jsonrpc.VObject(dict.to_list(fields)))
+      codec_encode.encode_value(jsonrpc.VObject(dict.to_list(fields)))
     }),
   )
   |> append_optional(
@@ -698,59 +655,59 @@ fn encode_client_capabilities(
     "tasks",
     option_map(tasks, encode_client_tasks_capabilities),
   )
-  |> json.object
+  |> codec_value.object
 }
 
 fn encode_client_roots_capabilities(
   capabilities: actions.ClientRootsCapabilities,
-) -> json.Json {
+) -> jsonrpc.Value {
   let actions.ClientRootsCapabilities(list_changed) = capabilities
 
   []
-  |> append_optional("listChanged", option_map(list_changed, json.bool))
-  |> json.object
+  |> append_optional("listChanged", option_map(list_changed, codec_value.bool))
+  |> codec_value.object
 }
 
 fn encode_client_sampling_capabilities(
   capabilities: actions.ClientSamplingCapabilities,
-) -> json.Json {
+) -> jsonrpc.Value {
   let actions.ClientSamplingCapabilities(context, tools) = capabilities
 
   []
-  |> append_optional("context", option_map(context, encode_value))
-  |> append_optional("tools", option_map(tools, encode_value))
-  |> json.object
+  |> append_optional("context", option_map(context, codec_encode.encode_value))
+  |> append_optional("tools", option_map(tools, codec_encode.encode_value))
+  |> codec_value.object
 }
 
 fn encode_client_elicitation_capabilities(
   capabilities: actions.ClientElicitationCapabilities,
-) -> json.Json {
+) -> jsonrpc.Value {
   let actions.ClientElicitationCapabilities(form, url) = capabilities
 
   []
-  |> append_optional("form", option_map(form, encode_value))
-  |> append_optional("url", option_map(url, encode_value))
-  |> json.object
+  |> append_optional("form", option_map(form, codec_encode.encode_value))
+  |> append_optional("url", option_map(url, codec_encode.encode_value))
+  |> codec_value.object
 }
 
 fn encode_client_tasks_capabilities(
   capabilities: actions.ClientTasksCapabilities,
-) -> json.Json {
+) -> jsonrpc.Value {
   let actions.ClientTasksCapabilities(list, cancel, requests) = capabilities
 
   []
-  |> append_optional("list", option_map(list, encode_value))
-  |> append_optional("cancel", option_map(cancel, encode_value))
+  |> append_optional("list", option_map(list, codec_encode.encode_value))
+  |> append_optional("cancel", option_map(cancel, codec_encode.encode_value))
   |> append_optional(
     "requests",
     option_map(requests, encode_client_task_request_capabilities),
   )
-  |> json.object
+  |> codec_value.object
 }
 
 fn encode_client_task_request_capabilities(
   capabilities: actions.ClientTaskRequestCapabilities,
-) -> json.Json {
+) -> jsonrpc.Value {
   let actions.ClientTaskRequestCapabilities(
     sampling_create_message,
     elicitation_create,
@@ -758,48 +715,58 @@ fn encode_client_task_request_capabilities(
 
   []
   |> append_optional("sampling", case sampling_create_message {
-    Some(value) -> Some(json.object([#("createMessage", encode_value(value))]))
+    Some(value) ->
+      Some(
+        codec_value.object([
+          #("createMessage", codec_encode.encode_value(value)),
+        ]),
+      )
     None -> None
   })
   |> append_optional("elicitation", case elicitation_create {
-    Some(value) -> Some(json.object([#("create", encode_value(value))]))
+    Some(value) ->
+      Some(codec_value.object([#("create", codec_encode.encode_value(value))]))
     None -> None
   })
-  |> json.object
+  |> codec_value.object
 }
 
-fn encode_implementation(implementation: actions.Implementation) -> json.Json {
-  codec_common.encode_implementation(implementation)
-}
-
-fn encode_task_metadata(metadata: actions.TaskMetadata) -> json.Json {
+fn encode_task_metadata(metadata: actions.TaskMetadata) -> jsonrpc.Value {
   let actions.TaskMetadata(ttl_ms) = metadata
 
   []
-  |> append_optional("ttl", option_map(ttl_ms, json.int))
-  |> json.object
+  |> append_optional("ttl", option_map(ttl_ms, codec_value.int))
+  |> codec_value.object
 }
 
-fn encode_completion_ref(ref: actions.CompletionRef) -> json.Json {
+fn encode_completion_ref(ref: actions.CompletionRef) -> jsonrpc.Value {
   case ref {
     actions.PromptRef(name, title) ->
-      [#("type", json.string("ref/prompt")), #("name", json.string(name))]
-      |> append_optional("title", option_map(title, json.string))
-      |> json.object
+      [
+        #("type", codec_value.string("ref/prompt")),
+        #("name", codec_value.string(name)),
+      ]
+      |> append_optional("title", option_map(title, codec_value.string))
+      |> codec_value.object
     actions.ResourceTemplateRef(uri) ->
-      json.object([
-        #("type", json.string("ref/resource")),
-        #("uri", json.string(uri)),
+      codec_value.object([
+        #("type", codec_value.string("ref/resource")),
+        #("uri", codec_value.string(uri)),
       ])
   }
 }
 
-fn encode_complete_argument(argument: actions.CompleteArgument) -> json.Json {
+fn encode_complete_argument(
+  argument: actions.CompleteArgument,
+) -> jsonrpc.Value {
   let actions.CompleteArgument(name, value) = argument
-  json.object([#("name", json.string(name)), #("value", json.string(value))])
+  codec_value.object([
+    #("name", codec_value.string(name)),
+    #("value", codec_value.string(value)),
+  ])
 }
 
-fn encode_complete_context(context: actions.CompleteContext) -> json.Json {
+fn encode_complete_context(context: actions.CompleteContext) -> jsonrpc.Value {
   let actions.CompleteContext(arguments) = context
 
   []
@@ -809,16 +776,16 @@ fn encode_complete_context(context: actions.CompleteContext) -> json.Json {
       dict.to_list(arguments)
       |> list.map(fn(entry) {
         let #(key, value) = entry
-        #(key, json.string(value))
+        #(key, codec_value.string(value))
       })
-      |> json.object
+      |> codec_value.object
     }),
   )
-  |> json.object
+  |> codec_value.object
 }
 
-fn encode_logging_level(level: actions.LoggingLevel) -> json.Json {
-  json.string(logging_level_string(level))
+fn encode_logging_level(level: actions.LoggingLevel) -> jsonrpc.Value {
+  codec_value.string(logging_level_string(level))
 }
 
 fn logging_level_string(level: actions.LoggingLevel) -> String {
@@ -836,7 +803,7 @@ fn logging_level_string(level: actions.LoggingLevel) -> String {
 
 fn encode_model_preferences(
   preferences: actions.ModelPreferences,
-) -> json.Json {
+) -> jsonrpc.Value {
   let actions.ModelPreferences(
     hints,
     cost_priority,
@@ -847,54 +814,59 @@ fn encode_model_preferences(
   []
   |> append_optional("hints", case hints {
     [] -> None
-    _ -> Some(json.array(hints, encode_model_hint))
+    _ -> Some(codec_value.array(hints, encode_model_hint))
   })
-  |> append_optional("costPriority", option_map(cost_priority, json.float))
-  |> append_optional("speedPriority", option_map(speed_priority, json.float))
+  |> append_optional(
+    "costPriority",
+    option_map(cost_priority, codec_value.float),
+  )
+  |> append_optional(
+    "speedPriority",
+    option_map(speed_priority, codec_value.float),
+  )
   |> append_optional(
     "intelligencePriority",
-    option_map(intelligence_priority, json.float),
+    option_map(intelligence_priority, codec_value.float),
   )
-  |> json.object
+  |> codec_value.object
 }
 
-fn encode_model_hint(hint: actions.ModelHint) -> json.Json {
+fn encode_model_hint(hint: actions.ModelHint) -> jsonrpc.Value {
   let actions.ModelHint(name) = hint
-  [] |> append_optional("name", option_map(name, json.string)) |> json.object
+  []
+  |> append_optional("name", option_map(name, codec_value.string))
+  |> codec_value.object
 }
 
-fn encode_include_context(context: actions.IncludeContext) -> json.Json {
+fn encode_include_context(context: actions.IncludeContext) -> jsonrpc.Value {
   case context {
-    actions.NoContext -> json.string("none")
-    actions.ThisServerContext -> json.string("thisServer")
-    actions.AllServersContext -> json.string("allServers")
+    actions.NoContext -> codec_value.string("none")
+    actions.ThisServerContext -> codec_value.string("thisServer")
+    actions.AllServersContext -> codec_value.string("allServers")
   }
 }
 
-fn encode_sampling_message(message: actions.SamplingMessage) -> json.Json {
+fn encode_sampling_message(message: actions.SamplingMessage) -> jsonrpc.Value {
   let actions.SamplingMessage(role, content, meta) = message
 
   [#("role", encode_role(role)), #("content", encode_sampling_content(content))]
-  |> append_optional("_meta", option_map(meta, encode_meta))
-  |> json.object
+  |> append_optional("_meta", option_map(meta, codec_encode.encode_meta))
+  |> codec_value.object
 }
 
-fn encode_sampling_content(content: actions.SamplingContent) -> json.Json {
+fn encode_sampling_content(content: actions.SamplingContent) -> jsonrpc.Value {
   case content {
     actions.SingleSamplingContent(block) ->
-      encode_sampling_message_content_block(block)
+      codec_encode.encode_sampling_message_content_block(block)
     actions.MultipleSamplingContent(blocks) ->
-      json.array(blocks, encode_sampling_message_content_block)
+      codec_value.array(
+        blocks,
+        codec_encode.encode_sampling_message_content_block,
+      )
   }
 }
 
-fn encode_sampling_message_content_block(
-  block: actions.SamplingMessageContentBlock,
-) -> json.Json {
-  codec_common.encode_sampling_message_content_block(block)
-}
-
-fn encode_tool_choice(choice: actions.ToolChoice) -> json.Json {
+fn encode_tool_choice(choice: actions.ToolChoice) -> jsonrpc.Value {
   let actions.ToolChoice(mode) = choice
 
   []
@@ -902,44 +874,20 @@ fn encode_tool_choice(choice: actions.ToolChoice) -> json.Json {
     "mode",
     option_map(mode, fn(mode) {
       case mode {
-        actions.ToolAuto -> json.string("auto")
-        actions.ToolRequired -> json.string("required")
-        actions.ToolNone -> json.string("none")
+        actions.ToolAuto -> codec_value.string("auto")
+        actions.ToolRequired -> codec_value.string("required")
+        actions.ToolNone -> codec_value.string("none")
       }
     }),
   )
-  |> json.object
+  |> codec_value.object
 }
 
-fn encode_tool(tool: actions.Tool) -> json.Json {
-  codec_common.encode_tool(tool)
-}
-
-fn encode_meta(meta: actions.Meta) -> json.Json {
-  codec_common.encode_meta(meta)
-}
-
-fn encode_role(role: actions.Role) -> json.Json {
+fn encode_role(role: actions.Role) -> jsonrpc.Value {
   case role {
-    actions.User -> json.string("user")
-    actions.Assistant -> json.string("assistant")
+    actions.User -> codec_value.string("user")
+    actions.Assistant -> codec_value.string("assistant")
   }
-}
-
-fn encode_cursor(cursor: actions.Cursor) -> json.Json {
-  codec_common.encode_cursor(cursor)
-}
-
-fn encode_task_status(status: actions.TaskStatus) -> json.Json {
-  codec_common.encode_task_status(status)
-}
-
-fn encode_value(value: jsonrpc.Value) -> json.Json {
-  codec_common.encode_value(value)
-}
-
-fn encode_request_id(id: jsonrpc.RequestId) -> json.Json {
-  codec_common.encode_request_id(id)
 }
 
 fn response_decoder(
@@ -1009,8 +957,10 @@ pub fn server_message_decoder() -> decode.Decoder(ServerMessage) {
         decode_required_server_notification_message(
           mcp.method_notify_task,
           {
-            use fields <- decode.then(value_dict_decoder())
-            use meta <- decode.then(notification_meta_only_decoder())
+            use fields <- decode.then(codec_decode.value_dict_decoder())
+            use meta <- decode.then(
+              codec_decode.notification_meta_only_decoder(),
+            )
             decode.success(actions.NotifyTaskModern(
               jsonrpc.VObject(dict.to_list(dict.delete(fields, "_meta"))),
               meta,
@@ -1026,7 +976,9 @@ pub fn server_message_decoder() -> decode.Decoder(ServerMessage) {
               "notifications",
               subscription_filter_decoder(),
             )
-            use meta <- decode.then(notification_meta_only_decoder())
+            use meta <- decode.then(
+              codec_decode.notification_meta_only_decoder(),
+            )
             decode.success(actions.NotifySubscriptionsAcknowledgedWithFilter(
               Some(notifications),
               meta,
@@ -1073,7 +1025,7 @@ fn ping_message_decoder() -> decode.Decoder(ServerMessage) {
   decode_optional_server_request_message(
     mcp.method_ping,
     None,
-    request_meta_only_decoder(),
+    codec_decode.request_meta_only_decoder(),
     actions.ServerRequestPing,
   )
 }
@@ -1082,7 +1034,7 @@ fn list_roots_message_decoder() -> decode.Decoder(ServerMessage) {
   decode_optional_server_request_message(
     mcp.method_list_roots,
     None,
-    request_meta_only_decoder(),
+    codec_decode.request_meta_only_decoder(),
     actions.ServerRequestListRoots,
   )
 }
@@ -1115,7 +1067,7 @@ fn list_tasks_message_decoder() -> decode.Decoder(ServerMessage) {
 fn get_task_message_decoder() -> decode.Decoder(ServerMessage) {
   decode_required_server_request_message(
     mcp.method_get_task,
-    task_id_params_decoder(),
+    codec_decode.task_id_params_decoder(),
     actions.ServerRequestGetTask,
   )
 }
@@ -1123,7 +1075,7 @@ fn get_task_message_decoder() -> decode.Decoder(ServerMessage) {
 fn get_task_result_message_decoder() -> decode.Decoder(ServerMessage) {
   decode_required_server_request_message(
     mcp.method_get_task_result,
-    task_id_params_decoder(),
+    codec_decode.task_id_params_decoder(),
     actions.ServerRequestGetTaskResult,
   )
 }
@@ -1131,7 +1083,7 @@ fn get_task_result_message_decoder() -> decode.Decoder(ServerMessage) {
 fn cancel_task_message_decoder() -> decode.Decoder(ServerMessage) {
   decode_required_server_request_message(
     mcp.method_cancel_task,
-    task_id_params_decoder(),
+    codec_decode.task_id_params_decoder(),
     actions.ServerRequestCancelTask,
   )
 }
@@ -1221,7 +1173,7 @@ fn decode_server_notification_message(
       use id <- decode.optional_field(
         "id",
         None,
-        decode.optional(request_id_decoder()),
+        decode.optional(codec_decode.request_id_decoder()),
       )
       decode.success(id)
     },
@@ -1282,7 +1234,10 @@ fn decode_meta_server_notification_message(
   decode_server_notification_message(
     method,
     decode.map(
-      optional_params_decoder(None, notification_meta_only_decoder()),
+      optional_params_decoder(
+        None,
+        codec_decode.notification_meta_only_decoder(),
+      ),
       wrap,
     ),
   )
@@ -1334,7 +1289,7 @@ fn unknown_server_message_decoder(
     use id <- decode.optional_field(
       "id",
       None,
-      decode.optional(request_id_decoder()),
+      decode.optional(codec_decode.request_id_decoder()),
     )
     case id {
       Some(request_id) -> decode.success(UnknownRequest(request_id, method))
@@ -1348,7 +1303,7 @@ fn decode_server_request_message(
   params_decoder: decode.Decoder(params),
   wrap: fn(params) -> actions.ServerActionRequest,
 ) -> decode.Decoder(ServerMessage) {
-  decode.then(decode.at(["id"], request_id_decoder()), fn(id) {
+  decode.then(decode.at(["id"], codec_decode.request_id_decoder()), fn(id) {
     decode.then(params_decoder, fn(params) {
       decode.success(
         ServerActionRequest(jsonrpc.Request(id, method, Some(wrap(params)))),
@@ -1364,7 +1319,7 @@ fn cancelled_notification_params_decoder() -> decode.Decoder(
     use request_id <- decode.optional_field(
       "requestId",
       None,
-      decode.optional(request_id_decoder()),
+      decode.optional(codec_decode.request_id_decoder()),
     )
     use reason <- decode.optional_field(
       "reason",
@@ -1374,7 +1329,7 @@ fn cancelled_notification_params_decoder() -> decode.Decoder(
     use meta <- decode.optional_field(
       "_meta",
       None,
-      decode.optional(notification_meta_decoder()),
+      decode.optional(codec_decode.notification_meta_decoder()),
     )
     decode.success(actions.CancelledNotificationParams(request_id, reason, meta))
   }
@@ -1384,12 +1339,15 @@ fn progress_notification_params_decoder() -> decode.Decoder(
   actions.ProgressNotificationParams,
 ) {
   {
-    use progress_token <- decode.field("progressToken", request_id_decoder())
-    use progress <- decode.field("progress", number_decoder())
+    use progress_token <- decode.field(
+      "progressToken",
+      codec_decode.request_id_decoder(),
+    )
+    use progress <- decode.field("progress", codec_decode.number_decoder())
     use total <- decode.optional_field(
       "total",
       None,
-      decode.optional(number_decoder()),
+      decode.optional(codec_decode.number_decoder()),
     )
     use message <- decode.optional_field(
       "message",
@@ -1399,7 +1357,7 @@ fn progress_notification_params_decoder() -> decode.Decoder(
     use meta <- decode.optional_field(
       "_meta",
       None,
-      decode.optional(notification_meta_decoder()),
+      decode.optional(codec_decode.notification_meta_decoder()),
     )
     decode.success(actions.ProgressNotificationParams(
       progress_token,
@@ -1419,7 +1377,7 @@ fn resource_updated_notification_params_decoder() -> decode.Decoder(
     use meta <- decode.optional_field(
       "_meta",
       None,
-      decode.optional(notification_meta_decoder()),
+      decode.optional(codec_decode.notification_meta_decoder()),
     )
     decode.success(actions.ResourceUpdatedNotificationParams(uri, meta))
   }
@@ -1429,7 +1387,7 @@ fn logging_message_notification_params_decoder() -> decode.Decoder(
   actions.LoggingMessageNotificationParams,
 ) {
   {
-    use level <- decode.field("level", logging_level_decoder())
+    use level <- decode.field("level", codec_decode.logging_level_decoder())
     use logger <- decode.optional_field(
       "logger",
       None,
@@ -1439,7 +1397,7 @@ fn logging_message_notification_params_decoder() -> decode.Decoder(
     use meta <- decode.optional_field(
       "_meta",
       None,
-      decode.optional(notification_meta_decoder()),
+      decode.optional(codec_decode.notification_meta_decoder()),
     )
     decode.success(actions.LoggingMessageNotificationParams(
       level,
@@ -1458,7 +1416,7 @@ fn elicitation_complete_notification_params_decoder() -> decode.Decoder(
     use meta <- decode.optional_field(
       "_meta",
       None,
-      decode.optional(notification_meta_decoder()),
+      decode.optional(codec_decode.notification_meta_decoder()),
     )
     decode.success(case meta {
       None -> actions.ElicitationCompleteNotificationParams(elicitation_id)
@@ -1493,7 +1451,7 @@ fn task_status_notification_params_decoder() -> decode.Decoder(
     use meta <- decode.optional_field(
       "_meta",
       None,
-      decode.optional(notification_meta_decoder()),
+      decode.optional(codec_decode.notification_meta_decoder()),
     )
     decode.success(actions.TaskStatusNotificationParams(
       actions.Task(
@@ -1625,7 +1583,10 @@ fn complete_action_result_decoder(
 
 fn discover_result_decoder() -> decode.Decoder(actions.DiscoverResult) {
   use versions <- decode.field("supportedVersions", decode.list(decode.string))
-  use capabilities <- decode.field("capabilities", value_dict_decoder())
+  use capabilities <- decode.field(
+    "capabilities",
+    codec_decode.value_dict_decoder(),
+  )
   use instructions <- decode.optional_field(
     "instructions",
     None,
@@ -1653,7 +1614,7 @@ fn input_required_result_decoder() -> decode.Decoder(
       use requests <- decode.optional_field(
         "inputRequests",
         None,
-        decode.map(value_dict_decoder(), Some),
+        decode.map(codec_decode.value_dict_decoder(), Some),
       )
       use state <- decode.optional_field(
         "requestState",
@@ -1684,7 +1645,7 @@ fn input_required_result_decoder() -> decode.Decoder(
 }
 
 pub fn subscription_filter_decoder() -> decode.Decoder(jsonrpc.Value) {
-  use fields <- decode.then(value_dict_decoder())
+  use fields <- decode.then(codec_decode.value_dict_decoder())
   use _tools <- decode.optional_field(
     "toolsListChanged",
     None,
@@ -1708,7 +1669,10 @@ pub fn subscription_filter_decoder() -> decode.Decoder(jsonrpc.Value) {
   use _extensions <- decode.optional_field(
     "extensions",
     None,
-    decode.map(decode.dict(decode.string, value_dict_decoder()), Some),
+    decode.map(
+      decode.dict(decode.string, codec_decode.value_dict_decoder()),
+      Some,
+    ),
   )
   decode.success(jsonrpc.VObject(dict.to_list(fields)))
 }
@@ -1771,7 +1735,7 @@ fn successful_response_decoder(
 ) -> decode.Decoder(jsonrpc.Response(result)) {
   {
     use version <- decode.field("jsonrpc", decode.string)
-    use id <- decode.field("id", request_id_decoder())
+    use id <- decode.field("id", codec_decode.request_id_decoder())
     use result <- decode.field("result", result_decoder)
     let _ = version
     decode.success(jsonrpc.ResultResponse(id, result))
@@ -1781,8 +1745,11 @@ fn successful_response_decoder(
 fn failed_response_decoder() -> decode.Decoder(jsonrpc.Response(result)) {
   {
     use version <- decode.field("jsonrpc", decode.string)
-    use id <- decode.field("id", decode.optional(request_id_decoder()))
-    use error <- decode.field("error", error_decoder())
+    use id <- decode.field(
+      "id",
+      decode.optional(codec_decode.request_id_decoder()),
+    )
+    use error <- decode.field("error", codec_decode.error_decoder())
     let _ = version
     decode.success(jsonrpc.ErrorResponse(id, error))
   }
@@ -1801,7 +1768,10 @@ fn initialize_result_decoder() -> decode.Decoder(actions.InitializeResult) {
       "capabilities",
       server_capabilities_decoder(),
     )
-    use server_info <- decode.field("serverInfo", implementation_decoder())
+    use server_info <- decode.field(
+      "serverInfo",
+      codec_decode.implementation_decoder(),
+    )
     use instructions <- decode.optional_field(
       "instructions",
       None,
@@ -2052,7 +2022,7 @@ fn create_message_request_params_decoder() -> decode.Decoder(
     use temperature <- decode.optional_field(
       "temperature",
       None,
-      decode.optional(number_decoder()),
+      decode.optional(codec_decode.number_decoder()),
     )
     use max_tokens <- decode.field("maxTokens", decode.int)
     use stop_sequences <- decode.optional_field(
@@ -2078,12 +2048,12 @@ fn create_message_request_params_decoder() -> decode.Decoder(
     use task <- decode.optional_field(
       "task",
       None,
-      decode.optional(task_metadata_decoder()),
+      decode.optional(codec_decode.task_metadata_decoder()),
     )
     use meta <- decode.optional_field(
       "_meta",
       None,
-      decode.optional(request_meta_decoder()),
+      decode.optional(codec_decode.request_meta_decoder()),
     )
     decode.success(actions.CreateMessageRequestParams(
       messages: messages,
@@ -2114,7 +2084,7 @@ fn paginated_request_params_decoder() -> decode.Decoder(
     use meta <- decode.optional_field(
       "_meta",
       None,
-      decode.optional(request_meta_decoder()),
+      decode.optional(codec_decode.request_meta_decoder()),
     )
     decode.success(actions.PaginatedRequestParams(cursor, meta))
   }
@@ -2163,12 +2133,12 @@ fn elicit_request_form_params_decoder() -> decode.Decoder(
     use task <- decode.optional_field(
       "task",
       None,
-      decode.optional(task_metadata_decoder()),
+      decode.optional(codec_decode.task_metadata_decoder()),
     )
     use meta <- decode.optional_field(
       "_meta",
       None,
-      decode.optional(request_meta_decoder()),
+      decode.optional(codec_decode.request_meta_decoder()),
     )
     decode.success(actions.ElicitRequestFormParams(
       message,
@@ -2193,87 +2163,16 @@ fn elicit_request_url_params_decoder() -> decode.Decoder(
     use task <- decode.optional_field(
       "task",
       None,
-      decode.optional(task_metadata_decoder()),
+      decode.optional(codec_decode.task_metadata_decoder()),
     )
     use meta <- decode.optional_field(
       "_meta",
       None,
-      decode.optional(request_meta_decoder()),
+      decode.optional(codec_decode.request_meta_decoder()),
     )
     decode.success(case elicitation_id {
       Some(id) -> actions.ElicitRequestUrlParams(message, id, url, task, meta)
       None -> actions.ElicitRequestUrlParamsWithoutId(message, url, task, meta)
-    })
-  }
-}
-
-fn request_meta_decoder() -> decode.Decoder(actions.RequestMeta) {
-  {
-    use fields <- decode.then(value_dict_decoder())
-    use progress_token <- decode.optional_field(
-      "progressToken",
-      None,
-      decode.map(request_id_decoder(), Some),
-    )
-    let fields = dict.delete(fields, "progressToken")
-    let extra = case dict.size(fields) {
-      0 -> None
-      _ -> Some(actions.Meta(fields))
-    }
-    decode.success(actions.RequestMeta(progress_token, extra))
-  }
-}
-
-fn request_meta_only_decoder() -> decode.Decoder(Option(actions.RequestMeta)) {
-  use meta <- decode.optional_field(
-    "_meta",
-    None,
-    decode.map(request_meta_decoder(), Some),
-  )
-  decode.success(meta)
-}
-
-fn notification_meta_only_decoder() -> decode.Decoder(
-  Option(actions.NotificationMeta),
-) {
-  {
-    use meta <- decode.optional_field(
-      "_meta",
-      None,
-      decode.optional(notification_meta_decoder()),
-    )
-    decode.success(meta)
-  }
-}
-
-fn notification_meta_decoder() -> decode.Decoder(actions.NotificationMeta) {
-  decode.map(value_dict_decoder(), fn(fields) {
-    let extra = case dict.size(fields) {
-      0 -> None
-      _ -> Some(actions.Meta(fields))
-    }
-    actions.NotificationMeta(extra)
-  })
-}
-
-fn task_metadata_decoder() -> decode.Decoder(actions.TaskMetadata) {
-  {
-    use ttl_ms <- decode.optional_field(
-      "ttl",
-      None,
-      decode.optional(decode.int),
-    )
-    decode.success(actions.TaskMetadata(ttl_ms))
-  }
-}
-
-fn task_id_params_decoder() -> decode.Decoder(actions.TaskIdParams) {
-  {
-    use task_id <- decode.field("taskId", decode.string)
-    use meta <- decode.then(request_meta_only_decoder())
-    decode.success(case meta {
-      None -> actions.TaskIdParams(task_id)
-      Some(_) -> actions.TaskIdParamsWithMeta(task_id, meta)
     })
   }
 }
@@ -2288,17 +2187,17 @@ fn model_preferences_decoder() -> decode.Decoder(actions.ModelPreferences) {
     use cost_priority <- decode.optional_field(
       "costPriority",
       None,
-      decode.optional(number_decoder()),
+      decode.optional(codec_decode.number_decoder()),
     )
     use speed_priority <- decode.optional_field(
       "speedPriority",
       None,
-      decode.optional(number_decoder()),
+      decode.optional(codec_decode.number_decoder()),
     )
     use intelligence_priority <- decode.optional_field(
       "intelligencePriority",
       None,
-      decode.optional(number_decoder()),
+      decode.optional(codec_decode.number_decoder()),
     )
     decode.success(actions.ModelPreferences(
       hints,
@@ -2492,47 +2391,12 @@ fn paginated_result_decoder(
   }
 }
 
-fn implementation_decoder() -> decode.Decoder(actions.Implementation) {
-  {
-    use name <- decode.field("name", decode.string)
-    use version <- decode.field("version", decode.string)
-    use title <- decode.optional_field(
-      "title",
-      None,
-      decode.optional(decode.string),
-    )
-    use description <- decode.optional_field(
-      "description",
-      None,
-      decode.optional(decode.string),
-    )
-    use website_url <- decode.optional_field(
-      "websiteUrl",
-      None,
-      decode.optional(decode.string),
-    )
-    use icons <- decode.optional_field(
-      "icons",
-      [],
-      decode.list(of: icon_decoder()),
-    )
-    decode.success(actions.Implementation(
-      name: name,
-      version: version,
-      title: title,
-      description: description,
-      website_url: website_url,
-      icons: icons,
-    ))
-  }
-}
-
 fn server_capabilities_decoder() -> decode.Decoder(actions.ServerCapabilities) {
   {
     use experimental <- decode.optional_field(
       "experimental",
       None,
-      decode.optional(value_dict_decoder()),
+      decode.optional(codec_decode.value_dict_decoder()),
     )
     use logging <- decode.optional_field(
       "logging",
@@ -2662,38 +2526,6 @@ fn server_task_request_capabilities_decoder() -> decode.Decoder(
   }
 }
 
-fn icon_decoder() -> decode.Decoder(actions.Icon) {
-  {
-    use src <- decode.field("src", decode.string)
-    use mime_type <- decode.optional_field(
-      "mimeType",
-      None,
-      decode.optional(decode.string),
-    )
-    use sizes <- decode.optional_field(
-      "sizes",
-      [],
-      decode.list(of: decode.string),
-    )
-    use theme <- decode.optional_field(
-      "theme",
-      None,
-      decode.optional(icon_theme_decoder()),
-    )
-    decode.success(actions.Icon(src, mime_type, sizes, theme))
-  }
-}
-
-fn icon_theme_decoder() -> decode.Decoder(actions.IconTheme) {
-  decode.then(decode.string, fn(value) {
-    case value {
-      "light" -> decode.success(actions.LightTheme)
-      "dark" -> decode.success(actions.DarkTheme)
-      _ -> decode.failure(actions.LightTheme, expected: "IconTheme")
-    }
-  })
-}
-
 fn resource_decoder() -> decode.Decoder(actions.Resource) {
   {
     use uri <- decode.field("uri", decode.string)
@@ -2722,7 +2554,7 @@ fn resource_decoder() -> decode.Decoder(actions.Resource) {
     use icons <- decode.optional_field(
       "icons",
       [],
-      decode.list(of: icon_decoder()),
+      decode.list(of: codec_decode.icon_decoder()),
     )
     use meta <- decode.optional_field(
       "_meta",
@@ -2770,7 +2602,7 @@ fn resource_template_decoder() -> decode.Decoder(actions.ResourceTemplate) {
     use icons <- decode.optional_field(
       "icons",
       [],
-      decode.list(of: icon_decoder()),
+      decode.list(of: codec_decode.icon_decoder()),
     )
     use meta <- decode.optional_field(
       "_meta",
@@ -2848,7 +2680,7 @@ fn prompt_decoder() -> decode.Decoder(actions.Prompt) {
     use icons <- decode.optional_field(
       "icons",
       [],
-      decode.list(of: icon_decoder()),
+      decode.list(of: codec_decode.icon_decoder()),
     )
     use meta <- decode.optional_field(
       "_meta",
@@ -2928,7 +2760,7 @@ fn tool_decoder() -> decode.Decoder(actions.Tool) {
     use icons <- decode.optional_field(
       "icons",
       [],
-      decode.list(of: icon_decoder()),
+      decode.list(of: codec_decode.icon_decoder()),
     )
     use meta <- decode.optional_field(
       "_meta",
@@ -2961,7 +2793,7 @@ fn tool_execution_decoder() -> decode.Decoder(actions.ToolExecution) {
 }
 
 fn tool_input_schema_decoder() -> decode.Decoder(jsonrpc.Value) {
-  use fields <- decode.then(value_dict_decoder())
+  use fields <- decode.then(codec_decode.value_dict_decoder())
   use schema_type <- decode.field("type", decode.string)
   case schema_type {
     "object" -> decode.success(jsonrpc.VObject(dict.to_list(fields)))
@@ -2974,7 +2806,7 @@ fn tool_input_schema_decoder() -> decode.Decoder(jsonrpc.Value) {
 }
 
 fn schema_object_decoder() -> decode.Decoder(jsonrpc.Value) {
-  use fields <- decode.then(value_dict_decoder())
+  use fields <- decode.then(codec_decode.value_dict_decoder())
   decode.success(jsonrpc.VObject(dict.to_list(fields)))
 }
 
@@ -3199,7 +3031,7 @@ fn annotations_decoder() -> decode.Decoder(actions.Annotations) {
     use priority <- decode.optional_field(
       "priority",
       None,
-      decode.optional(number_decoder()),
+      decode.optional(codec_decode.number_decoder()),
     )
     use last_modified <- decode.optional_field(
       "lastModified",
@@ -3214,7 +3046,7 @@ fn tool_use_content_decoder() -> decode.Decoder(actions.ToolUseContent) {
   {
     use id <- decode.field("id", decode.string)
     use name <- decode.field("name", decode.string)
-    use input <- decode.field("input", value_dict_decoder())
+    use input <- decode.field("input", codec_decode.value_dict_decoder())
     use meta <- decode.optional_field(
       "_meta",
       None,
@@ -3298,22 +3130,6 @@ fn task_status_decoder() -> decode.Decoder(actions.TaskStatus) {
   })
 }
 
-fn logging_level_decoder() -> decode.Decoder(actions.LoggingLevel) {
-  decode.then(decode.string, fn(value) {
-    case value {
-      "debug" -> decode.success(actions.Debug)
-      "info" -> decode.success(actions.Info)
-      "notice" -> decode.success(actions.Notice)
-      "warning" -> decode.success(actions.Warning)
-      "error" -> decode.success(actions.Error)
-      "critical" -> decode.success(actions.Critical)
-      "alert" -> decode.success(actions.Alert)
-      "emergency" -> decode.success(actions.Emergency)
-      _ -> decode.failure(actions.Info, expected: "LoggingLevel")
-    }
-  })
-}
-
 fn role_decoder() -> decode.Decoder(actions.Role) {
   decode.then(decode.string, fn(value) {
     case value {
@@ -3344,7 +3160,7 @@ fn elicit_content_decoder() -> decode.Decoder(
 fn elicit_value_decoder() -> decode.Decoder(actions.ElicitValue) {
   decode.one_of(decode.map(decode.string, actions.ElicitString), or: [
     decode.map(decode.int, actions.ElicitInt),
-    decode.map(number_decoder(), actions.ElicitFloat),
+    decode.map(codec_decode.number_decoder(), actions.ElicitFloat),
     decode.map(decode.bool, actions.ElicitBool),
     decode.map(decode.list(of: decode.string), actions.ElicitStringArray),
   ])
@@ -3362,108 +3178,18 @@ fn meta_only_decoder() -> decode.Decoder(Option(actions.Meta)) {
 }
 
 fn meta_decoder() -> decode.Decoder(actions.Meta) {
-  decode.map(value_dict_decoder(), actions.Meta)
-}
-
-fn value_dict_decoder() -> decode.Decoder(dict.Dict(String, jsonrpc.Value)) {
-  decode.dict(decode.string, value_decoder())
-}
-
-fn request_id_decoder() -> decode.Decoder(jsonrpc.RequestId) {
-  decode.one_of(decode.map(decode.string, jsonrpc.StringId), or: [
-    decode.map(decode.int, jsonrpc.IntId),
-  ])
-}
-
-fn error_decoder() -> decode.Decoder(jsonrpc.RpcError) {
-  {
-    use code <- decode.field("code", decode.int)
-    use message <- decode.field("message", decode.string)
-    use data <- decode.optional_field(
-      "data",
-      None,
-      decode.optional(value_decoder()),
-    )
-    decode.success(jsonrpc.RpcError(code:, message:, data: data))
-  }
+  decode.map(codec_decode.value_dict_decoder(), actions.Meta)
 }
 
 pub fn value_decoder() -> decode.Decoder(jsonrpc.Value) {
-  use <- decode.recursive
-  decode.one_of(decode.map(decode.string, jsonrpc.VString), or: [
-    decode.map(decode.int, jsonrpc.VInt),
-    decode.map(number_decoder(), jsonrpc.VFloat),
-    decode.map(decode.bool, jsonrpc.VBool),
-    decode.map(decode.list(of: value_decoder()), jsonrpc.VArray),
-    decode.map(decode.dict(decode.string, value_decoder()), fn(fields) {
-      jsonrpc.VObject(dict.to_list(fields))
-    }),
-    null_value_decoder(),
-  ])
-}
-
-fn null_value_decoder() -> decode.Decoder(jsonrpc.Value) {
-  decode.map(decode.optional(decode.dynamic), fn(_) { jsonrpc.VNull })
-  |> decode.collapse_errors("Null")
-}
-
-fn number_decoder() -> decode.Decoder(Float) {
-  decode.one_of(decode.float, or: [decode.map(decode.int, int.to_float)])
-}
-
-fn json_error_message(error: json.DecodeError) -> String {
-  case error {
-    json.UnexpectedEndOfInput -> "Unexpected end of JSON input"
-    json.UnexpectedByte(byte) -> "Unexpected JSON byte: " <> byte
-    json.UnexpectedSequence(sequence) ->
-      "Unexpected JSON sequence: " <> sequence
-    json.UnableToDecode(errors) ->
-      case errors {
-        [] -> "Unable to decode JSON value"
-        [decode.DecodeError(expected, found, path), ..] ->
-          "Expected "
-          <> expected
-          <> ", found "
-          <> found
-          <> decode_path_suffix(path)
-      }
-  }
-}
-
-fn decode_path_suffix(path: List(String)) -> String {
-  case path {
-    [] -> ""
-    _ -> " at " <> string.join(path, ".")
-  }
-}
-
-fn task_fields(task: actions.Task) -> List(#(String, json.Json)) {
-  let actions.Task(
-    task_id,
-    status,
-    status_message,
-    created_at,
-    last_updated_at,
-    ttl_ms,
-    poll_interval_ms,
-  ) = task
-
-  [
-    #("taskId", json.string(task_id)),
-    #("status", encode_task_status(status)),
-    #("createdAt", json.string(created_at)),
-    #("lastUpdatedAt", json.string(last_updated_at)),
-    #("ttl", json.nullable(ttl_ms, json.int)),
-  ]
-  |> append_optional("statusMessage", option_map(status_message, json.string))
-  |> append_optional("pollInterval", option_map(poll_interval_ms, json.int))
+  codec_decode.value_decoder()
 }
 
 fn append_optional(
-  fields: List(#(String, json.Json)),
+  fields: List(#(String, jsonrpc.Value)),
   key: String,
-  value: Option(json.Json),
-) -> List(#(String, json.Json)) {
+  value: Option(jsonrpc.Value),
+) -> List(#(String, jsonrpc.Value)) {
   case value {
     Some(value) -> list.append(fields, [#(key, value)])
     None -> fields
@@ -3471,10 +3197,10 @@ fn append_optional(
 }
 
 fn prepend_optional(
-  fields: List(#(String, json.Json)),
+  fields: List(#(String, jsonrpc.Value)),
   key: String,
-  value: Option(json.Json),
-) -> List(#(String, json.Json)) {
+  value: Option(jsonrpc.Value),
+) -> List(#(String, jsonrpc.Value)) {
   case value {
     Some(value) -> [#(key, value), ..fields]
     None -> fields

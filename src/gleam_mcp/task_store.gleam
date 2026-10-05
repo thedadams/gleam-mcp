@@ -18,13 +18,16 @@ type Entry {
     outcome: Option(Result(actions.TaskResult, jsonrpc.RpcError)),
     waiters: List(process.Subject(Result(actions.TaskResult, jsonrpc.RpcError))),
     scope: Option(String),
-    worker: Option(process.Pid),
-    monitor: Option(process.Monitor),
+    worker: Option(TrackedWorker),
     inputs: Dict(String, jsonrpc.Value),
     resume: Option(
       fn(Dict(String, jsonrpc.Value)) -> Result(ModernOutcome, jsonrpc.RpcError),
     ),
   )
+}
+
+type TrackedWorker {
+  TrackedWorker(pid: process.Pid, monitor: process.Monitor)
 }
 
 /// Modern tasks can wait for MRTR input before resuming their monitored worker.
@@ -309,7 +312,7 @@ fn loop(
         dict.insert(
           entries,
           task.task_id,
-          Entry(task, None, [], scope, None, None, dict.new(), None),
+          Entry(task, None, [], scope, None, dict.new(), None),
         ),
       )
     }
@@ -328,7 +331,7 @@ fn loop(
     }
     StartWorker(task_id, worker, reply_to) -> {
       let #(next_entries, response) =
-        start_task_worker(entries, task_id, Store(subject), worker)
+        start_task_worker(entries, task_id, subject, worker)
       process.send(reply_to, response)
       loop(subject, next_entries)
     }
@@ -403,9 +406,11 @@ fn loop(
     }
     ModernFinished(task_id, pid, outcome) -> {
       case dict.get(entries, task_id) {
-        Ok(entry) if entry.worker == Some(pid) -> {
-          release_monitor(entry.monitor)
-          let entry = Entry(..entry, worker: None, monitor: None)
+        Ok(Entry(worker: Some(TrackedWorker(pid: worker, ..)), ..) as entry)
+          if worker == pid
+        -> {
+          release_worker_monitor(entry.worker)
+          let entry = Entry(..entry, worker: None)
           let entries = dict.insert(entries, task_id, entry)
           case outcome {
             Ok(ModernInputRequired(inputs, resume)) -> {
@@ -459,21 +464,21 @@ fn loop(
     }
     WorkerReady(task_id, pid, ready) -> {
       case dict.get(entries, task_id) {
-        Ok(entry) if entry.worker == Some(pid) -> process.send(ready, Nil)
+        Ok(Entry(worker: Some(TrackedWorker(pid: worker, ..)), ..))
+          if worker == pid
+        -> process.send(ready, Nil)
         _ -> process.kill(pid)
       }
       loop(subject, entries)
     }
     WorkerFinished(task_id, pid, outcome) -> {
       case dict.get(entries, task_id) {
-        Ok(entry) if entry.worker == Some(pid) -> {
-          release_monitor(entry.monitor)
+        Ok(Entry(worker: Some(TrackedWorker(pid: worker, ..)), ..) as entry)
+          if worker == pid
+        -> {
+          release_worker_monitor(entry.worker)
           let entries =
-            dict.insert(
-              entries,
-              task_id,
-              Entry(..entry, worker: None, monitor: None),
-            )
+            dict.insert(entries, task_id, Entry(..entry, worker: None))
           let #(next_entries, _, waiters, task_result) =
             complete_task(entries, task_id, outcome)
           notify_waiters(waiters, task_result)
@@ -484,7 +489,12 @@ fn loop(
     }
     WorkerDown(process.ProcessDown(_, pid, _)) -> {
       case
-        list.find(dict.to_list(entries), fn(pair) { pair.1.worker == Some(pid) })
+        list.find(dict.to_list(entries), fn(pair) {
+          case pair.1.worker {
+            Some(worker) -> worker.pid == pid
+            None -> False
+          }
+        })
       {
         Ok(#(task_id, _)) -> {
           let error =
@@ -505,7 +515,7 @@ fn loop(
     Expire(task_id) -> {
       case dict.get(entries, task_id) {
         Ok(entry) -> {
-          stop_worker(entry.worker, entry.monitor)
+          stop_worker(entry.worker)
           notify_waiters(entry.waiters, Error(task_expired_error(task_id)))
         }
         Error(Nil) -> Nil
@@ -550,42 +560,16 @@ fn loop(
 fn start_task_worker(
   entries: Dict(String, Entry),
   task_id: String,
-  store: Store,
+  subject: process.Subject(Message),
   worker: fn() -> Result(actions.TaskResult, jsonrpc.RpcError),
 ) -> #(Dict(String, Entry), Result(Nil, jsonrpc.RpcError)) {
-  case dict.get(entries, task_id) {
-    Ok(entry) ->
-      case is_terminal(entry.task.status), entry.worker {
-        False, None -> {
-          let Store(subject) = store
-          let pid =
-            process.spawn_unlinked(fn() {
-              let ready = process.new_subject()
-              process.send(subject, WorkerReady(task_id, process.self(), ready))
-              process.receive_forever(ready)
-              process.send(
-                subject,
-                WorkerFinished(task_id, process.self(), worker()),
-              )
-              Nil
-            })
-          let monitor = process.monitor(pid)
-          #(
-            dict.insert(
-              entries,
-              task_id,
-              Entry(..entry, worker: Some(pid), monitor: Some(monitor)),
-            ),
-            Ok(Nil),
-          )
-        }
-        _, _ -> #(
-          entries,
-          Error(jsonrpc.invalid_params_error("Task cannot start another worker")),
-        )
-      }
-    Error(Nil) -> #(entries, Error(task_not_found_error(task_id)))
-  }
+  start_worker_entry(
+    entries,
+    task_id,
+    subject,
+    fn(pid) { WorkerFinished(task_id, pid, worker()) },
+    fn(entry) { entry },
+  )
 }
 
 fn start_modern_task(
@@ -594,6 +578,29 @@ fn start_modern_task(
   subject: process.Subject(Message),
   worker: fn() -> Result(ModernOutcome, jsonrpc.RpcError),
 ) -> #(Dict(String, Entry), Result(Nil, jsonrpc.RpcError)) {
+  start_worker_entry(
+    entries,
+    task_id,
+    subject,
+    fn(pid) { ModernFinished(task_id, pid, worker()) },
+    fn(entry) {
+      Entry(
+        ..entry,
+        task: set_task_status(entry.task, actions.Working, None),
+        inputs: dict.new(),
+        resume: None,
+      )
+    },
+  )
+}
+
+fn start_worker_entry(
+  entries: Dict(String, Entry),
+  task_id: String,
+  subject: process.Subject(Message),
+  finish: fn(process.Pid) -> Message,
+  prepare: fn(Entry) -> Entry,
+) -> #(Dict(String, Entry), Result(Nil, jsonrpc.RpcError)) {
   case dict.get(entries, task_id) {
     Ok(entry) ->
       case is_terminal(entry.task.status), entry.worker {
@@ -603,22 +610,18 @@ fn start_modern_task(
               let ready = process.new_subject()
               process.send(subject, WorkerReady(task_id, process.self(), ready))
               process.receive_forever(ready)
-              process.send(
-                subject,
-                ModernFinished(task_id, process.self(), worker()),
-              )
+              process.send(subject, finish(process.self()))
             })
           let monitor = process.monitor(pid)
-          let entry =
-            Entry(
-              ..entry,
-              worker: Some(pid),
-              monitor: Some(monitor),
-              task: set_task_status(entry.task, actions.Working, None),
-              inputs: dict.new(),
-              resume: None,
-            )
-          #(dict.insert(entries, task_id, entry), Ok(Nil))
+          let entry = prepare(entry)
+          #(
+            dict.insert(
+              entries,
+              task_id,
+              Entry(..entry, worker: Some(TrackedWorker(pid, monitor))),
+            ),
+            Ok(Nil),
+          )
         }
         _, _ -> #(
           entries,
@@ -725,14 +728,8 @@ fn cancel_task(
               Some("The task was cancelled by request."),
             )
           let next_entry =
-            Entry(
-              ..entry,
-              task: cancelled,
-              waiters: [],
-              worker: None,
-              monitor: None,
-            )
-          stop_worker(entry.worker, entry.monitor)
+            Entry(..entry, task: cancelled, waiters: [], worker: None)
+          stop_worker(entry.worker)
           notify_waiters(entry.waiters, Error(cancelled_task_error(task_id)))
           #(dict.insert(entries, task_id, next_entry), Ok(cancelled))
         }
@@ -753,7 +750,7 @@ fn complete_task(
 ) {
   case dict.get(entries, task_id) {
     Ok(entry) -> {
-      stop_worker(entry.worker, entry.monitor)
+      stop_worker(entry.worker)
       let task = terminal_task(entry.task, outcome)
       let final_outcome = case is_terminal(entry.task.status), entry.outcome {
         True, Some(previous) -> previous
@@ -767,7 +764,6 @@ fn complete_task(
           outcome: Some(final_outcome),
           waiters: [],
           worker: None,
-          monitor: None,
         )
       #(
         dict.insert(entries, task_id, next_entry),
@@ -895,20 +891,17 @@ fn find_entry(
   }
 }
 
-fn stop_worker(
-  worker: Option(process.Pid),
-  monitor: Option(process.Monitor),
-) -> Nil {
-  release_monitor(monitor)
+fn stop_worker(worker: Option(TrackedWorker)) -> Nil {
+  release_worker_monitor(worker)
   case worker {
-    Some(pid) -> process.kill(pid)
+    Some(worker) -> process.kill(worker.pid)
     None -> Nil
   }
 }
 
-fn release_monitor(monitor: Option(process.Monitor)) -> Nil {
-  case monitor {
-    Some(reference) -> process.demonitor_process(reference)
+fn release_worker_monitor(worker: Option(TrackedWorker)) -> Nil {
+  case worker {
+    Some(worker) -> process.demonitor_process(worker.monitor)
     None -> Nil
   }
 }

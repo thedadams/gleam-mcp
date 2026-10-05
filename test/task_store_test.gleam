@@ -134,6 +134,125 @@ pub fn scoped_task_access_does_not_expose_other_requestors_test() {
   task_store.result_scoped(store, task.task_id, owner) |> should.be_ok
 }
 
+pub fn sampling_and_elicitation_task_results_preserve_their_payloads_test() {
+  let store = task_store.new()
+  let meta =
+    Some(
+      actions.Meta(
+        dict.from_list([
+          #("custom", jsonrpc.VString("preserved")),
+        ]),
+      ),
+    )
+  let message =
+    actions.CreateMessageResult(
+      actions.SamplingMessage(
+        actions.Assistant,
+        actions.SingleSamplingContent(
+          actions.SamplingText(actions.TextContent("sampled", None, None)),
+        ),
+        None,
+      ),
+      "model",
+      Some("endTurn"),
+      meta,
+    )
+  let elicited =
+    actions.ElicitResult(
+      actions.ElicitAccept,
+      Some(dict.from_list([#("confirmed", actions.ElicitBool(True))])),
+      meta,
+    )
+  let message_task = task_store.create(store, None)
+  task_store.complete(
+    store,
+    message_task.task_id,
+    Ok(actions.TaskCreateMessage(message)),
+  )
+  |> should.be_ok
+  let assert actions.TaskCreateMessage(restored) =
+    task_store.result(store, message_task.task_id) |> should.be_ok
+  should.equal(restored.message, message.message)
+  should.equal(restored.model, message.model)
+  should.equal(restored.stop_reason, message.stop_reason)
+  assert_task_metadata(restored.meta, message_task.task_id)
+  let elicitation_task = task_store.create(store, None)
+  task_store.complete(
+    store,
+    elicitation_task.task_id,
+    Ok(actions.TaskElicit(elicited)),
+  )
+  |> should.be_ok
+  let assert actions.TaskElicit(restored) =
+    task_store.result(store, elicitation_task.task_id) |> should.be_ok
+  should.equal(restored.action, elicited.action)
+  should.equal(restored.content, elicited.content)
+  assert_task_metadata(restored.meta, elicitation_task.task_id)
+}
+
+fn assert_task_metadata(meta, task_id) {
+  let actions.Meta(fields) = meta |> should.be_some
+  should.equal(dict.get(fields, "custom"), Ok(jsonrpc.VString("preserved")))
+  should.equal(
+    dict.get(fields, "io.modelcontextprotocol/related-task"),
+    Ok(jsonrpc.VObject([#("taskId", jsonrpc.VString(task_id))])),
+  )
+}
+
+pub fn cancellation_stops_a_resumed_modern_worker_test() {
+  let store = task_store.new()
+  let task = task_store.create(store, None)
+  let running = process.new_subject()
+  task_store.start_modern_worker(store, task.task_id, fn() {
+    Ok(
+      task_store.ModernInputRequired(
+        dict.from_list([#("confirm", jsonrpc.VObject([]))]),
+        fn(inputs) {
+          should.equal(dict.get(inputs, "confirm"), Ok(jsonrpc.VBool(True)))
+          process.send(running, process.self())
+          process.sleep_forever()
+          Ok(task_store.ModernComplete(jsonrpc.VObject([])))
+        },
+      ),
+    )
+  })
+  |> should.be_ok
+  await_task_status(store, task.task_id, actions.InputRequired, 100)
+  task_store.submit_inputs_scoped(
+    store,
+    task.task_id,
+    None,
+    dict.from_list([#("confirm", jsonrpc.VBool(True))]),
+  )
+  |> should.be_ok
+  let worker = process.receive(running, 1000) |> should.be_ok
+  let snapshot =
+    task_store.snapshot_scoped(store, task.task_id, None) |> should.be_ok
+  should.equal(snapshot.task.status, actions.Working)
+  should.equal(snapshot.inputs, dict.new())
+  let monitor = process.monitor(worker)
+  let cancelled = task_store.cancel(store, task.task_id) |> should.be_ok
+  should.equal(cancelled.status, actions.Cancelled)
+  let selector =
+    process.new_selector()
+    |> process.select_specific_monitor(monitor, fn(_) { Nil })
+  process.selector_receive(selector, 1000) |> should.be_ok
+  should.be_false(process.is_alive(worker))
+  task_store.result(store, task.task_id) |> should.be_error
+}
+
+fn await_task_status(store, id, expected, attempts) -> Nil {
+  let task = task_store.get(store, id) |> should.be_ok
+  case task.status == expected {
+    True -> Nil
+    False -> {
+      should.be_true(attempts > 0)
+      process.sleep(1)
+      await_task_status(store, id, expected, attempts - 1)
+    }
+  }
+}
+
 pub fn terminal_status_cannot_be_set_without_a_result_test() {
   let store = task_store.new()
   let task = task_store.create(store, None)

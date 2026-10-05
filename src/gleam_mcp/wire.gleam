@@ -1,7 +1,6 @@
 /// Revision-aware wire boundaries. The neutral codecs remain usable for legacy
 /// messages; these helpers enforce the July 2026 envelope and result rules.
 import gleam/dict.{type Dict}
-import gleam/dynamic/decode
 import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}
@@ -10,6 +9,9 @@ import gleam/string
 import gleam_mcp/actions
 import gleam_mcp/client/codec as client_codec
 import gleam_mcp/codec_common
+import gleam_mcp/codec_decode
+import gleam_mcp/codec_encode
+import gleam_mcp/codec_value
 import gleam_mcp/jsonrpc.{type Value, VInt, VObject, VString}
 import gleam_mcp/mcp
 import gleam_mcp/server/codec as server_codec
@@ -520,9 +522,9 @@ pub fn encode_response(
     jsonrpc.ErrorResponse(None, _), True -> {
       let fields =
         response
-        |> server_codec.encode_response
-        |> parse_object
-        |> result.unwrap(dict.new())
+        |> server_codec.encode_response_value
+        |> codec_value.object_fields
+        |> dict.from_list
       fields
       |> dict.delete("id")
       |> dict.to_list
@@ -539,13 +541,10 @@ pub fn result_value(
   version: String,
   server_info: actions.Implementation,
 ) -> Value {
-  let encoded =
-    server_codec.encode_response(jsonrpc.ResultResponse(
-      jsonrpc.IntId(0),
-      result,
-    ))
-  let fields = encoded |> parse_object |> result.unwrap(dict.new())
-  let raw = fields |> dict.get("result") |> result.unwrap(VObject([]))
+  let raw =
+    result
+    |> server_codec.encode_client_action_result_value
+    |> codec_value.normalize
   case raw, is_modern(version) {
     VObject(fields), True -> {
       let fields = dict.from_list(fields)
@@ -563,10 +562,8 @@ pub fn result_value(
         _ -> dict.new()
       }
       let server_info =
-        codec_common.encode_implementation(server_info)
-        |> json.to_string
-        |> parse_value
-        |> result.unwrap(VObject([]))
+        codec_encode.encode_implementation(server_info)
+        |> codec_value.normalize
       let meta =
         dict.insert(meta, "io.modelcontextprotocol/serverInfo", server_info)
       let fields =
@@ -669,7 +666,7 @@ pub fn cache_hint(body: String) -> CacheHint {
 }
 
 pub fn parse_value(body: String) -> Result(Value, String) {
-  json.parse(body, value_decoder())
+  json.parse(body, codec_decode.value_decoder())
   |> result.map_error(fn(_) { "Invalid JSON value" })
 }
 
@@ -679,18 +676,4 @@ pub fn parse_object(body: String) -> Result(Dict(String, Value), String) {
     VObject(fields) -> Ok(dict.from_list(fields))
     _ -> Error("Expected a JSON object")
   }
-}
-
-fn value_decoder() -> decode.Decoder(Value) {
-  use <- decode.recursive
-  decode.one_of(decode.map(decode.string, VString), or: [
-    decode.map(decode.int, VInt),
-    decode.map(decode.float, jsonrpc.VFloat),
-    decode.map(decode.bool, jsonrpc.VBool),
-    decode.map(decode.list(value_decoder()), jsonrpc.VArray),
-    decode.map(decode.dict(decode.string, value_decoder()), fn(fields) {
-      VObject(dict.to_list(fields))
-    }),
-    decode.map(decode.optional(decode.dynamic), fn(_) { jsonrpc.VNull }),
-  ])
 }

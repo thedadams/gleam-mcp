@@ -1138,32 +1138,48 @@ pub fn list_tools(
     )
   case outcome {
     Ok(page) -> {
-      let page = case
+      let filter_headers = case
         next_client.protocol_version,
         next_client.transport_config
       {
-        "2026-07-28", transport.Http(_) ->
-          actions.ListToolsResult(
-            ..page,
-            tools: list.filter(page.tools, fn(tool) {
-              http_headers.definitions(tool.input_schema) |> result.is_ok
-            }),
-          )
-        _, _ -> page
+        "2026-07-28", transport.Http(_) -> True
+        _, _ -> False
       }
-      let tools = case params {
-        Some(actions.PaginatedRequestParams(cursor: Some(_), ..)) ->
-          next_client.cached_tools
-        _ -> dict.new()
-      }
-      let tools =
-        list.fold(page.tools, tools, fn(tools, tool) {
-          dict.insert(tools, tool.name, tool)
-        })
-      #(Client(..next_client, cached_tools: tools), Ok(page))
+      let cursor = params |> option.then(fn(params) { params.cursor })
+      let #(next_client, page) =
+        cache_tool_page(next_client, page, cursor, filter_headers)
+      #(next_client, Ok(page))
     }
     Error(error) -> #(next_client, Error(error))
   }
+}
+
+fn cache_tool_page(
+  client: Client,
+  page: actions.ListToolsResult,
+  cursor: Option(actions.Cursor),
+  filter_headers: Bool,
+) -> #(Client, actions.ListToolsResult) {
+  let tools = case filter_headers {
+    True ->
+      list.filter(page.tools, fn(tool) {
+        http_headers.definitions(tool.input_schema) |> result.is_ok
+      })
+    False -> page.tools
+  }
+  let cached =
+    list.fold(
+      tools,
+      case cursor {
+        None -> dict.new()
+        Some(_) -> client.cached_tools
+      },
+      fn(cache, tool) { dict.insert(cache, tool.name, tool) },
+    )
+  #(
+    Client(..client, cached_tools: cached),
+    actions.ListToolsResult(..page, tools: tools),
+  )
 }
 
 pub fn call_tool(
@@ -1590,60 +1606,75 @@ fn discover_tool(
   visited: List(actions.Cursor),
   remaining_pages: Int,
 ) -> #(Client, Result(Nil, ClientError)) {
-  case remaining_pages <= 0 {
-    True -> #(
-      client,
-      Error(
-        Transport(transport.UnexpectedResponse(
-          "Tool discovery exceeded 100 pages; list and cache tools explicitly",
-        )),
-      ),
-    )
-    False -> discover_tool_page(client, name, cursor, visited, remaining_pages)
-  }
+  find_tool_pages(
+    client,
+    name,
+    cursor,
+    visited,
+    remaining_pages,
+    fn(client, cursor) {
+      list_tools(client, Some(actions.PaginatedRequestParams(cursor, None)))
+    },
+    "Tool discovery exceeded 100 pages; list and cache tools explicitly",
+    "Server repeated a tools/list pagination cursor",
+  )
 }
 
-fn discover_tool_page(
+fn find_tool_pages(
   client: Client,
   name: String,
   cursor: Option(actions.Cursor),
   visited: List(actions.Cursor),
   remaining_pages: Int,
+  fetch: fn(Client, Option(actions.Cursor)) ->
+    #(Client, Result(actions.ListToolsResult, ClientError)),
+  page_limit_error: String,
+  cursor_error: String,
 ) -> #(Client, Result(Nil, ClientError)) {
-  let #(client, response) =
-    list_tools(client, Some(actions.PaginatedRequestParams(cursor, None)))
-  case response {
-    Error(error) -> #(client, Error(error))
-    Ok(page) ->
-      case dict.get(client.cached_tools, name) {
-        Ok(_) -> #(client, Ok(Nil))
-        Error(Nil) ->
-          case page.page.next_cursor {
-            Some(next) ->
-              case list.contains(visited, next) {
-                True -> #(
+  case remaining_pages <= 0 {
+    True -> #(
+      client,
+      Error(Transport(transport.UnexpectedResponse(page_limit_error))),
+    )
+    False -> {
+      let #(client, response) = fetch(client, cursor)
+      case response {
+        Error(error) -> #(client, Error(error))
+        Ok(page) ->
+          case dict.get(client.cached_tools, name) {
+            Ok(_) -> #(client, Ok(Nil))
+            Error(Nil) ->
+              case page.page.next_cursor {
+                Some(next) ->
+                  case list.contains(visited, next) {
+                    True -> #(
+                      client,
+                      Error(
+                        Transport(transport.UnexpectedResponse(cursor_error)),
+                      ),
+                    )
+                    False ->
+                      find_tool_pages(
+                        client,
+                        name,
+                        Some(next),
+                        [next, ..visited],
+                        remaining_pages - 1,
+                        fetch,
+                        page_limit_error,
+                        cursor_error,
+                      )
+                  }
+                None -> #(
                   client,
                   Error(
-                    Transport(transport.UnexpectedResponse(
-                      "Server repeated a tools/list pagination cursor",
-                    )),
+                    Rpc(jsonrpc.invalid_params_error("Unknown tool: " <> name)),
                   ),
                 )
-                False ->
-                  discover_tool(
-                    client,
-                    name,
-                    Some(next),
-                    [next, ..visited],
-                    remaining_pages - 1,
-                  )
               }
-            None -> #(
-              client,
-              Error(Rpc(jsonrpc.invalid_params_error("Unknown tool: " <> name))),
-            )
           }
       }
+    }
   }
 }
 
@@ -2168,80 +2199,46 @@ fn refresh_tool_headers(
   stop: process.Subject(Nil),
   pages: Int,
 ) -> #(Client, Result(Nil, ClientError)) {
-  case pages <= 0 {
-    True -> #(
-      client,
-      Error(
-        Transport(transport.UnexpectedResponse(
-          "Tool header refresh exceeded page limit",
+  find_tool_pages(
+    client,
+    name,
+    cursor,
+    visited,
+    pages,
+    fn(client, cursor) { fetch_tool_headers(client, cursor, stop) },
+    "Tool header refresh exceeded page limit",
+    "Repeated tool header refresh cursor",
+  )
+}
+
+fn fetch_tool_headers(
+  client: Client,
+  cursor: Option(actions.Cursor),
+  stop: process.Subject(Nil),
+) -> #(Client, Result(actions.ListToolsResult, ClientError)) {
+  let incoming =
+    Request(
+      jsonrpc.StringId(uuid.v4_string()),
+      mcp.method_list_tools,
+      Some(
+        actions.ClientRequestListTools(actions.PaginatedRequestParams(
+          cursor,
+          None,
         )),
       ),
     )
-    False -> {
-      let incoming =
-        Request(
-          jsonrpc.StringId(uuid.v4_string()),
-          mcp.method_list_tools,
-          Some(
-            actions.ClientRequestListTools(actions.PaginatedRequestParams(
-              cursor,
-              None,
-            )),
-          ),
-        )
-        |> attach_metadata(client, _)
-      let #(client, response) =
-        perform_request_options(client, incoming, Some(stop))
-      let #(client, response) = retain_cache_hint(client, response)
-      case response {
-        Ok(jsonrpc.ResultResponse(_, actions.ClientResultListTools(page))) -> {
-          let tools =
-            list.filter(page.tools, fn(tool) {
-              http_headers.definitions(tool.input_schema) |> result.is_ok
-            })
-          let cached =
-            list.fold(
-              tools,
-              case cursor {
-                None -> dict.new()
-                _ -> client.cached_tools
-              },
-              fn(cache, tool) { dict.insert(cache, tool.name, tool) },
-            )
-          let client = Client(..client, cached_tools: cached)
-          case dict.has_key(cached, name), page.page.next_cursor {
-            True, _ -> #(client, Ok(Nil))
-            False, Some(next) ->
-              case list.contains(visited, next) {
-                True -> #(
-                  client,
-                  Error(
-                    Transport(transport.UnexpectedResponse(
-                      "Repeated tool header refresh cursor",
-                    )),
-                  ),
-                )
-                False ->
-                  refresh_tool_headers(
-                    client,
-                    name,
-                    Some(next),
-                    [next, ..visited],
-                    stop,
-                    pages - 1,
-                  )
-              }
-            _, _ -> #(
-              client,
-              Error(Rpc(jsonrpc.invalid_params_error("Unknown tool: " <> name))),
-            )
-          }
-        }
-        Ok(jsonrpc.ErrorResponse(_, error)) -> #(client, Error(Rpc(error)))
-        Error(error) -> #(client, Error(error))
-        _ -> #(client, Error(unexpected_response_error(mcp.method_list_tools)))
-      }
+    |> attach_metadata(client, _)
+  let #(client, response) =
+    perform_request_options(client, incoming, Some(stop))
+  let #(client, response) = retain_cache_hint(client, response)
+  case response {
+    Ok(jsonrpc.ResultResponse(_, actions.ClientResultListTools(page))) -> {
+      let #(client, page) = cache_tool_page(client, page, cursor, True)
+      #(client, Ok(page))
     }
+    Ok(jsonrpc.ErrorResponse(_, error)) -> #(client, Error(Rpc(error)))
+    Error(error) -> #(client, Error(error))
+    _ -> #(client, Error(unexpected_response_error(mcp.method_list_tools)))
   }
 }
 

@@ -14,6 +14,7 @@ import gleam_mcp/actions
 import gleam_mcp/jsonrpc
 import gleam_mcp/mcp
 import gleam_mcp/server/capabilities
+import gleam_mcp/server/codec
 import gleam_mcp/server/oauth
 import gleam_mcp/server/runtime
 import gleam_mcp/server/streamable_http_store
@@ -180,11 +181,7 @@ pub fn implementation(server: Server) -> actions.Implementation {
 }
 
 pub fn with_instructions(server: Server, instructions: String) -> Server {
-  with_server_metadata(
-    server,
-    instructions: Some(instructions),
-    authorization: header_authorization(server),
-  )
+  Server(..server, instructions: Some(instructions))
 }
 
 pub fn with_header_authorization(
@@ -192,12 +189,7 @@ pub fn with_header_authorization(
   header: String,
   validate: fn(String) -> Bool,
 ) -> Server {
-  let Server(instructions: instructions, ..) = server
-  with_server_metadata(
-    server,
-    instructions: instructions,
-    authorization: Some(HeaderAuthorization(header, validate)),
-  )
+  Server(..server, authorization: Some(HeaderAuthorization(header, validate)))
 }
 
 pub fn header_authorization(server: Server) -> Option(HeaderAuthorization) {
@@ -638,14 +630,7 @@ pub fn add_resource(
       meta: None,
     )
 
-  let Server(resources: resources, ..) = server
-  with_server_registry(
-    server,
-    tools: server.tools,
-    resources: [RegisteredResource(resource, implementation), ..resources],
-    resource_templates: server.resource_templates,
-    prompts: server.prompts,
-  )
+  register_resource_descriptor(server, resource, implementation)
 }
 
 pub fn add_resource_template(
@@ -668,16 +653,10 @@ pub fn add_resource_template(
       meta: None,
     )
 
-  let Server(resource_templates: resource_templates, ..) = server
-  with_server_registry(
+  register_resource_template_descriptor(
     server,
-    tools: server.tools,
-    resources: server.resources,
-    resource_templates: [
-      RegisteredResourceTemplate(resource_template, implementation),
-      ..resource_templates
-    ],
-    prompts: server.prompts,
+    resource_template,
+    implementation,
   )
 }
 
@@ -698,47 +677,25 @@ pub fn add_prompt(
       meta: None,
     )
 
-  let Server(prompts: prompts, ..) = server
-  with_server_registry(
-    server,
-    tools: server.tools,
-    resources: server.resources,
-    resource_templates: server.resource_templates,
-    prompts: [RegisteredPrompt(prompt, implementation), ..prompts],
-  )
+  register_prompt_descriptor(server, prompt, implementation)
 }
 
 pub fn set_completion_handler(
   server: Server,
   handler: CompletionHandler,
 ) -> Server {
-  with_server_handlers(
-    server,
-    completion_handler: Some(handler),
-    logging_handler: server.logging_handler,
-    task_result_request_handler: server.task_result_request_handler,
-  )
+  Server(..server, completion_handler: Some(handler))
 }
 
 pub fn set_logging_handler(server: Server, handler: LoggingHandler) -> Server {
-  with_server_handlers(
-    server,
-    completion_handler: server.completion_handler,
-    logging_handler: Some(handler),
-    task_result_request_handler: server.task_result_request_handler,
-  )
+  Server(..server, logging_handler: Some(handler))
 }
 
 pub fn set_task_result_request_handler(
   server: Server,
   handler: TaskResultRequestHandler,
 ) -> Server {
-  with_server_handlers(
-    server,
-    completion_handler: server.completion_handler,
-    logging_handler: server.logging_handler,
-    task_result_request_handler: Some(handler),
-  )
+  Server(..server, task_result_request_handler: Some(handler))
 }
 
 pub fn handle_request(
@@ -1113,22 +1070,12 @@ fn base_request(
 }
 
 pub fn modern_capabilities(server: Server) -> dict.Dict(String, jsonrpc.Value) {
-  let value =
-    wire.result_value(
-      initialization_result(server),
-      jsonrpc.legacy_protocol_version,
-      server.implementation,
-    )
-  let fields = case value {
-    jsonrpc.VObject(fields) -> dict.from_list(fields)
-    _ -> dict.new()
-  }
-  let caps = case dict.get(fields, "capabilities") {
-    Ok(jsonrpc.VObject(fields)) -> dict.from_list(fields)
-    _ -> dict.new()
-  }
+  let capabilities = advertised_capabilities(server)
+  let assert jsonrpc.VObject(fields) =
+    codec.encode_server_capabilities_value(capabilities)
+  let caps = dict.from_list(fields)
   let caps = dict.delete(caps, "tasks")
-  let extensions = case option.is_some(advertised_capabilities(server).tasks) {
+  let extensions = case option.is_some(capabilities.tasks) {
     True ->
       dict.insert(
         server.options.extensions,
@@ -2764,64 +2711,6 @@ pub fn task_result(
   task_id: String,
 ) -> Result(actions.TaskResult, jsonrpc.RpcError) {
   task_store.result(server.task_store, task_id)
-  |> result.map(with_related_task_result(_, task_id))
-}
-
-fn with_related_task_result(
-  task_result: actions.TaskResult,
-  task_id: String,
-) -> actions.TaskResult {
-  case task_result {
-    actions.TaskResultModern(_) -> task_result
-    actions.TaskCallTool(result) ->
-      actions.TaskCallTool(with_related_task_call_tool_result(result, task_id))
-    actions.TaskCreateMessage(result) ->
-      actions.TaskCreateMessage(with_related_task_create_message_result(
-        result,
-        task_id,
-      ))
-    actions.TaskElicit(result) ->
-      actions.TaskElicit(with_related_task_elicit_result(result, task_id))
-  }
-}
-
-fn with_related_task_call_tool_result(
-  result: actions.CallToolResult,
-  task_id: String,
-) -> actions.CallToolResult {
-  let actions.CallToolResult(content, structured_content, is_error, meta) =
-    result
-  actions.CallToolResult(
-    content: content,
-    structured_content: structured_content,
-    is_error: is_error,
-    meta: Some(merge_related_task_meta(meta, task_id)),
-  )
-}
-
-fn with_related_task_create_message_result(
-  result: actions.CreateMessageResult,
-  task_id: String,
-) -> actions.CreateMessageResult {
-  let actions.CreateMessageResult(message, model, stop_reason, meta) = result
-  actions.CreateMessageResult(
-    message: message,
-    model: model,
-    stop_reason: stop_reason,
-    meta: Some(merge_related_task_meta(meta, task_id)),
-  )
-}
-
-fn with_related_task_elicit_result(
-  result: actions.ElicitResult,
-  task_id: String,
-) -> actions.ElicitResult {
-  let actions.ElicitResult(action, content, meta) = result
-  actions.ElicitResult(
-    action: action,
-    content: content,
-    meta: Some(merge_related_task_meta(meta, task_id)),
-  )
 }
 
 fn merge_related_task_meta(
@@ -3500,46 +3389,6 @@ fn find_resource_template(
       registered
     matches_template(descriptor.uri_template, uri)
   })
-}
-
-fn with_server_metadata(
-  server: Server,
-  instructions instructions: Option(String),
-  authorization authorization: Option(HeaderAuthorization),
-) -> Server {
-  Server(..server, instructions: instructions, authorization: authorization)
-}
-
-fn with_server_registry(
-  server: Server,
-  tools tools: List(RegisteredTool),
-  resources resources: List(RegisteredResource),
-  resource_templates resource_templates: List(RegisteredResourceTemplate),
-  prompts prompts: List(RegisteredPrompt),
-) -> Server {
-  Server(
-    ..server,
-    tools: tools,
-    resources: resources,
-    resource_templates: resource_templates,
-    prompts: prompts,
-  )
-}
-
-fn with_server_handlers(
-  server: Server,
-  completion_handler completion_handler: Option(CompletionHandler),
-  logging_handler logging_handler: Option(LoggingHandler),
-  task_result_request_handler task_result_request_handler: Option(
-    TaskResultRequestHandler,
-  ),
-) -> Server {
-  Server(
-    ..server,
-    completion_handler: completion_handler,
-    logging_handler: logging_handler,
-    task_result_request_handler: task_result_request_handler,
-  )
 }
 
 fn listed_entries(entries: List(a), extract: fn(a) -> b) -> List(b) {

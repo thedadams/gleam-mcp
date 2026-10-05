@@ -9,7 +9,7 @@ import gleam/http/response
 import gleam/int
 import gleam/json
 import gleam/list
-import gleam/option.{None, Some}
+import gleam/option.{type Option, None, Some}
 import gleam_mcp/actions
 import gleam_mcp/client
 import gleam_mcp/client/capabilities
@@ -727,18 +727,37 @@ pub fn modern_stdio_rejects_reverse_request_after_response_test() {
 
 pub fn modern_stdio_demultiplexes_subscription_ids_test() {
   let manager = stdio_manager.start()
+  let callbacks = process.new_subject()
+  let caps =
+    capabilities.none()
+    |> capabilities.with_notify_tool_list_changed(fn() {
+      process.send(callbacks, Nil)
+      Ok(Nil)
+    })
   let initial =
     "{\"jsonrpc\":\"2.0\",\"id\":\"ping\",\"result\":{\"resultType\":\"complete\"}}"
   let wrong =
     "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/subscriptions/acknowledged\",\"params\":{\"notifications\":{},\"_meta\":{\"io.modelcontextprotocol/subscriptionId\":\"other\"}}}"
   let correct =
     "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/subscriptions/acknowledged\",\"params\":{\"notifications\":{},\"_meta\":{\"io.modelcontextprotocol/subscriptionId\":\"subscription\"}}}"
+  let null_tag =
+    "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/subscriptionId\":null}}}"
+  let invalid_tag =
+    "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/subscriptionId\":{}}}}"
+  let untagged =
+    "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}"
   let config =
     raw_stdio_config(
       "IFS= read -r frame; printf '%s\\n' '"
       <> initial
       <> "'; IFS= read -r frame; printf '%s\\n' '"
       <> wrong
+      <> "' '"
+      <> null_tag
+      <> "' '"
+      <> invalid_tag
+      <> "' '"
+      <> untagged
       <> "' '"
       <> correct
       <> "'; while IFS= read -r frame; do :; done",
@@ -748,7 +767,7 @@ pub fn modern_stdio_demultiplexes_subscription_ids_test() {
       manager,
       config,
       None,
-      capabilities.none(),
+      caps,
       modern_stdio_ping("ping"),
     )
   let events = process.new_subject()
@@ -758,6 +777,34 @@ pub fn modern_stdio_demultiplexes_subscription_ids_test() {
   |> should.be_ok
   should.equal(process.receive(events, 500), Ok(Ok(correct)))
   should.equal(process.receive(events, 20), Error(Nil))
+  should.equal(process.receive(callbacks, 300), Ok(Nil))
+  should.equal(process.receive(callbacks, 20), Error(Nil))
+  stdio_manager.close(manager, session) |> should.be_ok
+}
+
+pub fn modern_stdio_ignores_invalid_id_but_routes_null_error_test() {
+  let invalid =
+    "{\"jsonrpc\":\"2.0\",\"id\":false,\"error\":{\"code\":-32020,\"message\":\"Invalid ID\"}}"
+  let null =
+    "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32020,\"message\":\"Null ID\"}}"
+  let manager = stdio_manager.start()
+  let config =
+    raw_stdio_config(
+      "IFS= read -r frame; printf '%s\\n' '"
+      <> invalid
+      <> "' '"
+      <> null
+      <> "'; while IFS= read -r frame; do :; done",
+    )
+  let assert Ok(#(received, session)) =
+    stdio_manager.request(
+      manager,
+      config,
+      None,
+      capabilities.none(),
+      modern_stdio_ping("ping"),
+    )
+  should.equal(received, null)
   stdio_manager.close(manager, session) |> should.be_ok
 }
 
@@ -769,6 +816,288 @@ fn modern_stdio_ping(id: String) -> String {
 
 fn raw_stdio_config(script: String) -> stdio_manager.Config {
   stdio_manager.Config("/bin/sh", ["-c", script], [], None, Some(300))
+}
+
+pub fn modern_header_refresh_replaces_and_merges_filtered_tool_pages_test() {
+  let seen = process.new_subject()
+  let url =
+    start_wire_server(fn(req) {
+      let assert Ok(req) = mist.read_body(req, 1_048_576)
+      let assert Ok(body) = bit_array.to_string(req.body)
+      let id =
+        json.parse(body, decode.at(["id"], codec.value_decoder()))
+        |> should.be_ok
+      let method =
+        json.parse(body, decode.at(["method"], decode.string))
+        |> should.be_ok
+      case method {
+        "tools/call" -> {
+          let arguments =
+            json.parse(
+              body,
+              decode.at(["params", "arguments"], codec.value_decoder()),
+            )
+            |> should.be_ok
+          process.send(seen, #(method, id, arguments))
+          case request.get_header(req, "mcp-param-old") {
+            Ok("Hello") -> header_mismatch(id)
+            _ -> {
+              should.equal(
+                request.get_header(req, "mcp-param-new"),
+                Ok("Hello"),
+              )
+              request.get_header(req, "mcp-param-old") |> should.be_error
+              complete_response(id, [#("content", jsonrpc.VArray([]))])
+            }
+          }
+        }
+        "tools/list" -> {
+          let cursor = case
+            json.parse(
+              body,
+              decode.at(["params", "cursor"], codec.value_decoder()),
+            )
+          {
+            Ok(cursor) -> cursor
+            Error(_) -> jsonrpc.VNull
+          }
+          process.send(seen, #(method, id, cursor))
+          case cursor {
+            jsonrpc.VNull ->
+              complete_response(id, [
+                #(
+                  "tools",
+                  jsonrpc.VArray([
+                    header_tool_value(header_tool("other", None)),
+                    header_tool_value(
+                      header_tool("bad", Some("Bad"))
+                      |> invalid_header_tool,
+                    ),
+                  ]),
+                ),
+                #("nextCursor", jsonrpc.VString("later")),
+                #("ttlMs", jsonrpc.VInt(100)),
+              ])
+            jsonrpc.VString("later") ->
+              complete_response(id, [
+                #(
+                  "tools",
+                  jsonrpc.VArray([
+                    header_tool_value(header_tool("echo", Some("New"))),
+                    header_tool_value(header_tool("tail", None)),
+                  ]),
+                ),
+                #("ttlMs", jsonrpc.VInt(5000)),
+                #("cacheScope", jsonrpc.VString("public")),
+              ])
+            _ -> panic as "Unexpected refresh cursor"
+          }
+        }
+        _ -> panic as "Unexpected header refresh method"
+      }
+    })
+  let app = cached_header_client(url, 1000)
+  let arguments = jsonrpc.VObject([#("value", jsonrpc.VString("Hello"))])
+  let #(app, outcome) = client.call_tool(app, header_call())
+  outcome |> should.be_ok
+  let assert Ok(#("tools/call", first_id, first_args)) =
+    process.receive(seen, 0)
+  should.equal(first_args, arguments)
+  let assert Ok(#("tools/list", _, jsonrpc.VNull)) = process.receive(seen, 0)
+  let assert Ok(#("tools/list", _, jsonrpc.VString("later"))) =
+    process.receive(seen, 0)
+  let assert Ok(#("tools/call", second_id, second_args)) =
+    process.receive(seen, 0)
+  should.be_true(first_id != second_id)
+  should.equal(second_args, arguments)
+  should.equal(dict.size(app.cached_tools), 3)
+  let expected = header_tool("echo", Some("New"))
+  let decoded_schema =
+    expected.input_schema
+    |> codec_common.encode_value
+    |> json.to_string
+    |> json.parse(codec.value_decoder())
+    |> should.be_ok
+  should.equal(
+    dict.get(app.cached_tools, "echo"),
+    Ok(actions.Tool(..expected, input_schema: decoded_schema)),
+  )
+  should.be_true(dict.has_key(app.cached_tools, "other"))
+  should.be_true(dict.has_key(app.cached_tools, "tail"))
+  should.be_false(dict.has_key(app.cached_tools, "old_cache"))
+  should.be_false(dict.has_key(app.cached_tools, "bad"))
+  should.equal(
+    app.last_cache_hint,
+    Some(actions.CacheHint(5000, actions.Public)),
+  )
+  let #(_, closed) = client.close(app)
+  closed |> should.be_ok
+}
+
+pub fn modern_header_refresh_obeys_original_request_deadline_test() {
+  let refresh_started = process.new_subject()
+  let calls = process.new_subject()
+  let url =
+    start_wire_server(fn(req) {
+      let assert Ok(req) = mist.read_body(req, 1_048_576)
+      let assert Ok(body) = bit_array.to_string(req.body)
+      let id =
+        json.parse(body, decode.at(["id"], codec.value_decoder()))
+        |> should.be_ok
+      let method =
+        json.parse(body, decode.at(["method"], decode.string))
+        |> should.be_ok
+      case method {
+        "tools/call" -> {
+          process.send(calls, Nil)
+          header_mismatch(id)
+        }
+        "tools/list" -> {
+          let release = process.new_subject()
+          process.send(refresh_started, release)
+          // The operation must expire before this fixture releases the page.
+          process.receive(release, 2000) |> should.be_ok
+          complete_response(id, [
+            #(
+              "tools",
+              jsonrpc.VArray([
+                header_tool_value(header_tool("echo", Some("New"))),
+              ]),
+            ),
+          ])
+        }
+        _ -> panic as "Unexpected header refresh method"
+      }
+    })
+  let app = cached_header_client(url, 300)
+  let #(app, outcome) = client.call_tool(app, header_call())
+  should.equal(outcome, Error(client.Transport(transport.TimeoutError)))
+  let release = process.receive(refresh_started, 0) |> should.be_ok
+  process.send(release, Nil)
+  should.equal(process.receive(calls, 0), Ok(Nil))
+  should.equal(process.receive(calls, 50), Error(Nil))
+  should.equal(
+    dict.get(app.cached_tools, "echo"),
+    Ok(header_tool("echo", Some("Old"))),
+  )
+  should.equal(dict.size(app.cached_tools), 2)
+  let #(_, closed) = client.close(app)
+  closed |> should.be_ok
+}
+
+fn cached_header_client(url: String, timeout: Int) -> client.Client {
+  let app =
+    client.new(
+      transport.Http(transport.HttpConfig(url, [], Some(timeout))),
+      capabilities.none(),
+    )
+  client.Client(
+    ..app,
+    cached_tools: dict.from_list([
+      #("echo", header_tool("echo", Some("Old"))),
+      #("old_cache", header_tool("old_cache", None)),
+    ]),
+  )
+}
+
+fn header_call() -> actions.CallToolRequestParams {
+  actions.CallToolRequestParams(
+    "echo",
+    Some(dict.from_list([#("value", jsonrpc.VString("Hello"))])),
+    None,
+    None,
+  )
+}
+
+fn header_tool(name: String, header: Option(String)) -> actions.Tool {
+  let properties = case header {
+    None -> []
+    Some(header) -> [
+      #(
+        "value",
+        jsonrpc.VObject([
+          #("type", jsonrpc.VString("string")),
+          #("x-mcp-header", jsonrpc.VString(header)),
+        ]),
+      ),
+    ]
+  }
+  actions.Tool(
+    name,
+    None,
+    None,
+    jsonrpc.VObject([
+      #("type", jsonrpc.VString("object")),
+      #("properties", jsonrpc.VObject(properties)),
+    ]),
+    None,
+    None,
+    None,
+    [],
+    None,
+  )
+}
+
+fn invalid_header_tool(tool: actions.Tool) -> actions.Tool {
+  actions.Tool(
+    ..tool,
+    input_schema: jsonrpc.VObject([
+      #("type", jsonrpc.VString("object")),
+      #(
+        "properties",
+        jsonrpc.VObject([
+          #(
+            "value",
+            jsonrpc.VObject([
+              #("type", jsonrpc.VString("number")),
+              #("x-mcp-header", jsonrpc.VString("Bad")),
+            ]),
+          ),
+        ]),
+      ),
+    ]),
+  )
+}
+
+fn header_tool_value(tool: actions.Tool) -> jsonrpc.Value {
+  jsonrpc.VObject([
+    #("name", jsonrpc.VString(tool.name)),
+    #("inputSchema", tool.input_schema),
+  ])
+}
+
+fn complete_response(
+  id: jsonrpc.Value,
+  fields: List(#(String, jsonrpc.Value)),
+) {
+  json_response(
+    200,
+    jsonrpc.VObject([
+      #("jsonrpc", jsonrpc.VString("2.0")),
+      #("id", id),
+      #(
+        "result",
+        jsonrpc.VObject([#("resultType", jsonrpc.VString("complete")), ..fields]),
+      ),
+    ]),
+  )
+}
+
+fn header_mismatch(id: jsonrpc.Value) {
+  json_response(
+    400,
+    jsonrpc.VObject([
+      #("jsonrpc", jsonrpc.VString("2.0")),
+      #("id", id),
+      #(
+        "error",
+        jsonrpc.VObject([
+          #("code", jsonrpc.VInt(-32_020)),
+          #("message", jsonrpc.VString("Header mismatch")),
+        ]),
+      ),
+    ]),
+  )
 }
 
 pub fn modern_subscription_ack_requires_notifications_object_test() {

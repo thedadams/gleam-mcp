@@ -127,72 +127,28 @@ pub fn with_list_roots(
   config: Config,
   handler: fn(Option(actions.RequestMeta)) -> Result(List(Root), RpcError),
 ) -> Config {
-  update_handlers(
-    config,
-    list_roots: Some(handler),
-    create_message: None,
-    sampling_tools: None,
-    sampling_context: None,
-    elicit_form: None,
-    elicit_url: None,
-  )
+  Config(..config, list_roots: Some(handler))
 }
 
 pub fn with_notify_cancelled(
   config: Config,
   handler: fn(actions.CancelledNotificationParams) -> Result(Nil, RpcError),
 ) -> Config {
-  update_callbacks(
-    config,
-    Some(handler),
-    None,
-    None,
-    None,
-    None,
-    None,
-    None,
-    None,
-    None,
-    None,
-  )
+  Config(..config, notify_cancelled: Some(handler))
 }
 
 pub fn with_notify_progress(
   config: Config,
   handler: fn(actions.ProgressNotificationParams) -> Result(Nil, RpcError),
 ) -> Config {
-  update_callbacks(
-    config,
-    None,
-    Some(handler),
-    None,
-    None,
-    None,
-    None,
-    None,
-    None,
-    None,
-    None,
-  )
+  Config(..config, notify_progress: Some(handler))
 }
 
 pub fn with_notify_resource_list_changed(
   config: Config,
   handler: fn() -> Result(Nil, RpcError),
 ) -> Config {
-  update_callbacks(
-    config,
-    None,
-    None,
-    Some(handler),
-    None,
-    None,
-    None,
-    None,
-    None,
-    None,
-    None,
-  )
+  Config(..config, notify_resource_list_changed: Some(handler))
 }
 
 pub fn with_notify_resource_updated(
@@ -200,95 +156,35 @@ pub fn with_notify_resource_updated(
   handler: fn(actions.ResourceUpdatedNotificationParams) ->
     Result(Nil, RpcError),
 ) -> Config {
-  update_callbacks(
-    config,
-    None,
-    None,
-    None,
-    Some(handler),
-    None,
-    None,
-    None,
-    None,
-    None,
-    None,
-  )
+  Config(..config, notify_resource_updated: Some(handler))
 }
 
 pub fn with_notify_prompt_list_changed(
   config: Config,
   handler: fn() -> Result(Nil, RpcError),
 ) -> Config {
-  update_callbacks(
-    config,
-    None,
-    None,
-    None,
-    None,
-    Some(handler),
-    None,
-    None,
-    None,
-    None,
-    None,
-  )
+  Config(..config, notify_prompt_list_changed: Some(handler))
 }
 
 pub fn with_notify_tool_list_changed(
   config: Config,
   handler: fn() -> Result(Nil, RpcError),
 ) -> Config {
-  update_callbacks(
-    config,
-    None,
-    None,
-    None,
-    None,
-    None,
-    Some(handler),
-    None,
-    None,
-    None,
-    None,
-  )
+  Config(..config, notify_tool_list_changed: Some(handler))
 }
 
 pub fn with_notify_logging_message(
   config: Config,
   handler: fn(actions.LoggingMessageNotificationParams) -> Result(Nil, RpcError),
 ) -> Config {
-  update_callbacks(
-    config,
-    None,
-    None,
-    None,
-    None,
-    None,
-    None,
-    Some(handler),
-    None,
-    None,
-    None,
-  )
+  Config(..config, notify_logging_message: Some(handler))
 }
 
 pub fn with_notify_roots_list_changed(
   config: Config,
   handler: fn() -> Result(Nil, RpcError),
 ) -> Config {
-  update_callbacks(
-    config,
-    None,
-    None,
-    None,
-    None,
-    None,
-    None,
-    None,
-    Some(handler),
-    None,
-    None,
-  )
+  Config(..config, notify_roots_list_changed: Some(handler))
 }
 
 pub fn with_notify_elicitation_complete(
@@ -296,38 +192,14 @@ pub fn with_notify_elicitation_complete(
   handler: fn(actions.ElicitationCompleteNotificationParams) ->
     Result(Nil, RpcError),
 ) -> Config {
-  update_callbacks(
-    config,
-    None,
-    None,
-    None,
-    None,
-    None,
-    None,
-    None,
-    None,
-    Some(handler),
-    None,
-  )
+  Config(..config, notify_elicitation_complete: Some(handler))
 }
 
 pub fn with_notify_task_status(
   config: Config,
   handler: fn(actions.TaskStatusNotificationParams) -> Result(Nil, RpcError),
 ) -> Config {
-  update_callbacks(
-    config,
-    None,
-    None,
-    None,
-    None,
-    None,
-    None,
-    None,
-    None,
-    None,
-    Some(handler),
-  )
+  Config(..config, notify_task_status: Some(handler))
 }
 
 pub fn with_create_message(
@@ -335,15 +207,7 @@ pub fn with_create_message(
   handler: fn(actions.CreateMessageRequestParams) ->
     Result(CreateMessageHandlerResult, RpcError),
 ) -> Config {
-  update_handlers(
-    config,
-    list_roots: None,
-    create_message: Some(handler),
-    sampling_tools: None,
-    sampling_context: None,
-    elicit_form: None,
-    elicit_url: None,
-  )
+  Config(..config, create_message: Some(handler))
 }
 
 /// Enable sampling tool support. The callback receives an object with `tools`
@@ -352,15 +216,7 @@ pub fn with_sampling_tools(
   config: Config,
   handler: fn(Value) -> Result(Nil, RpcError),
 ) -> Config {
-  update_handlers(
-    config,
-    list_roots: None,
-    create_message: None,
-    sampling_tools: Some(handler),
-    sampling_context: None,
-    elicit_form: None,
-    elicit_url: None,
-  )
+  Config(..config, sampling_tools: Some(handler))
 }
 
 /// Enable sampling context support. The callback receives the requested
@@ -369,15 +225,7 @@ pub fn with_sampling_context(
   config: Config,
   handler: fn(Value) -> Result(Nil, RpcError),
 ) -> Config {
-  update_handlers(
-    config,
-    list_roots: None,
-    create_message: None,
-    sampling_tools: None,
-    sampling_context: Some(handler),
-    elicit_form: None,
-    elicit_url: None,
-  )
+  Config(..config, sampling_context: Some(handler))
 }
 
 pub fn with_elicit_form(
@@ -385,15 +233,7 @@ pub fn with_elicit_form(
   handler: fn(actions.ElicitRequestFormParams) ->
     Result(ElicitHandlerResult, RpcError),
 ) -> Config {
-  update_handlers(
-    config,
-    list_roots: None,
-    create_message: None,
-    sampling_tools: None,
-    sampling_context: None,
-    elicit_form: Some(handler),
-    elicit_url: None,
-  )
+  Config(..config, elicit_form: Some(handler))
 }
 
 pub fn with_elicit_url(
@@ -401,15 +241,7 @@ pub fn with_elicit_url(
   handler: fn(actions.ElicitRequestUrlParams) ->
     Result(ElicitHandlerResult, RpcError),
 ) -> Config {
-  update_handlers(
-    config,
-    list_roots: None,
-    create_message: None,
-    sampling_tools: None,
-    sampling_context: None,
-    elicit_form: None,
-    elicit_url: Some(handler),
-  )
+  Config(..config, elicit_url: Some(handler))
 }
 
 pub fn to_initialize_capabilities(config: Config) -> ClientCapabilities {
@@ -1141,99 +973,6 @@ fn value_to_meta(value: Value) -> actions.Meta {
   }
 }
 
-fn update_callbacks(
-  config: Config,
-  notify_cancelled: Option(
-    fn(actions.CancelledNotificationParams) -> Result(Nil, RpcError),
-  ),
-  notify_progress: Option(
-    fn(actions.ProgressNotificationParams) -> Result(Nil, RpcError),
-  ),
-  notify_resource_list_changed: Option(fn() -> Result(Nil, RpcError)),
-  notify_resource_updated: Option(
-    fn(actions.ResourceUpdatedNotificationParams) -> Result(Nil, RpcError),
-  ),
-  notify_prompt_list_changed: Option(fn() -> Result(Nil, RpcError)),
-  notify_tool_list_changed: Option(fn() -> Result(Nil, RpcError)),
-  notify_logging_message: Option(
-    fn(actions.LoggingMessageNotificationParams) -> Result(Nil, RpcError),
-  ),
-  notify_roots_list_changed: Option(fn() -> Result(Nil, RpcError)),
-  notify_elicitation_complete: Option(
-    fn(actions.ElicitationCompleteNotificationParams) -> Result(Nil, RpcError),
-  ),
-  notify_task_status: Option(
-    fn(actions.TaskStatusNotificationParams) -> Result(Nil, RpcError),
-  ),
-) -> Config {
-  Config(
-    ..config,
-    notify_cancelled: choose_callback(notify_cancelled, config.notify_cancelled),
-    notify_progress: choose_callback(notify_progress, config.notify_progress),
-    notify_resource_list_changed: choose_callback(
-      notify_resource_list_changed,
-      config.notify_resource_list_changed,
-    ),
-    notify_resource_updated: choose_callback(
-      notify_resource_updated,
-      config.notify_resource_updated,
-    ),
-    notify_prompt_list_changed: choose_callback(
-      notify_prompt_list_changed,
-      config.notify_prompt_list_changed,
-    ),
-    notify_tool_list_changed: choose_callback(
-      notify_tool_list_changed,
-      config.notify_tool_list_changed,
-    ),
-    notify_logging_message: choose_callback(
-      notify_logging_message,
-      config.notify_logging_message,
-    ),
-    notify_roots_list_changed: choose_callback(
-      notify_roots_list_changed,
-      config.notify_roots_list_changed,
-    ),
-    notify_elicitation_complete: choose_callback(
-      notify_elicitation_complete,
-      config.notify_elicitation_complete,
-    ),
-    notify_task_status: choose_callback(
-      notify_task_status,
-      config.notify_task_status,
-    ),
-  )
-}
-
-fn update_handlers(
-  config: Config,
-  list_roots list_roots: Option(
-    fn(Option(actions.RequestMeta)) -> Result(List(Root), RpcError),
-  ),
-  create_message create_message: Option(
-    fn(actions.CreateMessageRequestParams) ->
-      Result(CreateMessageHandlerResult, RpcError),
-  ),
-  sampling_tools sampling_tools: Option(fn(Value) -> Result(Nil, RpcError)),
-  sampling_context sampling_context: Option(fn(Value) -> Result(Nil, RpcError)),
-  elicit_form elicit_form: Option(
-    fn(actions.ElicitRequestFormParams) -> Result(ElicitHandlerResult, RpcError),
-  ),
-  elicit_url elicit_url: Option(
-    fn(actions.ElicitRequestUrlParams) -> Result(ElicitHandlerResult, RpcError),
-  ),
-) -> Config {
-  Config(
-    ..config,
-    list_roots: choose_callback(list_roots, config.list_roots),
-    create_message: choose_callback(create_message, config.create_message),
-    sampling_tools: choose_callback(sampling_tools, config.sampling_tools),
-    sampling_context: choose_callback(sampling_context, config.sampling_context),
-    elicit_form: choose_callback(elicit_form, config.elicit_form),
-    elicit_url: choose_callback(elicit_url, config.elicit_url),
-  )
-}
-
 fn task_metadata(
   params: actions.ElicitRequestParams,
 ) -> Option(actions.TaskMetadata) {
@@ -1267,12 +1006,5 @@ fn has(value: Option(a)) -> Bool {
   case value {
     Some(_) -> True
     None -> False
-  }
-}
-
-fn choose_callback(updated: Option(a), current: Option(a)) -> Option(a) {
-  case updated {
-    Some(_) -> updated
-    None -> current
   }
 }
