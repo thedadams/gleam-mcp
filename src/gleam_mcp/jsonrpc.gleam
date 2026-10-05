@@ -2,7 +2,20 @@ import gleam/option.{type Option, None}
 
 pub const jsonrpc_version = "2.0"
 
-pub const latest_protocol_version = "2025-11-25"
+pub const legacy_protocol_version = "2025-11-25"
+
+pub const latest_protocol_version = "2026-07-28"
+
+pub const supported_protocol_versions = [
+  latest_protocol_version,
+  legacy_protocol_version,
+]
+
+pub const header_mismatch_error_code = -32_020
+
+pub const unsupported_protocol_version_error_code = -32_022
+
+pub const missing_required_client_capability_error_code = -32_021
 
 pub const user_rejected_error_code = -1
 

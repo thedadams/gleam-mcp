@@ -79,7 +79,7 @@ fn quiet_sse_stream_respects_the_sdk_deadline() {
     transport.streamable_http_request(
       transport.HttpConfig(url, [], Some(7500)),
       None,
-      jsonrpc.latest_protocol_version,
+      jsonrpc.legacy_protocol_version,
       capabilities.none(),
       message,
       codec.encode_request,
@@ -139,7 +139,7 @@ pub fn bearer_authenticated_mcp_requests_do_not_follow_redirects_test() {
         Some(1000),
       ),
       None,
-      jsonrpc.latest_protocol_version,
+      jsonrpc.legacy_protocol_version,
       capabilities.none(),
       message,
       codec.encode_request,

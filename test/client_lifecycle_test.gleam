@@ -37,12 +37,12 @@ pub fn initialization_records_peer_capabilities_and_notification_runtime_test() 
         initialize_response(
           request,
           caps,
-          jsonrpc.latest_protocol_version,
+          jsonrpc.legacy_protocol_version,
           Some("initial"),
         )
       },
       fn(_, _, version, _, _) {
-        should.equal(version, jsonrpc.latest_protocol_version)
+        should.equal(version, jsonrpc.legacy_protocol_version)
         Ok(transport.TransportResponse(
           jsonrpc.ResultResponse(jsonrpc.StringId("notify"), Nil),
           Some("ready"),
@@ -83,7 +83,7 @@ pub fn initialization_requires_initialized_notification_success_test() {
         initialize_response(
           request,
           empty_server_capabilities(),
-          jsonrpc.latest_protocol_version,
+          jsonrpc.legacy_protocol_version,
           None,
         )
       },
@@ -105,7 +105,7 @@ pub fn negotiated_capabilities_prevent_unsupported_requests_test() {
             initialize_response(
               request,
               empty_server_capabilities(),
-              jsonrpc.latest_protocol_version,
+              jsonrpc.legacy_protocol_version,
               None,
             )
           _ -> {
@@ -141,7 +141,7 @@ pub fn tool_task_negotiation_is_enforced_before_invocation_test() {
             initialize_response(
               request,
               caps,
-              jsonrpc.latest_protocol_version,
+              jsonrpc.legacy_protocol_version,
               None,
             )
           jsonrpc.Request(id, _, Some(actions.ClientRequestListTools(_))) ->
@@ -217,7 +217,7 @@ pub fn expired_session_reinitializes_without_replaying_mutation_test() {
             initialize_response(
               request,
               caps,
-              jsonrpc.latest_protocol_version,
+              jsonrpc.legacy_protocol_version,
               Some("fresh"),
             )
           }
@@ -423,7 +423,7 @@ pub fn explicit_initialize_reopens_without_reviving_old_copies_test() {
             initialize_response(
               request,
               empty_server_capabilities(),
-              jsonrpc.latest_protocol_version,
+              jsonrpc.legacy_protocol_version,
               None,
             )
         }
@@ -448,7 +448,7 @@ pub fn reopening_an_old_copy_discards_its_deleted_session_test() {
         initialize_response(
           request,
           empty_server_capabilities(),
-          jsonrpc.latest_protocol_version,
+          jsonrpc.legacy_protocol_version,
           None,
         )
       },
@@ -589,6 +589,7 @@ fn http_client(
     ),
     capabilities.none(),
   )
+  |> client.with_protocol_version(jsonrpc.legacy_protocol_version)
 }
 
 fn initialize_response(

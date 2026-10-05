@@ -19,7 +19,7 @@ pub fn encode_request_serializes_initialize_test() {
       "initialize",
       Some(
         actions.ClientRequestInitialize(actions.InitializeRequestParams(
-          protocol_version: jsonrpc.latest_protocol_version,
+          protocol_version: jsonrpc.legacy_protocol_version,
           capabilities: actions.ClientCapabilities(None, None, None, None, None),
           client_info: actions.Implementation(
             name: "test-client",
@@ -37,7 +37,7 @@ pub fn encode_request_serializes_initialize_test() {
   codec.encode_request(request)
   |> should.equal(
     "{\"id\":\"req-1\",\"jsonrpc\":\"2.0\",\"method\":\"initialize\",\"params\":{\"protocolVersion\":\""
-    <> jsonrpc.latest_protocol_version
+    <> jsonrpc.legacy_protocol_version
     <> "\",\"capabilities\":{},\"clientInfo\":{\"name\":\"test-client\",\"version\":\"1.0.0\"}}}",
   )
 }

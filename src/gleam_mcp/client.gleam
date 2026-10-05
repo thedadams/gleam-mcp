@@ -1,21 +1,41 @@
 import gleam/dict.{type Dict}
+import gleam/dynamic/decode
 import gleam/erlang/process
+import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
+import gleam/string
 import gleam_mcp/actions.{
   type ActionNotification, type ClientActionRequest, type ClientActionResult,
   type Implementation,
 }
 import gleam_mcp/client/capabilities
+import gleam_mcp/client/codec as client_codec
+import gleam_mcp/client/http_stream
 import gleam_mcp/client/runtime
 import gleam_mcp/client/stdio_manager
+import gleam_mcp/client/subscriptions
 import gleam_mcp/client/transport
+import gleam_mcp/codec_common
+import gleam_mcp/http_headers
 import gleam_mcp/jsonrpc.{type Request, type Response, type RpcError, Request}
 import gleam_mcp/mcp
+import gleam_mcp/server/codec as server_codec
+import gleam_mcp/wire
 import youid/uuid
 
 const maximum_tool_discovery_pages = 100
+
+pub type VersionNegotiation {
+  Auto
+  Pin(String)
+}
+
+pub type ConnectionInfo {
+  Modern(actions.DiscoverResult)
+  Legacy(actions.InitializeResult)
+}
 
 pub type Client {
   Client(
@@ -31,6 +51,14 @@ pub type Client {
     closed: Bool,
     lifecycle: runtime.Control,
     generation: Int,
+    version_negotiation: VersionNegotiation,
+    log_level: Option(actions.LoggingLevel),
+    maximum_input_rounds: Int,
+    connection_info: Option(ConnectionInfo),
+    last_cache_hint: Option(actions.CacheHint),
+    discovery_timeout_ms: Int,
+    extensions: Dict(String, jsonrpc.Value),
+    peer_protocol_version: Option(String),
   )
 }
 
@@ -71,6 +99,14 @@ pub fn new_with_runners(
     closed: False,
     lifecycle: runtime.new(),
     generation: 0,
+    version_negotiation: Auto,
+    log_level: None,
+    maximum_input_rounds: 16,
+    connection_info: None,
+    last_cache_hint: None,
+    discovery_timeout_ms: 5000,
+    extensions: dict.new(),
+    peer_protocol_version: None,
   )
 }
 
@@ -89,7 +125,319 @@ pub fn initialize(
     False -> client
   }
   let generation = runtime.open(client.lifecycle)
-  initialize_current(Client(..client, generation: generation), client_info)
+  initialize_current(
+    Client(
+      ..client,
+      generation: generation,
+      protocol_version: jsonrpc.legacy_protocol_version,
+      peer_protocol_version: None,
+    ),
+    client_info,
+  )
+}
+
+/// Pin negotiation to a supported version, or retain automatic legacy fallback.
+pub fn with_version_negotiation(
+  client: Client,
+  negotiation: VersionNegotiation,
+) -> Client {
+  Client(..client, version_negotiation: negotiation)
+}
+
+pub fn with_protocol_version(client: Client, version: String) -> Client {
+  Client(..client, protocol_version: version, version_negotiation: Pin(version))
+}
+
+pub fn with_log_level(
+  client: Client,
+  level: Option(actions.LoggingLevel),
+) -> Client {
+  Client(..client, log_level: level)
+}
+
+pub fn with_maximum_input_rounds(client: Client, rounds: Int) -> Client {
+  Client(..client, maximum_input_rounds: case rounds < 1 {
+    True -> 1
+    False -> rounds
+  })
+}
+
+pub fn with_discovery_timeout(client: Client, timeout_ms: Int) -> Client {
+  Client(..client, discovery_timeout_ms: case timeout_ms < 1 {
+    True -> 1
+    False -> timeout_ms
+  })
+}
+
+pub fn last_cache_hint(client: Client) -> Option(actions.CacheHint) {
+  client.last_cache_hint
+}
+
+pub fn with_extensions(
+  client: Client,
+  extensions: Dict(String, jsonrpc.Value),
+) -> Client {
+  Client(..client, extensions: extensions)
+}
+
+pub fn with_tasks_extension(client: Client) -> Client {
+  with_extensions(
+    client,
+    dict.insert(
+      client.extensions,
+      "io.modelcontextprotocol/tasks",
+      jsonrpc.VObject([]),
+    ),
+  )
+}
+
+/// Discover modern servers and fall back only when the peer demonstrates legacy
+/// behavior. Authentication failures and recognized modern errors never trigger
+/// a speculative legacy handshake.
+pub fn connect(
+  client: Client,
+  info: Implementation,
+) -> Result(#(Client, ConnectionInfo), ClientError) {
+  let generation = runtime.open(client.lifecycle)
+  let fresh =
+    Client(
+      ..client,
+      generation: generation,
+      closed: False,
+      session_id: None,
+      peer_capabilities: None,
+      cached_tools: dict.new(),
+      client_info: Some(info),
+      connection_info: None,
+      peer_protocol_version: None,
+    )
+  case client.version_negotiation {
+    Pin(version) if version == jsonrpc.legacy_protocol_version ->
+      connect_legacy(fresh, info)
+    Pin(version) if version != jsonrpc.latest_protocol_version ->
+      Error(
+        Transport(transport.UnexpectedResponse(
+          "Unsupported pinned MCP protocol version: " <> version,
+        )),
+      )
+    _ ->
+      connect_modern(
+        Client(..fresh, protocol_version: jsonrpc.latest_protocol_version),
+        info,
+      )
+  }
+}
+
+fn connect_modern(
+  client: Client,
+  info: Implementation,
+) -> Result(#(Client, ConnectionInfo), ClientError) {
+  let timeout = case transport_timeout(client) < client.discovery_timeout_ms {
+    True -> transport_timeout(client)
+    False -> client.discovery_timeout_ms
+  }
+  let #(probed, response) =
+    send_request(
+      with_request_timeout(client, timeout),
+      "server/discover",
+      Some(actions.ClientRequestDiscover(None)),
+    )
+  let probed = Client(..probed, transport_config: client.transport_config)
+  case response {
+    Ok(jsonrpc.ResultResponse(_, actions.ClientResultDiscover(discovered))) -> {
+      case
+        list.contains(
+          discovered.supported_versions,
+          jsonrpc.latest_protocol_version,
+        )
+      {
+        False ->
+          Error(
+            Transport(transport.UnexpectedResponse(
+              "Discovery omitted the requested protocol version",
+            )),
+          )
+        True -> {
+          use caps <- result.try(
+            client_codec.decode_server_capabilities(
+              jsonrpc.VObject(dict.to_list(discovered.capabilities)),
+            )
+            |> result.map_error(fn(message) {
+              Transport(transport.UnexpectedResponse(message))
+            }),
+          )
+          let connected =
+            Client(
+              ..probed,
+              peer_capabilities: Some(caps),
+              connection_info: Some(Modern(discovered)),
+            )
+          Ok(#(connected, Modern(discovered)))
+        }
+      }
+    }
+    Ok(jsonrpc.ErrorResponse(_, error)) if error.code == -32_022 ->
+      case client.version_negotiation, supported_versions(error.data) {
+        Auto, versions ->
+          case list.contains(versions, jsonrpc.legacy_protocol_version) {
+            True -> connect_legacy(close_probe(probed), info)
+            False -> Error(Rpc(error))
+          }
+        _, _ -> Error(Rpc(error))
+      }
+    Ok(jsonrpc.ErrorResponse(_, error)) ->
+      case client.version_negotiation, client.transport_config {
+        Auto, transport.Http(_)
+          if error.code == -32_601
+          && probed.peer_protocol_version
+          != Some(jsonrpc.latest_protocol_version)
+        -> connect_legacy(close_probe(probed), info)
+        Auto, transport.Stdio(_)
+          if error.code != -32_020 && error.code != -32_021
+        -> connect_legacy(close_probe(probed), info)
+        _, _ -> Error(Rpc(error))
+      }
+    Error(error) ->
+      case client.version_negotiation, client.transport_config, error {
+        Auto, transport.Http(_), Transport(transport.ProtocolHttpError(400, _))
+        -> connect_legacy(close_probe(probed), info)
+        Auto, transport.Stdio(_), _ -> connect_legacy(close_probe(probed), info)
+        _, _, _ -> Error(error)
+      }
+    _ -> Error(unexpected_response_error("server/discover"))
+  }
+}
+
+fn close_probe(client: Client) -> Client {
+  case client.stdio_manager {
+    Some(manager) -> {
+      let _ = stdio_manager.close(manager, client.session_id)
+      Nil
+    }
+    None -> Nil
+  }
+  Client(
+    ..client,
+    session_id: None,
+    peer_capabilities: None,
+    cached_tools: dict.new(),
+  )
+}
+
+fn connect_legacy(
+  client: Client,
+  info: Implementation,
+) -> Result(#(Client, ConnectionInfo), ClientError) {
+  use #(client, initialized) <- result.try(initialize_current(
+    Client(..client, protocol_version: jsonrpc.legacy_protocol_version),
+    info,
+  ))
+  let connected = Client(..client, connection_info: Some(Legacy(initialized)))
+  Ok(#(connected, Legacy(initialized)))
+}
+
+fn supported_versions(data: Option(jsonrpc.Value)) -> List(String) {
+  case data {
+    Some(jsonrpc.VObject(fields)) ->
+      case list.key_find(fields, "supported") {
+        Ok(jsonrpc.VArray(versions)) ->
+          list.filter_map(versions, fn(version) {
+            case version {
+              jsonrpc.VString(value) -> Ok(value)
+              _ -> Error(Nil)
+            }
+          })
+        _ -> []
+      }
+    _ -> []
+  }
+}
+
+fn transport_timeout(client: Client) -> Int {
+  let timeout = case client.transport_config {
+    transport.Http(config) -> config.timeout_ms
+    transport.Stdio(config) -> config.timeout_ms
+  }
+  timeout |> option.unwrap(30_000)
+}
+
+fn modern_meta(
+  client: Client,
+  existing: Option(actions.RequestMeta),
+) -> actions.RequestMeta {
+  let existing = existing |> option.unwrap(actions.RequestMeta(None, None))
+  let extras =
+    existing.extra
+    |> option.map(fn(meta) { meta.fields })
+    |> option.unwrap(dict.new())
+  let caps = case capabilities.modern_capabilities(client.capabilities) {
+    jsonrpc.VObject(fields) ->
+      jsonrpc.VObject([
+        #("extensions", jsonrpc.VObject(dict.to_list(client.extensions))),
+        ..fields
+      ])
+    value -> value
+  }
+  let extras =
+    extras
+    |> dict.insert(
+      "io.modelcontextprotocol/protocolVersion",
+      jsonrpc.VString(client.protocol_version),
+    )
+    |> dict.insert("io.modelcontextprotocol/clientCapabilities", caps)
+  let extras = case client.client_info {
+    Some(info) -> {
+      let assert Ok(value) =
+        codec_common.encode_implementation(info)
+        |> json.to_string
+        |> json.parse(client_codec.value_decoder())
+      dict.insert(extras, "io.modelcontextprotocol/clientInfo", value)
+    }
+    None -> dict.delete(extras, "io.modelcontextprotocol/clientInfo")
+  }
+  let extras = case client.log_level {
+    Some(level) ->
+      dict.insert(
+        extras,
+        "io.modelcontextprotocol/logLevel",
+        jsonrpc.VString(logging_level_name(level)),
+      )
+    None -> dict.delete(extras, "io.modelcontextprotocol/logLevel")
+  }
+  actions.RequestMeta(..existing, extra: Some(actions.Meta(extras)))
+}
+
+fn logging_level_name(level: actions.LoggingLevel) -> String {
+  case level {
+    actions.Debug -> "debug"
+    actions.Info -> "info"
+    actions.Notice -> "notice"
+    actions.Warning -> "warning"
+    actions.Error -> "error"
+    actions.Critical -> "critical"
+    actions.Alert -> "alert"
+    actions.Emergency -> "emergency"
+  }
+}
+
+fn attach_metadata(
+  client: Client,
+  incoming: Request(ClientActionRequest),
+) -> Request(ClientActionRequest) {
+  case incoming {
+    Request(id, method, params) -> {
+      let action = params |> option.unwrap(actions.ClientRequestPing(None))
+      Request(
+        id,
+        method,
+        Some(actions.with_request_meta(
+          action,
+          Some(modern_meta(client, actions.request_meta(action))),
+        )),
+      )
+    }
+    _ -> incoming
+  }
 }
 
 fn initialize_current(
@@ -163,7 +511,7 @@ pub fn peer_capabilities(client: Client) -> Option(actions.ServerCapabilities) {
 fn validate_initialize_result(
   value: actions.InitializeResult,
 ) -> Result(Nil, ClientError) {
-  case value.protocol_version == jsonrpc.latest_protocol_version {
+  case value.protocol_version == jsonrpc.legacy_protocol_version {
     False ->
       Error(
         Transport(transport.UnexpectedResponse(
@@ -196,6 +544,9 @@ fn validate_initialize_result(
 pub fn close(client: Client) -> #(Client, Result(Nil, ClientError)) {
   runtime.close(client.lifecycle, client.generation)
   let outcome = case client.transport_config {
+    transport.Http(_)
+      if client.protocol_version == jsonrpc.latest_protocol_version
+    -> Ok(Nil)
     transport.Http(config) ->
       case client.session_id {
         None -> Ok(Nil)
@@ -261,7 +612,10 @@ pub fn ping(client: Client) -> #(Client, Result(Nil, ClientError)) {
 }
 
 pub fn initialized(client: Client) -> #(Client, Result(Nil, ClientError)) {
-  send_notification(client, mcp.method_initialized, None)
+  case client.protocol_version == jsonrpc.latest_protocol_version {
+    True -> #(client, Ok(Nil))
+    False -> send_notification(client, mcp.method_initialized, None)
+  }
 }
 
 pub fn listen(client: Client) -> #(Client, Result(Nil, ClientError)) {
@@ -270,8 +624,276 @@ pub fn listen(client: Client) -> #(Client, Result(Nil, ClientError)) {
       client,
       Error(Transport(transport.UnexpectedResponse("MCP client is closed"))),
     )
-    False -> listen_forever(client)
+    False ->
+      case client.protocol_version == jsonrpc.latest_protocol_version {
+        True ->
+          listen_with_notifications(
+            client,
+            Some(capabilities.notification_filter(client.capabilities)),
+          )
+        False -> listen_forever(client)
+      }
   }
+}
+
+/// Listen to the explicitly selected modern notification types. Resource
+/// updates require URI entries in notifications.resourceSubscriptions.
+pub fn listen_with_notifications(
+  client: Client,
+  notifications: Option(jsonrpc.Value),
+) -> #(Client, Result(Nil, ClientError)) {
+  case
+    is_closed(client)
+    || client.protocol_version != jsonrpc.latest_protocol_version
+  {
+    True -> #(
+      client,
+      Error(
+        Transport(transport.UnexpectedResponse(
+          "Modern subscriptions require an open modern client",
+        )),
+      ),
+    )
+    False -> {
+      let id = jsonrpc.StringId(uuid.v4_string())
+      let incoming =
+        attach_metadata(
+          client,
+          Request(
+            id,
+            "subscriptions/listen",
+            Some(
+              actions.ClientRequestSubscriptionsListen(
+                actions.SubscriptionsListenParams(notifications, None),
+              ),
+            ),
+          ),
+        )
+      let validator = subscriptions.new(incoming, notifications)
+      let stop = process.new_subject()
+      runtime.watch_request(client.lifecycle, client.generation, id, stop)
+      let #(next, result) = case client.transport_config {
+        transport.Http(config) -> {
+          let finished = process.new_subject()
+          let encoded = wire.encode_request(incoming, client.protocol_version)
+          let timeout = case transport_timeout(client) < 3_600_000 {
+            True -> 3_600_000
+            False -> transport_timeout(client)
+          }
+          let streamed =
+            http_stream.request_modern(
+              config.base_url,
+              transport.modern_headers(
+                config,
+                client.protocol_version,
+                encoded,
+                [],
+              ),
+              encoded,
+              timeout,
+              Some(stop),
+              fn(payload, _) {
+                use event <- result.try(
+                  subscriptions.event(validator, payload)
+                  |> result.map_error(http_stream.InvalidResponse),
+                )
+                case event {
+                  subscriptions.Acknowledged(filter) ->
+                    capabilities.acknowledged(client.capabilities, filter)
+                    |> result.map(fn(_) { False })
+                    |> result.map_error(fn(error) {
+                      http_stream.InvalidResponse(error.message)
+                    })
+                  subscriptions.Notification(notification) ->
+                    capabilities.handle_notification(
+                      client.capabilities,
+                      notification,
+                    )
+                    |> result.map(fn(_) { False })
+                    |> result.map_error(fn(error) {
+                      http_stream.InvalidResponse(error.message)
+                    })
+                  subscriptions.Finished(outcome) -> {
+                    process.send(finished, outcome |> result.map_error(Rpc))
+                    Ok(True)
+                  }
+                }
+              },
+            )
+          let outcome = case streamed {
+            Ok(_) ->
+              process.receive(finished, 0)
+              |> result.unwrap(
+                Error(
+                  Transport(transport.UnexpectedResponse(
+                    "Subscription stream ended without completion",
+                  )),
+                ),
+              )
+            Error(error) ->
+              case is_closed(client), error {
+                True, _ -> Ok(Nil)
+                False, http_stream.Closed -> Ok(Nil)
+                _, _ ->
+                  Error(Transport(transport.map_stream_error(error, None)))
+              }
+          }
+          #(client, outcome)
+        }
+        transport.Stdio(config) ->
+          case client.stdio_manager {
+            None -> #(
+              client,
+              Error(
+                Transport(transport.UnexpectedResponse(
+                  "Modern stdio listening requires the managed transport",
+                )),
+              ),
+            )
+            Some(manager) -> {
+              let events = process.new_subject()
+              let manager_config =
+                stdio_manager.Config(
+                  config.command,
+                  config.args,
+                  config.env,
+                  config.cwd,
+                  config.timeout_ms,
+                )
+              case
+                stdio_manager.subscribe(
+                  manager,
+                  manager_config,
+                  client.session_id,
+                  wire.encode_request(incoming, client.protocol_version),
+                  events,
+                )
+              {
+                Error(message) -> #(
+                  client,
+                  Error(Transport(transport.ProcessError(message))),
+                )
+                Ok(session) -> {
+                  let next = set_runtime(client, session)
+                  let outcome =
+                    listen_stdio_subscription(next, validator, events, stop, id)
+                  #(next, outcome)
+                }
+              }
+            }
+          }
+      }
+      subscriptions.stop(validator)
+      runtime.unwatch(client.lifecycle, stop)
+      #(next, result)
+    }
+  }
+}
+
+type SubscriptionEvent {
+  SubscriptionPayload(Result(String, String))
+  SubscriptionStop
+}
+
+fn listen_stdio_subscription(
+  client: Client,
+  validator: subscriptions.Validator,
+  events: process.Subject(Result(String, String)),
+  stop: process.Subject(Nil),
+  id: jsonrpc.RequestId,
+) -> Result(Nil, ClientError) {
+  let selector =
+    process.new_selector()
+    |> process.select_map(events, SubscriptionPayload)
+    |> process.select_map(stop, fn(_) { SubscriptionStop })
+  case process.selector_receive_forever(selector) {
+    SubscriptionStop -> {
+      case is_closed(client) {
+        True -> Nil
+        False -> {
+          let _ =
+            perform_notification(
+              client,
+              mcp.method_notify_cancelled,
+              Some(
+                actions.NotifyCancelled(actions.CancelledNotificationParams(
+                  Some(id),
+                  None,
+                  None,
+                )),
+              ),
+            )
+          Nil
+        }
+      }
+      Ok(Nil)
+    }
+    SubscriptionPayload(Error(message)) ->
+      case is_closed(client) {
+        True -> Ok(Nil)
+        False -> Error(Transport(transport.ProcessError(message)))
+      }
+    SubscriptionPayload(Ok(payload)) -> {
+      use event <- result.try(
+        subscriptions.event(validator, payload)
+        |> result.map_error(fn(message) {
+          Transport(transport.UnexpectedResponse(message))
+        }),
+      )
+      case event {
+        subscriptions.Acknowledged(filter) -> {
+          use _ <- result.try(run_subscription_callback(
+            fn() { capabilities.acknowledged(client.capabilities, filter) },
+            stop,
+            client.capabilities.request_timeout_ms,
+          ))
+          listen_stdio_subscription(client, validator, events, stop, id)
+        }
+        subscriptions.Notification(notification) -> {
+          use _ <- result.try(run_subscription_callback(
+            fn() {
+              capabilities.handle_notification(
+                client.capabilities,
+                notification,
+              )
+            },
+            stop,
+            client.capabilities.request_timeout_ms,
+          ))
+          listen_stdio_subscription(client, validator, events, stop, id)
+        }
+        subscriptions.Finished(outcome) -> outcome |> result.map_error(Rpc)
+      }
+    }
+  }
+}
+
+type CallbackEvent {
+  CallbackReply(Result(Nil, RpcError))
+  CallbackStop
+}
+
+fn run_subscription_callback(
+  work: fn() -> Result(Nil, RpcError),
+  stop: process.Subject(Nil),
+  timeout: Int,
+) -> Result(Nil, ClientError) {
+  let reply = process.new_subject()
+  let worker = process.spawn_unlinked(fn() { process.send(reply, work()) })
+  let selector =
+    process.new_selector()
+    |> process.select_map(reply, CallbackReply)
+    |> process.select_map(stop, fn(_) { CallbackStop })
+  let outcome = case process.selector_receive(selector, timeout) {
+    Ok(CallbackReply(result)) -> result |> result.map_error(Rpc)
+    Ok(CallbackStop) -> {
+      process.send(stop, Nil)
+      Ok(Nil)
+    }
+    Error(_) -> Error(Transport(transport.TimeoutError))
+  }
+  process.kill(worker)
+  outcome
 }
 
 fn listen_forever(client: Client) -> #(Client, Result(Nil, ClientError)) {
@@ -335,7 +957,8 @@ fn listen_once(client: Client) -> #(Client, Result(Nil, ClientError)) {
     transport.Stdio(stdio_config) -> {
       let transport.Runners(stdio_listen: stdio_listen, ..) = runners
       case stdio_listen(stdio_config, session_id, capability_config) {
-        Ok(transport.TransportResponse(session_id: next_session_id, ..)) -> {
+        Ok(response) -> {
+          let next_session_id = response.session_id
           let client = set_runtime(client, next_session_id)
           runtime.await_closed(client.lifecycle, client.generation)
           #(Client(..client, closed: True), Ok(Nil))
@@ -483,6 +1106,19 @@ pub fn list_tools(
     )
   case outcome {
     Ok(page) -> {
+      let page = case
+        next_client.protocol_version,
+        next_client.transport_config
+      {
+        "2026-07-28", transport.Http(_) ->
+          actions.ListToolsResult(
+            ..page,
+            tools: list.filter(page.tools, fn(tool) {
+              http_headers.definitions(tool.input_schema) |> result.is_ok
+            }),
+          )
+        _, _ -> page
+      }
       let tools = case params {
         Some(actions.PaginatedRequestParams(cursor: Some(_), ..)) ->
           next_client.cached_tools
@@ -515,6 +1151,8 @@ pub fn call_tool(
             actions.ClientResultCallTool(res) -> Some(actions.CallTool(res))
             actions.ClientResultCreateTask(res) ->
               Some(actions.CallToolTask(res))
+            actions.ClientResultTaskModern(value) ->
+              Some(actions.CallToolTaskModern(value))
             _ -> None
           }
         },
@@ -585,6 +1223,69 @@ pub fn get_task(
   )
 }
 
+/// Read the current July 2026 polling-extension task representation.
+pub fn get_task_modern(
+  client: Client,
+  task_id: String,
+) -> #(Client, Result(jsonrpc.Value, ClientError)) {
+  modern_task_request(
+    client,
+    "tasks/get",
+    actions.ClientRequestGetTask(actions.TaskIdParams(task_id)),
+  )
+}
+
+pub fn update_task(
+  client: Client,
+  task_id: String,
+  input_responses: Dict(String, jsonrpc.Value),
+) -> #(Client, Result(jsonrpc.Value, ClientError)) {
+  modern_task_request(
+    client,
+    "tasks/update",
+    actions.ClientRequestUpdateTask(actions.TaskUpdateParams(
+      task_id,
+      Some(jsonrpc.VObject(dict.to_list(input_responses))),
+      None,
+    )),
+  )
+}
+
+pub fn cancel_task_modern(
+  client: Client,
+  task_id: String,
+) -> #(Client, Result(jsonrpc.Value, ClientError)) {
+  modern_task_request(
+    client,
+    "tasks/cancel",
+    actions.ClientRequestCancelTask(actions.TaskIdParams(task_id)),
+  )
+}
+
+fn modern_task_request(
+  client: Client,
+  method: String,
+  params: ClientActionRequest,
+) -> #(Client, Result(jsonrpc.Value, ClientError)) {
+  case client.protocol_version == jsonrpc.latest_protocol_version {
+    False -> #(
+      client,
+      Error(
+        Transport(transport.UnexpectedResponse(
+          "Modern task API requires the July 2026 protocol",
+        )),
+      ),
+    )
+    True ->
+      request_action(client, method, params, fn(result) {
+        case result {
+          actions.ClientResultTaskModern(value) -> Some(value)
+          _ -> None
+        }
+      })
+  }
+}
+
 pub fn get_task_result(
   client: Client,
   params: actions.TaskIdParams,
@@ -623,11 +1324,30 @@ pub fn cancelled(
   client: Client,
   params: actions.CancelledNotificationParams,
 ) -> #(Client, Result(Nil, ClientError)) {
-  notify_action(
-    client,
-    mcp.method_notify_cancelled,
-    actions.NotifyCancelled(params),
-  )
+  case
+    client.protocol_version == jsonrpc.latest_protocol_version,
+    params.request_id
+  {
+    True, Some(id) ->
+      runtime.cancel_request(client.lifecycle, client.generation, id)
+    _, _ -> Nil
+  }
+  case client.protocol_version, client.transport_config {
+    "2026-07-28", transport.Http(_) -> {
+      case params.request_id {
+        Some(id) ->
+          runtime.cancel_request(client.lifecycle, client.generation, id)
+        None -> Nil
+      }
+      #(client, Ok(Nil))
+    }
+    _, _ ->
+      notify_action(
+        client,
+        mcp.method_notify_cancelled,
+        actions.NotifyCancelled(params),
+      )
+  }
 }
 
 pub fn progress(
@@ -817,9 +1537,12 @@ fn ensure_tool_descriptor(
   client: Client,
   name: String,
 ) -> #(Client, Result(Nil, ClientError)) {
-  case client.peer_capabilities {
-    None -> #(client, Ok(Nil))
-    Some(_) ->
+  case
+    client.peer_capabilities == None
+    && client.protocol_version != jsonrpc.latest_protocol_version
+  {
+    True -> #(client, Ok(Nil))
+    False ->
       case dict.get(client.cached_tools, name) {
         Ok(_) -> #(client, Ok(Nil))
         Error(Nil) ->
@@ -905,9 +1628,12 @@ fn validate_request_capability(
       case client.peer_capabilities, params {
         None, _ -> Ok(Nil)
         Some(caps), Some(action) -> {
+          let action = actions.request_without_input(action)
           let allowed = case action {
-            actions.ClientRequestInitialize(_) | actions.ClientRequestPing(_) ->
-              True
+            actions.ClientRequestDiscover(_)
+            | actions.ClientRequestSubscriptionsListen(_)
+            | actions.ClientRequestInitialize(_)
+            | actions.ClientRequestPing(_) -> True
             actions.ClientRequestListResources(_)
             | actions.ClientRequestListResourceTemplates(_)
             | actions.ClientRequestReadResource(_) -> caps.resources != None
@@ -926,15 +1652,21 @@ fn validate_request_capability(
             actions.ClientRequestListTasks(_) ->
               case caps.tasks {
                 Some(tasks) -> tasks.list != None
-                None -> False
+                None ->
+                  client.protocol_version == jsonrpc.latest_protocol_version
               }
             actions.ClientRequestCancelTask(_) ->
               case caps.tasks {
                 Some(tasks) -> tasks.cancel != None
-                None -> False
+                None ->
+                  client.protocol_version == jsonrpc.latest_protocol_version
               }
             actions.ClientRequestGetTask(_)
-            | actions.ClientRequestGetTaskResult(_) -> caps.tasks != None
+            | actions.ClientRequestGetTaskResult(_)
+            | actions.ClientRequestUpdateTask(_) ->
+              client.protocol_version == jsonrpc.latest_protocol_version
+              || caps.tasks != None
+            actions.ClientRequestWithInput(_, _, _) -> False
           }
           case allowed {
             False ->
@@ -957,6 +1689,26 @@ fn validate_request_capability(
 }
 
 fn validate_tool_task(
+  client: Client,
+  caps: actions.ServerCapabilities,
+  params: actions.CallToolRequestParams,
+) -> Result(Nil, ClientError) {
+  case client.protocol_version == jsonrpc.latest_protocol_version {
+    True ->
+      case params.task {
+        None -> Ok(Nil)
+        Some(_) ->
+          Error(
+            Rpc(jsonrpc.invalid_params_error(
+              "Modern tool tasks use the declared task extension",
+            )),
+          )
+      }
+    False -> validate_legacy_tool_task(client, caps, params)
+  }
+}
+
+fn validate_legacy_tool_task(
   client: Client,
   caps: actions.ServerCapabilities,
   params: actions.CallToolRequestParams,
@@ -1026,6 +1778,17 @@ fn validate_response_mode(
   incoming: Request(ClientActionRequest),
   response: Response(ClientActionResult),
 ) -> Result(Response(ClientActionResult), ClientError) {
+  case client.protocol_version == jsonrpc.latest_protocol_version {
+    True -> Ok(response)
+    False -> validate_legacy_response_mode(client, incoming, response)
+  }
+}
+
+fn validate_legacy_response_mode(
+  client: Client,
+  incoming: Request(ClientActionRequest),
+  response: Response(ClientActionResult),
+) -> Result(Response(ClientActionResult), ClientError) {
   case client.peer_capabilities, incoming, response {
     Some(_),
       Request(_, _, Some(actions.ClientRequestCallTool(params))),
@@ -1069,7 +1832,9 @@ pub fn request(
       Error(Rpc(jsonrpc.invalid_params_error("Expected a request"))),
     )
     Request(_, method, params) -> {
-      let #(client, prepared) = case params {
+      let #(client, prepared) = case
+        option.map(params, actions.request_without_input)
+      {
         Some(actions.ClientRequestCallTool(params)) ->
           ensure_tool_descriptor(client, params.name)
         _ -> #(client, Ok(Nil))
@@ -1079,8 +1844,370 @@ pub fn request(
         Ok(Nil) ->
           case validate_request_capability(client, params, method) {
             Error(error) -> #(client, Error(error))
-            Ok(Nil) -> perform_request(client, incoming)
+            Ok(Nil) ->
+              case client.protocol_version == jsonrpc.latest_protocol_version {
+                True -> execute_modern(client, incoming)
+                False -> perform_request(client, incoming)
+              }
           }
+      }
+    }
+  }
+}
+
+type InputEvent {
+  InputReply(Result(Response(actions.ServerActionResult), RpcError))
+  InputStopped
+}
+
+fn execute_modern(
+  client: Client,
+  incoming: Request(ClientActionRequest),
+) -> #(Client, Result(Response(ClientActionResult), ClientError)) {
+  let assert Request(id, _, _) = incoming
+  let stop = process.new_subject()
+  let expired = process.new_subject()
+  runtime.watch_request(client.lifecycle, client.generation, id, stop)
+  let timer =
+    process.spawn_unlinked(fn() {
+      process.sleep(transport_timeout(client))
+      process.send(expired, Nil)
+      process.send(stop, Nil)
+    })
+  let #(client, outcome) =
+    modern_round(
+      client,
+      incoming,
+      incoming,
+      stop,
+      client.maximum_input_rounds,
+      False,
+    )
+  process.kill(timer)
+  runtime.unwatch(client.lifecycle, stop)
+  let outcome = case process.receive(expired, 0) {
+    Ok(_) -> Error(Transport(transport.TimeoutError))
+    Error(_) -> outcome
+  }
+  #(client, outcome)
+}
+
+fn modern_round(
+  client: Client,
+  original: Request(ClientActionRequest),
+  current: Request(ClientActionRequest),
+  stop: process.Subject(Nil),
+  remaining: Int,
+  refreshed_headers: Bool,
+) -> #(Client, Result(Response(ClientActionResult), ClientError)) {
+  case process.receive(stop, 0) {
+    Ok(_) -> #(
+      client,
+      Error(Transport(transport.UnexpectedResponse("MCP request cancelled"))),
+    )
+    Error(_) -> {
+      let current = attach_metadata(client, current)
+      let assert Request(id, _, _) = current
+      runtime.watch_request(client.lifecycle, client.generation, id, stop)
+      let #(client, response) =
+        perform_request_options(client, current, Some(stop))
+      let #(client, response) = retain_cache_hint(client, response)
+      case response {
+        Ok(jsonrpc.ResultResponse(
+          _,
+          actions.ClientResultInputRequired(required),
+        )) -> {
+          let state_size =
+            option.map(required.request_state, string.byte_size)
+            |> option.unwrap(0)
+          case
+            remaining <= 0
+            || required.input_requests == None
+            && required.request_state == None
+            || state_size > 1_048_576
+          {
+            True -> #(
+              client,
+              Error(
+                Transport(transport.UnexpectedResponse(
+                  "Invalid or excessive MRTR continuation",
+                )),
+              ),
+            )
+            False -> {
+              case
+                collect_inputs(
+                  client.capabilities,
+                  required.input_requests,
+                  stop,
+                )
+              {
+                Error(error) -> #(client, Error(error))
+                Ok(inputs) -> {
+                  let assert Request(_, method, Some(action)) =
+                    attach_metadata(client, original)
+                  let next =
+                    Request(
+                      jsonrpc.StringId(uuid.v4_string()),
+                      method,
+                      Some(actions.ClientRequestWithInput(
+                        actions.request_without_input(action),
+                        required.request_state,
+                        inputs,
+                      )),
+                    )
+                  modern_round(
+                    client,
+                    original,
+                    next,
+                    stop,
+                    remaining - 1,
+                    refreshed_headers,
+                  )
+                }
+              }
+            }
+          }
+        }
+        Ok(jsonrpc.ErrorResponse(_, error))
+          if error.code == -32_020 && !refreshed_headers
+        ->
+          case original {
+            Request(_, method, Some(actions.ClientRequestCallTool(params))) -> {
+              let #(client, refreshed) =
+                refresh_tool_headers(
+                  client,
+                  params.name,
+                  None,
+                  [],
+                  stop,
+                  maximum_tool_discovery_pages,
+                )
+              case refreshed {
+                Error(error) -> #(client, Error(error))
+                Ok(_) -> {
+                  let Request(_, _, params) = current
+                  modern_round(
+                    client,
+                    original,
+                    Request(jsonrpc.StringId(uuid.v4_string()), method, params),
+                    stop,
+                    remaining,
+                    True,
+                  )
+                }
+              }
+            }
+            _ -> #(client, response)
+          }
+        _ -> #(client, response)
+      }
+    }
+  }
+}
+
+fn retain_cache_hint(
+  client: Client,
+  response: Result(Response(ClientActionResult), ClientError),
+) -> #(Client, Result(Response(ClientActionResult), ClientError)) {
+  case response {
+    Ok(jsonrpc.ResultResponse(id, actions.ClientResultWithCache(value, hint))) -> #(
+      Client(..client, last_cache_hint: Some(hint)),
+      Ok(jsonrpc.ResultResponse(id, value)),
+    )
+    _ -> #(client, response)
+  }
+}
+
+fn collect_inputs(
+  config: capabilities.Config,
+  requests: Option(Dict(String, jsonrpc.Value)),
+  stop: process.Subject(Nil),
+) -> Result(Option(Dict(String, jsonrpc.Value)), ClientError) {
+  case requests {
+    None -> Ok(None)
+    Some(requests) -> {
+      case dict.size(requests) > 32 {
+        True ->
+          Error(
+            Transport(transport.UnexpectedResponse(
+              "MRTR response exceeded 32 input requests",
+            )),
+          )
+        False ->
+          list.try_fold(dict.to_list(requests), dict.new(), fn(inputs, entry) {
+            let #(key, input) = entry
+            use response <- result.try(collect_input(config, input, stop))
+            Ok(dict.insert(inputs, key, response))
+          })
+          |> result.map(Some)
+      }
+    }
+  }
+}
+
+fn collect_input(
+  config: capabilities.Config,
+  input: jsonrpc.Value,
+  stop: process.Subject(Nil),
+) -> Result(jsonrpc.Value, ClientError) {
+  use fields <- result.try(case input {
+    jsonrpc.VObject(fields) -> Ok(fields)
+    _ ->
+      Error(
+        Transport(transport.UnexpectedResponse(
+          "MRTR input must be a request object",
+        )),
+      )
+  })
+  let id = jsonrpc.StringId(uuid.v4_string())
+  let request =
+    jsonrpc.VObject([
+      #("jsonrpc", jsonrpc.VString("2.0")),
+      #("id", jsonrpc.request_id_to_value(id)),
+      ..list.filter(fields, fn(field) {
+        field.0 != "jsonrpc" && field.0 != "id"
+      })
+    ])
+    |> codec_common.encode_value
+    |> json.to_string
+  use incoming <- result.try(case client_codec.decode_server_message(request) {
+    Ok(client_codec.ServerActionRequest(Request(_, _, Some(action)) as request)) ->
+      case action {
+        actions.ServerRequestListRoots(_) -> Ok(request)
+        actions.ServerRequestCreateMessage(params) if params.task == None ->
+          Ok(request)
+        actions.ServerRequestElicit(actions.ElicitRequestForm(params))
+          if params.task == None
+        -> Ok(request)
+        actions.ServerRequestElicit(actions.ElicitRequestUrl(params)) ->
+          case actions.elicit_url_task(params) {
+            None -> Ok(request)
+            _ ->
+              Error(
+                Transport(transport.UnexpectedResponse(
+                  "Task-augmented MRTR input is unsupported",
+                )),
+              )
+          }
+        _ ->
+          Error(
+            Transport(transport.UnexpectedResponse(
+              "Unsupported MRTR input request",
+            )),
+          )
+      }
+    _ ->
+      Error(
+        Transport(transport.UnexpectedResponse("Malformed MRTR input request")),
+      )
+  })
+  let reply = process.new_subject()
+  capabilities.start_request(config, incoming, reply)
+  let selector =
+    process.new_selector()
+    |> process.select_map(reply, InputReply)
+    |> process.select_map(stop, fn(_) { InputStopped })
+  case process.selector_receive_forever(selector) {
+    InputStopped -> {
+      capabilities.cancel_input(config, id)
+      Error(
+        Transport(transport.UnexpectedResponse(
+          "MCP request cancelled while collecting input",
+        )),
+      )
+    }
+    InputReply(Error(error))
+    | InputReply(Ok(jsonrpc.ErrorResponse(_, error))) -> Error(Rpc(error))
+    InputReply(Ok(response)) ->
+      server_codec.encode_server_response(response)
+      |> json.parse(decode.at(["result"], client_codec.value_decoder()))
+      |> result.map_error(fn(_) {
+        Transport(transport.UnexpectedResponse("Invalid MRTR input result"))
+      })
+  }
+}
+
+fn refresh_tool_headers(
+  client: Client,
+  name: String,
+  cursor: Option(actions.Cursor),
+  visited: List(actions.Cursor),
+  stop: process.Subject(Nil),
+  pages: Int,
+) -> #(Client, Result(Nil, ClientError)) {
+  case pages <= 0 {
+    True -> #(
+      client,
+      Error(
+        Transport(transport.UnexpectedResponse(
+          "Tool header refresh exceeded page limit",
+        )),
+      ),
+    )
+    False -> {
+      let incoming =
+        Request(
+          jsonrpc.StringId(uuid.v4_string()),
+          mcp.method_list_tools,
+          Some(
+            actions.ClientRequestListTools(actions.PaginatedRequestParams(
+              cursor,
+              None,
+            )),
+          ),
+        )
+        |> attach_metadata(client, _)
+      let #(client, response) =
+        perform_request_options(client, incoming, Some(stop))
+      let #(client, response) = retain_cache_hint(client, response)
+      case response {
+        Ok(jsonrpc.ResultResponse(_, actions.ClientResultListTools(page))) -> {
+          let tools =
+            list.filter(page.tools, fn(tool) {
+              http_headers.definitions(tool.input_schema) |> result.is_ok
+            })
+          let cached =
+            list.fold(
+              tools,
+              case cursor {
+                None -> dict.new()
+                _ -> client.cached_tools
+              },
+              fn(cache, tool) { dict.insert(cache, tool.name, tool) },
+            )
+          let client = Client(..client, cached_tools: cached)
+          case dict.has_key(cached, name), page.page.next_cursor {
+            True, _ -> #(client, Ok(Nil))
+            False, Some(next) ->
+              case list.contains(visited, next) {
+                True -> #(
+                  client,
+                  Error(
+                    Transport(transport.UnexpectedResponse(
+                      "Repeated tool header refresh cursor",
+                    )),
+                  ),
+                )
+                False ->
+                  refresh_tool_headers(
+                    client,
+                    name,
+                    Some(next),
+                    [next, ..visited],
+                    stop,
+                    pages - 1,
+                  )
+              }
+            _, _ -> #(
+              client,
+              Error(Rpc(jsonrpc.invalid_params_error("Unknown tool: " <> name))),
+            )
+          }
+        }
+        Ok(jsonrpc.ErrorResponse(_, error)) -> #(client, Error(Rpc(error)))
+        Error(error) -> #(client, Error(error))
+        _ -> #(client, Error(unexpected_response_error(mcp.method_list_tools)))
       }
     }
   }
@@ -1101,6 +2228,14 @@ fn perform_request(
   client: Client,
   incoming: Request(ClientActionRequest),
 ) -> #(Client, Result(Response(ClientActionResult), ClientError)) {
+  perform_request_options(client, incoming, None)
+}
+
+fn perform_request_options(
+  client: Client,
+  incoming: Request(ClientActionRequest),
+  stop: Option(process.Subject(Nil)),
+) -> #(Client, Result(Response(ClientActionResult), ClientError)) {
   let Client(
     transport_config: transport_config,
     runners: runners,
@@ -1116,21 +2251,77 @@ fn perform_request(
     ..,
   ) = runners
 
-  case
-    send_message(
-      transport_config,
-      session_id,
-      protocol_version,
-      capability_config,
-      incoming,
-      stdio_request,
-      streamable_request,
-    )
-  {
-    Ok(transport.TransportResponse(response: value, session_id: next_session_id)) -> #(
-      set_runtime(client, next_session_id),
-      validate_response_mode(client, incoming, value),
-    )
+  let response = case wire.validate_request(incoming, protocol_version) {
+    Error(message) -> Error(Transport(transport.UnexpectedResponse(message)))
+    Ok(_) ->
+      case transport_config, client.stdio_manager, protocol_version {
+        transport.Http(http_config), Some(_), "2026-07-28" -> {
+          use mirrored <- result.try(mirrored_headers(client, incoming))
+          transport.streamable_http_request_options(
+            http_config,
+            None,
+            protocol_version,
+            capability_config,
+            incoming,
+            fn(request) { wire.encode_request(request, protocol_version) },
+            fn(body, request) {
+              wire.decode_response(body, request, protocol_version)
+            },
+            mirrored,
+            stop,
+          )
+          |> result.map_error(Transport)
+        }
+        transport.Stdio(config), Some(manager), "2026-07-28" ->
+          case stop {
+            Some(stop) ->
+              transport.stdio_request_until_stopped(
+                manager,
+                config,
+                session_id,
+                capability_config,
+                incoming,
+                stop,
+              )
+              |> result.map_error(Transport)
+            None ->
+              send_message(
+                transport_config,
+                session_id,
+                protocol_version,
+                capability_config,
+                incoming,
+                stdio_request,
+                streamable_request,
+              )
+          }
+        _, _, _ ->
+          send_message(
+            transport_config,
+            session_id,
+            protocol_version,
+            capability_config,
+            incoming,
+            stdio_request,
+            streamable_request,
+          )
+      }
+  }
+  case response {
+    Ok(response) -> {
+      let peer_protocol_version = case response {
+        transport.VersionedTransportResponse(protocol_version:, ..) ->
+          Some(protocol_version)
+        _ -> client.peer_protocol_version
+      }
+      #(
+        set_runtime(
+          Client(..client, peer_protocol_version: peer_protocol_version),
+          response.session_id,
+        ),
+        validate_response_mode(client, incoming, response.response),
+      )
+    }
     Error(Transport(transport.SessionExpired)) -> #(
       recover_expired_session(client, incoming),
       Error(Transport(transport.SessionExpired)),
@@ -1139,7 +2330,59 @@ fn perform_request(
   }
 }
 
+fn mirrored_headers(
+  client: Client,
+  incoming: Request(ClientActionRequest),
+) -> Result(List(#(String, String)), ClientError) {
+  let params = case incoming {
+    Request(_, _, params) | jsonrpc.Notification(_, params) -> params
+  }
+  case params |> option.map(actions.request_without_input) {
+    Some(actions.ClientRequestCallTool(params)) -> {
+      use tool <- result.try(
+        dict.get(client.cached_tools, params.name)
+        |> result.map_error(fn(_) {
+          Rpc(jsonrpc.invalid_params_error("Unknown tool: " <> params.name))
+        }),
+      )
+      http_headers.parameters(
+        tool.input_schema,
+        jsonrpc.VObject(
+          params.arguments |> option.map(dict.to_list) |> option.unwrap([]),
+        ),
+      )
+      |> result.map_error(fn(message) {
+        Rpc(jsonrpc.invalid_params_error(message))
+      })
+    }
+    _ -> Ok([])
+  }
+}
+
 fn send_notification(
+  client: Client,
+  method: String,
+  params: Option(ActionNotification),
+) -> #(Client, Result(Nil, ClientError)) {
+  let allowed = case client.protocol_version, client.transport_config {
+    "2026-07-28", transport.Http(_) -> False
+    "2026-07-28", transport.Stdio(_) -> method == mcp.method_notify_cancelled
+    _, _ -> True
+  }
+  case allowed {
+    False -> #(
+      client,
+      Error(
+        Rpc(jsonrpc.method_not_found_error(
+          "Notification is unavailable in this protocol version: " <> method,
+        )),
+      ),
+    )
+    True -> send_allowed_notification(client, method, params)
+  }
+}
+
+fn send_allowed_notification(
   client: Client,
   method: String,
   params: Option(ActionNotification),
@@ -1186,10 +2429,7 @@ fn perform_notification(
       streamable_request,
     )
   {
-    Ok(transport.TransportResponse(session_id: next_session_id, ..)) -> #(
-      set_runtime(client, next_session_id),
-      Ok(Nil),
-    )
+    Ok(response) -> #(set_runtime(client, response.session_id), Ok(Nil))
     Error(Transport(transport.SessionExpired)) -> {
       let client = case method == mcp.method_initialized {
         True ->
@@ -1248,9 +2488,14 @@ fn send_message(
 }
 
 fn set_runtime(client: Client, session_id: Option(String)) -> Client {
-  let next_session_id = case session_id {
-    Some(_) -> session_id
-    None -> client.session_id
+  let next_session_id = case
+    client.transport_config,
+    client.protocol_version,
+    session_id
+  {
+    transport.Http(_), "2026-07-28", _ -> None
+    _, _, Some(_) -> session_id
+    _, _, None -> client.session_id
   }
 
   Client(..client, session_id: next_session_id)

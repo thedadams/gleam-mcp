@@ -1,5 +1,7 @@
 import gleam/erlang/process
 import gleam/list
+import gleam/option.{type Option, None, Some}
+import gleam_mcp/jsonrpc
 
 /// Lifecycle state shared by immutable copies of a client.
 pub opaque type Control {
@@ -13,6 +15,17 @@ type Message {
   AwaitClosed(Int, process.Subject(Nil))
   Watch(Int, process.Subject(Nil), process.Subject(Nil))
   Unwatch(process.Subject(Nil), process.Subject(Nil))
+  WatchRequest(
+    Int,
+    jsonrpc.RequestId,
+    process.Subject(Nil),
+    process.Subject(Nil),
+  )
+  CancelRequest(Int, jsonrpc.RequestId, process.Subject(Nil))
+}
+
+type Waiter {
+  Waiter(stop: process.Subject(Nil), request_id: Option(jsonrpc.RequestId))
 }
 
 pub fn new() -> Control {
@@ -79,11 +92,36 @@ pub fn unwatch(control: Control, stop: process.Subject(Nil)) -> Nil {
   Nil
 }
 
+pub fn watch_request(
+  control: Control,
+  generation: Int,
+  id: jsonrpc.RequestId,
+  stop: process.Subject(Nil),
+) -> Nil {
+  let Control(subject) = control
+  let registered = process.new_subject()
+  process.send(subject, WatchRequest(generation, id, stop, registered))
+  let assert Ok(Nil) = process.receive(registered, 1000)
+  Nil
+}
+
+pub fn cancel_request(
+  control: Control,
+  generation: Int,
+  id: jsonrpc.RequestId,
+) -> Nil {
+  let Control(subject) = control
+  let reply = process.new_subject()
+  process.send(subject, CancelRequest(generation, id, reply))
+  let assert Ok(Nil) = process.receive(reply, 1000)
+  Nil
+}
+
 fn loop(
   subject: process.Subject(Message),
   generation: Int,
   open: Bool,
-  waiters: List(process.Subject(Nil)),
+  waiters: List(Waiter),
 ) -> Nil {
   case process.receive_forever(subject) {
     Open(reply) -> {
@@ -110,7 +148,8 @@ fn loop(
     }
     AwaitClosed(requested, reply) -> {
       case open && requested == generation {
-        True -> loop(subject, generation, open, [reply, ..waiters])
+        True ->
+          loop(subject, generation, open, [Waiter(reply, None), ..waiters])
         False -> {
           process.send(reply, Nil)
           loop(subject, generation, open, waiters)
@@ -119,7 +158,7 @@ fn loop(
     }
     Watch(requested, stop, registered) -> {
       let next = case open && requested == generation {
-        True -> [stop, ..waiters]
+        True -> [Waiter(stop, None), ..waiters]
         False -> {
           process.send(stop, Nil)
           waiters
@@ -129,13 +168,38 @@ fn loop(
       loop(subject, generation, open, next)
     }
     Unwatch(stop, removed) -> {
-      let next = list.filter(waiters, fn(waiter) { waiter != stop })
+      let next = list.filter(waiters, fn(waiter) { waiter.stop != stop })
       process.send(removed, Nil)
       loop(subject, generation, open, next)
+    }
+    WatchRequest(requested, id, stop, registered) -> {
+      let next = case open && requested == generation {
+        True -> [Waiter(stop, Some(id)), ..waiters]
+        False -> {
+          process.send(stop, Nil)
+          waiters
+        }
+      }
+      process.send(registered, Nil)
+      loop(subject, generation, open, next)
+    }
+    CancelRequest(requested, id, reply) -> {
+      case requested == generation {
+        True ->
+          list.each(waiters, fn(waiter) {
+            case waiter.request_id == Some(id) {
+              True -> process.send(waiter.stop, Nil)
+              False -> Nil
+            }
+          })
+        False -> Nil
+      }
+      process.send(reply, Nil)
+      loop(subject, generation, open, waiters)
     }
   }
 }
 
-fn notify_closed(waiters: List(process.Subject(Nil))) -> Nil {
-  list.each(waiters, fn(waiter) { process.send(waiter, Nil) })
+fn notify_closed(waiters: List(Waiter)) -> Nil {
+  list.each(waiters, fn(waiter) { process.send(waiter.stop, Nil) })
 }

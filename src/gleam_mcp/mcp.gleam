@@ -4,6 +4,14 @@ import gleam_mcp/jsonrpc.{type RequestId, type Value}
 
 pub const method_initialize = "initialize"
 
+pub const method_discover = "server/discover"
+
+pub const method_subscriptions_listen = "subscriptions/listen"
+
+pub const method_notify_subscriptions_acknowledged = "notifications/subscriptions/acknowledged"
+
+pub const method_update_task = "tasks/update"
+
 pub const method_initialized = "notifications/initialized"
 
 pub const method_ping = "ping"
@@ -59,6 +67,8 @@ pub const method_get_task_result = "tasks/result"
 pub const method_cancel_task = "tasks/cancel"
 
 pub const method_notify_task_status = "notifications/tasks/status"
+
+pub const method_notify_task = "notifications/tasks"
 
 pub const method_notify_cancelled = "notifications/cancelled"
 

@@ -1,4 +1,4 @@
-//// MCP 2025-11-25 HTTP authorization. Applications open the authorization URL,
+//// MCP HTTP authorization for 2026-07-28 and 2025-11-25. Applications open the authorization URL,
 //// receive the redirect, and securely persist tokens; this module performs
 //// discovery, PKCE request construction, code exchange, and token refresh.
 
@@ -54,6 +54,7 @@ pub opaque type Config {
     redirect_uri: String,
     client_secret: Option(String),
     issuer: Option(String),
+    credentials_issuer: Option(String),
     scopes: Option(List(String)),
     metadata_client: Bool,
     allow_loopback_http: Bool,
@@ -135,6 +136,7 @@ pub fn new(
     None,
     None,
     None,
+    None,
     False,
     False,
     30_000,
@@ -145,9 +147,24 @@ pub fn with_client_secret(config: Config, secret: String) -> Config {
   Config(..config, client_secret: Some(secret))
 }
 
-/// Select one issuer from the resource's advertised authorization servers.
+/// Select an issuer and bind pre-registered credentials to it. Changing the
+/// selected issuer preserves the original credential binding; use a fresh
+/// configuration with the new issuer's credentials when re-registering.
 pub fn with_issuer(config: Config, issuer: String) -> Config {
-  Config(..config, issuer: Some(issuer))
+  let credentials_issuer = case
+    config.credentials_issuer,
+    config.metadata_client
+  {
+    None, False -> Some(issuer)
+    binding, _ -> binding
+  }
+  Config(..config, issuer: Some(issuer), credentials_issuer: credentials_issuer)
+}
+
+/// Key persisted pre-registered credentials by this issuer. Metadata-document
+/// client IDs are portable and have no registration issuer.
+pub fn credentials_issuer(config: Config) -> Option(String) {
+  config.credentials_issuer
 }
 
 pub fn with_scopes(config: Config, scopes: List(String)) -> Config {
@@ -156,7 +173,38 @@ pub fn with_scopes(config: Config, scopes: List(String)) -> Config {
 
 /// Use an HTTPS client ID metadata document hosted by the application.
 pub fn with_client_metadata_document(config: Config) -> Config {
-  Config(..config, metadata_client: True)
+  Config(..config, metadata_client: True, credentials_issuer: None)
+}
+
+/// JSON to host at the HTTPS client ID URL. The document identifies a public
+/// client and exactly matches the registered redirect URI used by this config.
+pub fn client_metadata_document(
+  config: Config,
+  client_name: String,
+) -> Result(String, Error) {
+  use _ <- result.try(validate_config(config))
+  use _ <- result.try(validate_client_metadata_url(config.client_id))
+  case client_name == "" || config.client_secret != None {
+    True ->
+      Error(InvalidConfiguration(
+        "Client metadata requires a name and a public client",
+      ))
+    False ->
+      Ok(
+        json.object([
+          #("client_id", json.string(config.client_id)),
+          #("client_name", json.string(client_name)),
+          #("redirect_uris", json.array([config.redirect_uri], json.string)),
+          #(
+            "grant_types",
+            json.array(["authorization_code", "refresh_token"], json.string),
+          ),
+          #("response_types", json.array(["code"], json.string)),
+          #("token_endpoint_auth_method", json.string("none")),
+        ])
+        |> json.to_string,
+      )
+  }
 }
 
 pub fn with_timeout(config: Config, timeout_ms: Int) -> Config {
@@ -1165,21 +1213,20 @@ fn validate_discovery(
     True -> Error(ResourceMismatch)
     False ->
       case config.metadata_client {
-        False -> Ok(Nil)
+        False ->
+          case config.credentials_issuer {
+            Some(issuer) if issuer == discovery.authorization_server.issuer ->
+              Ok(Nil)
+            Some(_) -> Error(IssuerMismatch)
+            None ->
+              Error(InvalidConfiguration(
+                "Pre-registered credentials require their issuer; use with_issuer",
+              ))
+          }
         True -> {
-          use parsed <- result.try(
-            uri.parse(config.client_id)
-            |> result.replace_error(InvalidConfiguration(
-              "Invalid client metadata document URL",
-            )),
-          )
+          use _ <- result.try(validate_client_metadata_url(config.client_id))
           case
-            parsed.scheme == Some("https")
-            && parsed.host != None
-            && parsed.path != ""
-            && parsed.path != "/"
-            && parsed.fragment == None
-            && parsed.userinfo == None
+            config.client_secret == None
             && discovery.authorization_server.client_id_metadata_document_supported
           {
             True -> Ok(Nil)
@@ -1190,6 +1237,32 @@ fn validate_discovery(
           }
         }
       }
+  }
+}
+
+fn validate_client_metadata_url(value: String) -> Result(Nil, Error) {
+  use parsed <- result.try(
+    uri.parse(value)
+    |> result.replace_error(InvalidConfiguration(
+      "Invalid client metadata document URL",
+    )),
+  )
+  case
+    parsed.scheme == Some("https")
+    && parsed.host != None
+    && parsed.host != Some("")
+    && parsed.path != ""
+    && parsed.path != "/"
+    && parsed.fragment == None
+    && parsed.userinfo == None
+    && !string.contains(value, "\r")
+    && !string.contains(value, "\n")
+  {
+    True -> Ok(Nil)
+    False ->
+      Error(InvalidConfiguration(
+        "Client metadata URL requires HTTPS and a path",
+      ))
   }
 }
 

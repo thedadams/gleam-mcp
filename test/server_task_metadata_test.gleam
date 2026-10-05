@@ -266,7 +266,7 @@ fn ready_session(app: server.Server) -> String {
         mcp.method_initialize,
         Some(
           actions.ClientRequestInitialize(actions.InitializeRequestParams(
-            jsonrpc.latest_protocol_version,
+            jsonrpc.legacy_protocol_version,
             actions.ClientCapabilities(None, None, None, None, None),
             server_test_support.sample_client_info(),
             None,

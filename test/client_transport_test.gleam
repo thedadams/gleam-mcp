@@ -34,7 +34,7 @@ pub fn transport_stdio_mode_uses_stdio_runner_test() {
     transport.send_request(
       config,
       None,
-      jsonrpc.latest_protocol_version,
+      jsonrpc.legacy_protocol_version,
       capabilities.none(),
       request,
       fn(stdio_config, session_id, _capabilities, incoming_request) {
@@ -64,7 +64,7 @@ pub fn transport_http_mode_uses_streamable_runner_test() {
     transport.send_request(
       config,
       Some("session-1"),
-      jsonrpc.latest_protocol_version,
+      jsonrpc.legacy_protocol_version,
       capabilities.none(),
       request,
       fn(_, _, _, _) { Error(transport.UnexpectedResponse("wrong runner")) },
@@ -80,7 +80,7 @@ pub fn transport_http_mode_uses_streamable_runner_test() {
           transport.HttpConfig("https://example.com", [], Some(5000)),
         )
         should.equal(session_id, Some("session-1"))
-        should.equal(protocol_version, jsonrpc.latest_protocol_version)
+        should.equal(protocol_version, jsonrpc.legacy_protocol_version)
         should.equal(incoming_request, request)
         transport_ok(jsonrpc.ResultResponse(jsonrpc.StringId("http"), Nil))
       },
@@ -115,7 +115,7 @@ pub fn client_new_uses_protocol_defaults_test() {
 
 pub fn initialize_sends_requests_and_notification_test() {
   let client =
-    client.new_with_runners(
+    legacy_client_with_runners(
       transport.Stdio(transport.StdioConfig("cmd", [], [], None, None)),
       transport.Runners(
         stdio_request: fn(_, _, _, request) {
@@ -134,7 +134,7 @@ pub fn initialize_sends_requests_and_notification_test() {
               ) = params
               should.equal(
                 request_protocol_version,
-                jsonrpc.latest_protocol_version,
+                jsonrpc.legacy_protocol_version,
               )
               should.equal(
                 request_capabilities,
@@ -189,7 +189,7 @@ pub fn initialize_sends_requests_and_notification_test() {
 
 pub fn initialize_persists_http_session_id_test() {
   let created =
-    client.new_with_runners(
+    legacy_client_with_runners(
       transport.Http(transport.HttpConfig("https://example.com/mcp", [], None)),
       transport.Runners(
         stdio_request: fn(_, _, _, _) {
@@ -245,7 +245,7 @@ pub fn initialize_persists_http_session_id_test() {
 
 pub fn initialize_keeps_http_session_id_when_notification_returns_none_test() {
   let created =
-    client.new_with_runners(
+    legacy_client_with_runners(
       transport.Http(transport.HttpConfig("https://example.com/mcp", [], None)),
       transport.Runners(
         stdio_request: fn(_, _, _, _) {
@@ -304,7 +304,7 @@ pub fn initialize_keeps_http_session_id_when_notification_returns_none_test() {
 
 pub fn initialize_returns_rpc_errors_test() {
   let created =
-    client.new_with_runners(
+    legacy_client_with_runners(
       transport.Stdio(transport.StdioConfig("cmd", [], [], None, None)),
       transport.Runners(
         stdio_request: fn(_, _, _, _) {
@@ -335,7 +335,7 @@ pub fn initialize_returns_rpc_errors_test() {
 
 pub fn initialize_rejects_unexpected_result_variants_test() {
   let created =
-    client.new_with_runners(
+    legacy_client_with_runners(
       transport.Stdio(transport.StdioConfig("cmd", [], [], None, None)),
       transport.Runners(
         stdio_request: fn(_, _, _, _) {
@@ -372,7 +372,7 @@ pub fn initialize_rejects_unexpected_result_variants_test() {
 
 pub fn initialize_surfaces_notification_errors_test() {
   let created =
-    client.new_with_runners(
+    legacy_client_with_runners(
       transport.Stdio(transport.StdioConfig("cmd", [], [], None, None)),
       transport.Runners(
         stdio_request: fn(_, _, _, _) {
@@ -401,7 +401,7 @@ pub fn initialize_surfaces_notification_errors_test() {
 
 pub fn ping_returns_success_test() {
   let created =
-    client.new_with_runners(
+    legacy_client_with_runners(
       transport.Stdio(transport.StdioConfig("cmd", [], [], None, None)),
       transport.Runners(
         stdio_request: fn(_, _, _, request) {
@@ -439,7 +439,7 @@ pub fn ping_returns_success_test() {
 
 pub fn ping_returns_rpc_errors_test() {
   let created =
-    client.new_with_runners(
+    legacy_client_with_runners(
       transport.Stdio(transport.StdioConfig("cmd", [], [], None, None)),
       transport.Runners(
         stdio_request: fn(_, _, _, _) {
@@ -475,7 +475,7 @@ pub fn list_tools_returns_typed_result_test() {
   let params = actions.PaginatedRequestParams(None, None)
   let expected = sample_list_tools_result()
   let created =
-    client.new_with_runners(
+    legacy_client_with_runners(
       transport.Stdio(transport.StdioConfig("cmd", [], [], None, None)),
       transport.Runners(
         stdio_request: fn(_, _, _, request) {
@@ -518,7 +518,7 @@ pub fn list_tools_returns_typed_result_test() {
 
 pub fn list_tools_rejects_unexpected_result_variants_test() {
   let created =
-    client.new_with_runners(
+    legacy_client_with_runners(
       transport.Stdio(transport.StdioConfig("cmd", [], [], None, None)),
       transport.Runners(
         stdio_request: fn(_, _, _, _) {
@@ -557,7 +557,7 @@ pub fn list_tools_rejects_unexpected_result_variants_test() {
 pub fn set_logging_level_accepts_empty_results_test() {
   let params = actions.SetLevelRequestParams(actions.Info, None)
   let created =
-    client.new_with_runners(
+    legacy_client_with_runners(
       transport.Stdio(transport.StdioConfig("cmd", [], [], None, None)),
       transport.Runners(
         stdio_request: fn(_, _, _, request) {
@@ -601,7 +601,7 @@ pub fn call_tool_accepts_regular_results_test() {
   let params = actions.CallToolRequestParams("weather", None, None, None)
   let expected = sample_call_tool_result()
   let created =
-    client.new_with_runners(
+    legacy_client_with_runners(
       transport.Stdio(transport.StdioConfig("cmd", [], [], None, None)),
       transport.Runners(
         stdio_request: fn(_, _, _, request) {
@@ -645,7 +645,7 @@ pub fn call_tool_accepts_task_results_test() {
   let params = actions.CallToolRequestParams("weather", None, None, None)
   let expected = sample_create_task_result()
   let created =
-    client.new_with_runners(
+    legacy_client_with_runners(
       transport.Stdio(transport.StdioConfig("cmd", [], [], None, None)),
       transport.Runners(
         stdio_request: fn(_, _, _, _) {
@@ -684,7 +684,7 @@ pub fn progress_sends_notification_params_test() {
       None,
     )
   let created =
-    client.new_with_runners(
+    legacy_client_with_runners(
       transport.Stdio(transport.StdioConfig("cmd", [], [], None, None)),
       transport.Runners(
         stdio_request: fn(_, _, _, _) {
@@ -728,7 +728,7 @@ pub fn progress_sends_notification_params_test() {
 
 pub fn roots_list_changed_sends_notification_test() {
   let created =
-    client.new_with_runners(
+    legacy_client_with_runners(
       transport.Stdio(transport.StdioConfig("cmd", [], [], None, None)),
       transport.Runners(
         stdio_request: fn(_, _, _, _) {
@@ -808,7 +808,7 @@ fn sample_implementation() -> actions.Implementation {
 
 fn sample_initialize_result() -> actions.InitializeResult {
   actions.InitializeResult(
-    protocol_version: jsonrpc.latest_protocol_version,
+    protocol_version: jsonrpc.legacy_protocol_version,
     capabilities: actions.ServerCapabilities(
       None,
       None,
@@ -838,7 +838,7 @@ fn sample_list_tools_result() -> actions.ListToolsResult {
         name: "weather",
         title: Some("Weather"),
         description: Some("Get weather"),
-        input_schema: jsonrpc.VObject([]),
+        input_schema: jsonrpc.VObject([#("type", jsonrpc.VString("object"))]),
         execution: None,
         output_schema: None,
         annotations: None,
@@ -953,7 +953,7 @@ pub fn http_get_stream_does_not_block_json_post_test() {
         transport.streamable_http_listen_until_closed(
           transport.HttpConfig(url, [], Some(5000)),
           Some("wire-session"),
-          jsonrpc.latest_protocol_version,
+          jsonrpc.legacy_protocol_version,
           capabilities.none(),
           stop,
         )
@@ -1092,7 +1092,7 @@ pub fn http_sse_resumes_post_with_cursor_and_retry_test() {
           )
           should.equal(
             request.get_header(req, "mcp-protocol-version"),
-            Ok(jsonrpc.latest_protocol_version),
+            Ok(jsonrpc.legacy_protocol_version),
           )
           wire_chunks(
             req,
@@ -1142,7 +1142,7 @@ pub fn http_session_404_is_typed_test() {
   transport.streamable_http_request(
     transport.HttpConfig(url, [], Some(300)),
     Some("expired"),
-    jsonrpc.latest_protocol_version,
+    jsonrpc.legacy_protocol_version,
     capabilities.none(),
     message,
     client_codec.encode_request,
@@ -1205,7 +1205,7 @@ pub fn http_listener_does_not_retry_405_test() {
     transport.streamable_http_listen(
       transport.HttpConfig(url, [], Some(300)),
       None,
-      jsonrpc.latest_protocol_version,
+      jsonrpc.legacy_protocol_version,
       capabilities.none(),
     )
   {
@@ -1302,7 +1302,7 @@ fn wire_request(
   transport.streamable_http_request(
     transport.HttpConfig(url, [], Some(timeout)),
     None,
-    jsonrpc.latest_protocol_version,
+    jsonrpc.legacy_protocol_version,
     config,
     message,
     client_codec.encode_request,
@@ -1397,4 +1397,13 @@ fn nested_relay_loop(
       nested_relay_loop(subject, stream)
     }
   }
+}
+
+fn legacy_client_with_runners(
+  config: transport.Config,
+  runners: transport.Runners,
+  caps: capabilities.Config,
+) -> client.Client {
+  client.new_with_runners(config, runners, caps)
+  |> client.with_protocol_version(jsonrpc.legacy_protocol_version)
 }

@@ -1,10 +1,15 @@
+import gleam/bit_array
+import gleam/crypto
 import gleam/dict
+import gleam/dynamic/decode
 import gleam/erlang/process
 import gleam/int
+import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
+import gleam/time/timestamp
 import gleam_mcp/actions
 import gleam_mcp/jsonrpc
 import gleam_mcp/mcp
@@ -13,7 +18,10 @@ import gleam_mcp/server/oauth
 import gleam_mcp/server/runtime
 import gleam_mcp/server/streamable_http_store
 import gleam_mcp/task_store
+import gleam_mcp/wire
 import youid/uuid
+
+const task_extension = "io.modelcontextprotocol/tasks"
 
 const server_sent_request_timeout_ms = 3_600_000
 
@@ -59,11 +67,27 @@ pub type RequestContext {
     request_id: jsonrpc.RequestId,
     meta: Option(actions.RequestMeta),
   )
+  ModernRequestContext(
+    session_id: Option(String),
+    task_id: Option(String),
+    request_id: jsonrpc.RequestId,
+    meta: Option(actions.RequestMeta),
+    principal: Option(String),
+    transport_scope: String,
+    worker: Option(process.Pid),
+    notifications: Option(
+      process.Subject(streamable_http_store.ListenerMessage),
+    ),
+  )
 }
 
 pub type NotificationHandler =
   fn(Server, RequestContext, actions.ActionNotification) ->
     Result(Nil, jsonrpc.RpcError)
+
+pub type ModernRequestHandler =
+  fn(Server, RequestContext, actions.ClientActionRequest) ->
+    Result(actions.ClientActionResult, jsonrpc.RpcError)
 
 type Options {
   Options(
@@ -72,6 +96,9 @@ type Options {
     capabilities: Option(actions.ServerCapabilities),
     request_timeout_ms: Int,
     page_size: Int,
+    modern_handler: Option(ModernRequestHandler),
+    state_secret: BitArray,
+    extensions: dict.Dict(String, jsonrpc.Value),
   )
 }
 
@@ -83,6 +110,7 @@ pub opaque type Server {
     task_store: task_store.Store,
     http_store: streamable_http_store.Store,
     runtime: runtime.Store(actions.ClientActionResult),
+    subscriptions: runtime.SubscriptionStore,
     tools: List(RegisteredTool),
     resources: List(RegisteredResource),
     resource_templates: List(RegisteredResourceTemplate),
@@ -126,6 +154,7 @@ pub fn new(implementation: actions.Implementation) -> Server {
     task_store.new(),
     streamable_http_store.new(),
     runtime.new(),
+    runtime.new_subscriptions(),
     [],
     [],
     [],
@@ -133,8 +162,21 @@ pub fn new(implementation: actions.Implementation) -> Server {
     None,
     None,
     None,
-    Options([], None, None, server_sent_request_timeout_ms, 100),
+    Options(
+      [],
+      None,
+      None,
+      server_sent_request_timeout_ms,
+      100,
+      None,
+      crypto.strong_random_bytes(32),
+      dict.new(),
+    ),
   )
+}
+
+pub fn implementation(server: Server) -> actions.Implementation {
+  server.implementation
 }
 
 pub fn with_instructions(server: Server, instructions: String) -> Server {
@@ -191,6 +233,183 @@ pub fn allowed_origins(server: Server) -> List(String) {
   server.options.allowed_origins
 }
 
+/// Supply MRTR-aware handlers. Each retry carries all of its own input and
+/// opaque request state; handlers must verify application-owned state before
+/// using it for authorization or business decisions.
+pub fn with_modern_request_handler(
+  server: Server,
+  handler: ModernRequestHandler,
+) -> Server {
+  Server(
+    ..server,
+    options: Options(..server.options, modern_handler: Some(handler)),
+  )
+}
+
+/// Declare supported protocol extensions in modern discovery responses.
+pub fn with_extensions(
+  server: Server,
+  extensions: dict.Dict(String, jsonrpc.Value),
+) -> Server {
+  Server(..server, options: Options(..server.options, extensions: extensions))
+}
+
+/// A modern transport scopes cancellation and notifications to an individual
+/// request. It never establishes an MCP protocol session.
+pub fn modern_request_context(
+  principal: Option(String),
+  transport_scope: String,
+  notifications: Option(process.Subject(streamable_http_store.ListenerMessage)),
+) -> RequestContext {
+  ModernRequestContext(
+    None,
+    None,
+    jsonrpc.IntId(0),
+    None,
+    principal,
+    transport_scope,
+    None,
+    notifications,
+  )
+}
+
+/// Configure the same signing secret on server instances that share MRTR
+/// continuations. The secret must contain at least 32 random bytes.
+pub fn with_request_state_secret(
+  server: Server,
+  secret: BitArray,
+) -> Result(Server, String) {
+  case bit_array.byte_size(secret) >= 32 {
+    True ->
+      Ok(
+        Server(
+          ..server,
+          options: Options(..server.options, state_secret: secret),
+        ),
+      )
+    False ->
+      Error("Request state signing secrets must contain at least 32 bytes")
+  }
+}
+
+/// Protect continuation state and bind it to the authenticated caller, a
+/// method/parameter identity chosen by the application, and a short expiry.
+pub fn sign_request_state(
+  server: Server,
+  context: RequestContext,
+  binding: String,
+  state: String,
+  ttl_ms: Int,
+) -> String {
+  let principal = context_principal(context)
+  let expiry = current_time_ms() + int.clamp(ttl_ms, 1, 3_600_000)
+  let payload =
+    json.object([
+      #("principal", case principal {
+        Some(value) -> json.string(value)
+        None -> json.null()
+      }),
+      #("binding", json.string(binding)),
+      #("state", json.string(state)),
+      #("expiry", json.int(expiry)),
+    ])
+    |> json.to_string
+  crypto.sign_message(
+    <<payload:utf8>>,
+    server.options.state_secret,
+    crypto.Sha256,
+  )
+}
+
+pub fn verify_request_state(
+  server: Server,
+  context: RequestContext,
+  binding: String,
+  token: String,
+) -> Result(String, jsonrpc.RpcError) {
+  use payload <- result.try(
+    crypto.verify_signed_message(token, server.options.state_secret)
+    |> result.map_error(fn(_) {
+      jsonrpc.invalid_params_error("Invalid request state signature")
+    }),
+  )
+  use payload <- result.try(
+    bit_array.to_string(payload)
+    |> result.map_error(fn(_) {
+      jsonrpc.invalid_params_error("Invalid request state encoding")
+    }),
+  )
+  let decoder = {
+    use principal <- decode.field("principal", decode.optional(decode.string))
+    use binding <- decode.field("binding", decode.string)
+    use state <- decode.field("state", decode.string)
+    use expiry <- decode.field("expiry", decode.int)
+    decode.success(#(principal, binding, state, expiry))
+  }
+  use decoded <- result.try(
+    json.parse(payload, decoder)
+    |> result.map_error(fn(_) {
+      jsonrpc.invalid_params_error("Invalid request state payload")
+    }),
+  )
+  case
+    decoded.0 == context_principal(context)
+    && decoded.1 == binding
+    && decoded.3 > current_time_ms()
+  {
+    True -> Ok(decoded.2)
+    False ->
+      Error(jsonrpc.invalid_params_error(
+        "Request state expired or belongs to a different caller or request",
+      ))
+  }
+}
+
+fn current_time_ms() -> Int {
+  let #(seconds, nanoseconds) =
+    timestamp.system_time() |> timestamp.to_unix_seconds_and_nanoseconds
+  seconds * 1000 + nanoseconds / 1_000_000
+}
+
+fn context_principal(context: RequestContext) -> Option(String) {
+  case context {
+    ModernRequestContext(principal: principal, ..) -> principal
+    _ -> None
+  }
+}
+
+pub fn is_modern_context(context: RequestContext) -> Bool {
+  case context {
+    ModernRequestContext(..) -> True
+    _ -> False
+  }
+}
+
+fn runtime_scope(context: RequestContext) -> Option(String) {
+  case context {
+    ModernRequestContext(transport_scope: scope, ..) -> Some(scope)
+    _ -> context.session_id
+  }
+}
+
+/// Cancel a request using its transport correlation scope.
+pub fn cancel_incoming_request(
+  server: Server,
+  context: RequestContext,
+  id: jsonrpc.RequestId,
+) -> Nil {
+  runtime.cancel(server.runtime, runtime_scope(context), id)
+  case runtime_scope(context) {
+    Some(scope) -> runtime.cancel_subscription(server.subscriptions, scope, id)
+    None -> Nil
+  }
+}
+
+pub fn close_modern_transport(server: Server, scope: String) -> Nil {
+  runtime.close(server.runtime, scope)
+  runtime.close_subscription_scope(server.subscriptions, scope)
+}
+
 pub fn with_notification_handler(
   server: Server,
   handler: NotificationHandler,
@@ -242,6 +461,12 @@ pub fn register_tool_descriptor(
   ])
 }
 
+pub fn tool_descriptor(server: Server, name: String) -> Option(actions.Tool) {
+  find_tool(server.tools, name)
+  |> result.map(fn(registered) { registered.tool })
+  |> option.from_result
+}
+
 pub fn register_context_tool_descriptor(
   server: Server,
   tool: actions.Tool,
@@ -290,6 +515,7 @@ pub fn request_meta(context: RequestContext) -> Option(actions.RequestMeta) {
   case context {
     RequestContext(_, _) -> None
     RequestContextWithMeta(meta: meta, ..) -> meta
+    ModernRequestContext(meta: meta, ..) -> meta
   }
 }
 
@@ -572,21 +798,57 @@ pub fn start_request_with_context(
 ) -> Nil {
   case request {
     jsonrpc.Request(id, _, Some(action)) -> {
-      let context =
-        RequestContextWithMeta(
-          context.session_id,
-          context.task_id,
-          id,
-          action_meta(action),
-        )
-      case check_request_lifecycle(server, context, action) {
+      let context = case is_modern_context(context), is_modern_action(action) {
+        False, True ->
+          modern_request_context(
+            None,
+            context.session_id |> option.unwrap("direct"),
+            None,
+          )
+        _, _ -> context
+      }
+      let context = request_context(context, id, action_meta(action))
+      let duplicate_subscription = case runtime_scope(context) {
+        Some(scope) ->
+          runtime.subscription_active(server.subscriptions, scope, id)
+        None -> False
+      }
+      let validation = case duplicate_subscription {
+        True ->
+          Error(jsonrpc.RpcError(
+            -32_600,
+            "Duplicate active subscription id",
+            None,
+          ))
+        False ->
+          case is_modern_context(context) {
+            True -> validate_modern_request(server, context, action)
+            False -> check_request_lifecycle(server, context, action)
+          }
+      }
+      case validation {
         Ok(_) ->
           runtime.start_with_reply(
             server.runtime,
-            context.session_id,
+            runtime_scope(context),
             id,
             server.options.request_timeout_ms,
-            fn() { dispatch_request(server, context, action) },
+            fn() {
+              case is_modern_context(context) {
+                True -> {
+                  let assert ModernRequestContext(..) = context
+                  dispatch_modern_request(
+                    server,
+                    ModernRequestContext(
+                      ..context,
+                      worker: Some(process.self()),
+                    ),
+                    action,
+                  )
+                }
+                False -> dispatch_request(server, context, action)
+              }
+            },
             reply_to,
           )
         Error(error) -> process.send(reply_to, Error(error))
@@ -597,6 +859,951 @@ pub fn start_request_with_context(
         reply_to,
         Error(jsonrpc.invalid_params_error("Expected request parameters")),
       )
+  }
+}
+
+pub fn request_context(
+  context: RequestContext,
+  id: jsonrpc.RequestId,
+  meta: Option(actions.RequestMeta),
+) -> RequestContext {
+  case context {
+    ModernRequestContext(..) ->
+      ModernRequestContext(..context, request_id: id, meta: meta)
+    _ ->
+      case uses_modern_metadata(meta) {
+        True ->
+          ModernRequestContext(
+            None,
+            context.task_id,
+            id,
+            meta,
+            None,
+            "direct",
+            None,
+            None,
+          )
+        False ->
+          RequestContextWithMeta(context.session_id, context.task_id, id, meta)
+      }
+  }
+}
+
+pub fn uses_modern_metadata(meta: Option(actions.RequestMeta)) -> Bool {
+  option.is_some(request_meta_value(
+    meta,
+    "io.modelcontextprotocol/protocolVersion",
+  ))
+}
+
+pub fn is_modern_action(action: actions.ClientActionRequest) -> Bool {
+  uses_modern_metadata(action_meta(action))
+  || case base_request(action) {
+    actions.ClientRequestDiscover(_)
+    | actions.ClientRequestSubscriptionsListen(_)
+    | actions.ClientRequestUpdateTask(_) -> True
+    _ -> False
+  }
+}
+
+pub fn protocol_version(meta: Option(actions.RequestMeta)) -> Option(String) {
+  case request_meta_value(meta, "io.modelcontextprotocol/protocolVersion") {
+    Some(jsonrpc.VString(value)) -> Some(value)
+    _ -> None
+  }
+}
+
+fn request_meta_value(
+  meta: Option(actions.RequestMeta),
+  key: String,
+) -> Option(jsonrpc.Value) {
+  use meta <- option.then(meta)
+  use extra <- option.then(meta.extra)
+  dict.get(extra.fields, key) |> option.from_result
+}
+
+fn client_capability_value(
+  context: RequestContext,
+  key: String,
+) -> Option(jsonrpc.Value) {
+  case
+    request_meta_value(
+      request_meta(context),
+      "io.modelcontextprotocol/clientCapabilities",
+    )
+  {
+    Some(jsonrpc.VObject(fields)) ->
+      dict.get(dict.from_list(fields), key) |> option.from_result
+    _ -> None
+  }
+}
+
+pub fn validate_modern_request(
+  server: Server,
+  context: RequestContext,
+  action: actions.ClientActionRequest,
+) -> Result(Nil, jsonrpc.RpcError) {
+  use _ <- result.try(wire.validate_request_metadata(request_meta(context)))
+  case action {
+    actions.ClientRequestWithInput(request, _, _) ->
+      validate_modern_request(server, context, request)
+    actions.ClientRequestGetTask(_) | actions.ClientRequestCancelTask(_) ->
+      require_task_extension(server, context)
+    actions.ClientRequestUpdateTask(params) -> {
+      use _ <- result.try(require_task_extension(server, context))
+      case params.input {
+        Some(jsonrpc.VObject(_)) -> Ok(Nil)
+        _ ->
+          Error(jsonrpc.invalid_params_error(
+            "tasks/update requires inputResponses object",
+          ))
+      }
+    }
+    actions.ClientRequestSubscriptionsListen(params) ->
+      validate_subscription_filter(params.notifications)
+    actions.ClientRequestInitialize(_)
+    | actions.ClientRequestPing(_)
+    | actions.ClientRequestSubscribeResource(_)
+    | actions.ClientRequestUnsubscribeResource(_)
+    | actions.ClientRequestSetLoggingLevel(_)
+    | actions.ClientRequestListTasks(_)
+    | actions.ClientRequestGetTaskResult(_) ->
+      Error(jsonrpc.method_not_found_error(
+        "Method is not defined in the modern protocol",
+      ))
+    _ -> check_client_request_capability(server, action)
+  }
+}
+
+fn log_rank(level: String) -> Option(Int) {
+  case level {
+    "debug" -> Some(0)
+    "info" -> Some(1)
+    "notice" -> Some(2)
+    "warning" -> Some(3)
+    "error" -> Some(4)
+    "critical" -> Some(5)
+    "alert" -> Some(6)
+    "emergency" -> Some(7)
+    _ -> None
+  }
+}
+
+fn dispatch_modern_request(
+  server: Server,
+  context: RequestContext,
+  action: actions.ClientActionRequest,
+) -> Result(actions.ClientActionResult, jsonrpc.RpcError) {
+  let base = base_request(action)
+  let outcome = case base {
+    actions.ClientRequestDiscover(_) -> Ok(discovery_result(server))
+    actions.ClientRequestGetTask(params) ->
+      modern_task_result(server, context, params.task_id)
+    actions.ClientRequestCancelTask(params) -> {
+      use snapshot <- result.try(task_store.snapshot_scoped(
+        server.task_store,
+        params.task_id,
+        context_task_scope(server, context),
+      ))
+      case snapshot.task.status {
+        actions.Completed | actions.Failed | actions.Cancelled -> Nil
+        _ -> {
+          let _ =
+            task_store.cancel_scoped(
+              server.task_store,
+              params.task_id,
+              context_task_scope(server, context),
+            )
+          Nil
+        }
+      }
+      Ok(actions.ClientResultEmpty(None))
+    }
+    actions.ClientRequestUpdateTask(params) -> {
+      let inputs = case params.input {
+        Some(jsonrpc.VObject(fields)) -> dict.from_list(fields)
+        None -> dict.new()
+        _ -> dict.new()
+      }
+      task_store.submit_inputs_scoped(
+        server.task_store,
+        params.task_id,
+        context_task_scope(server, context),
+        inputs,
+      )
+      |> result.map(fn(_) { actions.ClientResultEmpty(None) })
+    }
+    actions.ClientRequestSubscriptionsListen(_) ->
+      Error(jsonrpc.invalid_params_error(
+        "Subscriptions require a streaming transport",
+      ))
+    actions.ClientRequestCallTool(params) -> {
+      case server.options.modern_handler {
+        Some(handler) -> handler(server, context, action)
+        None -> modern_call_tool(server, context, params)
+      }
+    }
+    actions.ClientRequestReadResource(_) | actions.ClientRequestGetPrompt(_) -> {
+      case server.options.modern_handler {
+        Some(handler) -> handler(server, context, action)
+        None -> dispatch_request(server, context, base)
+      }
+    }
+    _ -> dispatch_request(server, context, base)
+  }
+  use response <- result.try(
+    outcome
+    |> result.map_error(fn(error) {
+      case error.code {
+        -32_002 | -32_042 ->
+          jsonrpc.RpcError(-32_603, error.message, error.data)
+        _ -> error
+      }
+    }),
+  )
+  use _ <- result.try(validate_modern_result(server, context, base, response))
+  let response = strip_input_cache(response)
+  let response = case
+    actions.request_state(action),
+    actions.input_responses(action),
+    base
+  {
+    None, None, _ -> response
+    _, _, actions.ClientRequestReadResource(_) ->
+      actions.ClientResultWithCache(
+        response,
+        actions.CacheHint(0, actions.Private),
+      )
+    _, _, _ -> response
+  }
+  Ok(response)
+}
+
+fn strip_input_cache(
+  response: actions.ClientActionResult,
+) -> actions.ClientActionResult {
+  case response {
+    actions.ClientResultWithCache(value, hint) -> {
+      let value = strip_input_cache(value)
+      case value {
+        actions.ClientResultInputRequired(_) -> value
+        _ -> actions.ClientResultWithCache(value, hint)
+      }
+    }
+    _ -> response
+  }
+}
+
+fn base_request(
+  action: actions.ClientActionRequest,
+) -> actions.ClientActionRequest {
+  case action {
+    actions.ClientRequestWithInput(request, _, _) -> base_request(request)
+    _ -> action
+  }
+}
+
+pub fn modern_capabilities(server: Server) -> dict.Dict(String, jsonrpc.Value) {
+  let value =
+    wire.result_value(
+      initialization_result(server),
+      jsonrpc.legacy_protocol_version,
+      server.implementation,
+    )
+  let fields = case value {
+    jsonrpc.VObject(fields) -> dict.from_list(fields)
+    _ -> dict.new()
+  }
+  let caps = case dict.get(fields, "capabilities") {
+    Ok(jsonrpc.VObject(fields)) -> dict.from_list(fields)
+    _ -> dict.new()
+  }
+  let caps = dict.delete(caps, "tasks")
+  let extensions = case option.is_some(advertised_capabilities(server).tasks) {
+    True ->
+      dict.insert(
+        server.options.extensions,
+        task_extension,
+        jsonrpc.VObject([]),
+      )
+    False -> server.options.extensions
+  }
+  case dict.size(extensions) > 0 {
+    True ->
+      dict.insert(caps, "extensions", jsonrpc.VObject(dict.to_list(extensions)))
+    False -> caps
+  }
+}
+
+fn validate_subscription_filter(
+  filter: Option(jsonrpc.Value),
+) -> Result(Nil, jsonrpc.RpcError) {
+  case filter {
+    Some(jsonrpc.VObject(fields)) ->
+      list.try_each(fields, fn(pair) {
+        case pair {
+          #("toolsListChanged", jsonrpc.VBool(_))
+          | #("promptsListChanged", jsonrpc.VBool(_))
+          | #("resourcesListChanged", jsonrpc.VBool(_)) -> Ok(Nil)
+          #("resourceSubscriptions", jsonrpc.VArray(values))
+          | #("taskIds", jsonrpc.VArray(values)) ->
+            list.try_each(values, fn(value) {
+              case value {
+                jsonrpc.VString(_) -> Ok(Nil)
+                _ ->
+                  Error(jsonrpc.invalid_params_error(
+                    "Subscription identifiers must be strings",
+                  ))
+              }
+            })
+          #("toolsListChanged", _)
+          | #("promptsListChanged", _)
+          | #("resourcesListChanged", _)
+          | #("resourceSubscriptions", _)
+          | #("taskIds", _) ->
+            Error(jsonrpc.invalid_params_error("Invalid subscription filter"))
+          _ -> Ok(Nil)
+        }
+      })
+    _ ->
+      Error(jsonrpc.invalid_params_error(
+        "subscriptions/listen requires notifications object",
+      ))
+  }
+}
+
+/// Register a modern notification stream. The acknowledgment is the first
+/// delivered event, and only effective, explicitly requested filters are used.
+pub fn listen_subscription(
+  server: Server,
+  context: RequestContext,
+  params: actions.SubscriptionsListenParams,
+) -> Result(Nil, jsonrpc.RpcError) {
+  use _ <- result.try(validate_modern_request(
+    server,
+    context,
+    actions.ClientRequestSubscriptionsListen(params),
+  ))
+  let assert ModernRequestContext(
+    transport_scope: scope,
+    request_id: id,
+    notifications: sink,
+    ..,
+  ) = context
+  use _ <- result.try(case runtime.active(server.runtime, Some(scope), id) {
+    True ->
+      Error(jsonrpc.RpcError(-32_600, "Duplicate active request id", None))
+    False -> Ok(Nil)
+  })
+  use sink <- result.try(
+    sink
+    |> option.to_result(jsonrpc.invalid_params_error(
+      "Subscriptions require a streaming transport",
+    )),
+  )
+  let requested = case params.notifications {
+    Some(jsonrpc.VObject(fields)) -> dict.from_list(fields)
+    _ -> dict.new()
+  }
+  let caps = advertised_capabilities(server)
+  let effective =
+    dict.filter(requested, fn(key, value) {
+      case key, value {
+        "toolsListChanged", jsonrpc.VBool(True) ->
+          caps.tools
+          |> option.map(fn(cap) { cap.list_changed == Some(True) })
+          |> option.unwrap(False)
+        "promptsListChanged", jsonrpc.VBool(True) ->
+          caps.prompts
+          |> option.map(fn(cap) { cap.list_changed == Some(True) })
+          |> option.unwrap(False)
+        "resourcesListChanged", jsonrpc.VBool(True) ->
+          caps.resources
+          |> option.map(fn(cap) { cap.list_changed == Some(True) })
+          |> option.unwrap(False)
+        "resourceSubscriptions", jsonrpc.VArray(_) ->
+          caps.resources
+          |> option.map(fn(cap) { cap.subscribe == Some(True) })
+          |> option.unwrap(False)
+        "taskIds", jsonrpc.VArray(_) ->
+          has_task_extension(context) && server_supports_tasks(server)
+        _, _ -> False
+      }
+    })
+  // Do not agree to notifications for another authenticated caller's task.
+  let effective = case dict.get(effective, "taskIds") {
+    Ok(jsonrpc.VArray(ids)) ->
+      dict.insert(
+        effective,
+        "taskIds",
+        jsonrpc.VArray(
+          list.filter(ids, fn(value) {
+            case value {
+              jsonrpc.VString(id) ->
+                task_store.get_scoped(
+                  server.task_store,
+                  id,
+                  context_task_scope(server, context),
+                )
+                |> result.is_ok
+              _ -> False
+            }
+          }),
+        ),
+      )
+    _ -> effective
+  }
+  let correlate = fn(notification) { correlate_subscription(notification, id) }
+  let ack =
+    jsonrpc.Notification(
+      "notifications/subscriptions/acknowledged",
+      Some(actions.NotifySubscriptionsAcknowledgedWithFilter(
+        Some(jsonrpc.VObject(dict.to_list(effective))),
+        None,
+      )),
+    )
+  let closing =
+    wire.encode_response(
+      jsonrpc.ResultResponse(
+        id,
+        actions.ClientResultSubscriptionsListen(
+          actions.SubscriptionsListenResult(
+            Some(
+              actions.Meta(
+                dict.from_list([
+                  #(
+                    "io.modelcontextprotocol/subscriptionId",
+                    request_id_value(id),
+                  ),
+                ]),
+              ),
+            ),
+          ),
+        ),
+      ),
+      jsonrpc.latest_protocol_version,
+      server.implementation,
+    )
+  runtime.listen_request(
+    server.subscriptions,
+    scope,
+    id,
+    sink,
+    fn(notification) { subscription_accepts(effective, notification) },
+    correlate,
+    ack,
+    closing,
+  )
+}
+
+/// Emit an application change only to modern subscriptions that opted in.
+pub fn publish_notification(
+  server: Server,
+  notification: jsonrpc.Request(actions.ActionNotification),
+) -> Nil {
+  runtime.publish(server.subscriptions, notification)
+}
+
+fn subscription_accepts(
+  filter: dict.Dict(String, jsonrpc.Value),
+  notification: jsonrpc.Request(actions.ActionNotification),
+) -> Bool {
+  case notification {
+    jsonrpc.Notification(_, Some(actions.NotifyToolListChanged(_))) ->
+      dict.get(filter, "toolsListChanged") == Ok(jsonrpc.VBool(True))
+    jsonrpc.Notification(_, Some(actions.NotifyPromptListChanged(_))) ->
+      dict.get(filter, "promptsListChanged") == Ok(jsonrpc.VBool(True))
+    jsonrpc.Notification(_, Some(actions.NotifyResourceListChanged(_))) ->
+      dict.get(filter, "resourcesListChanged") == Ok(jsonrpc.VBool(True))
+    jsonrpc.Notification(_, Some(actions.NotifyResourceUpdated(params))) ->
+      case dict.get(filter, "resourceSubscriptions") {
+        Ok(jsonrpc.VArray(uris)) ->
+          list.contains(uris, jsonrpc.VString(params.uri))
+        _ -> False
+      }
+    jsonrpc.Notification(
+      _,
+      Some(actions.NotifyTaskModern(jsonrpc.VObject(fields), _)),
+    ) -> {
+      case
+        dict.get(filter, "taskIds"),
+        dict.get(dict.from_list(fields), "taskId")
+      {
+        Ok(jsonrpc.VArray(ids)), Ok(id) -> list.contains(ids, id)
+        _, _ -> False
+      }
+    }
+    _ -> False
+  }
+}
+
+fn request_id_value(id: jsonrpc.RequestId) -> jsonrpc.Value {
+  case id {
+    jsonrpc.IntId(id) -> jsonrpc.VInt(id)
+    jsonrpc.StringId(id) -> jsonrpc.VString(id)
+  }
+}
+
+fn subscription_meta(
+  meta: Option(actions.NotificationMeta),
+  id: jsonrpc.RequestId,
+) -> Option(actions.NotificationMeta) {
+  let fields = case meta |> option.then(fn(meta) { meta.extra }) {
+    Some(meta) -> meta.fields
+    None -> dict.new()
+  }
+  Some(
+    actions.NotificationMeta(
+      Some(
+        actions.Meta(dict.insert(
+          fields,
+          "io.modelcontextprotocol/subscriptionId",
+          request_id_value(id),
+        )),
+      ),
+    ),
+  )
+}
+
+fn correlate_subscription(
+  notification: jsonrpc.Request(actions.ActionNotification),
+  id: jsonrpc.RequestId,
+) -> jsonrpc.Request(actions.ActionNotification) {
+  case notification {
+    jsonrpc.Notification(method, Some(action)) -> {
+      let action = case action {
+        actions.NotifyToolListChanged(meta) ->
+          actions.NotifyToolListChanged(subscription_meta(meta, id))
+        actions.NotifyPromptListChanged(meta) ->
+          actions.NotifyPromptListChanged(subscription_meta(meta, id))
+        actions.NotifyResourceListChanged(meta) ->
+          actions.NotifyResourceListChanged(subscription_meta(meta, id))
+        actions.NotifyResourceUpdated(params) ->
+          actions.NotifyResourceUpdated(
+            actions.ResourceUpdatedNotificationParams(
+              ..params,
+              meta: subscription_meta(params.meta, id),
+            ),
+          )
+        actions.NotifySubscriptionsAcknowledged(meta) ->
+          actions.NotifySubscriptionsAcknowledged(subscription_meta(meta, id))
+        actions.NotifySubscriptionsAcknowledgedWithFilter(filter, meta) ->
+          actions.NotifySubscriptionsAcknowledgedWithFilter(
+            filter,
+            subscription_meta(meta, id),
+          )
+        actions.NotifyTaskModern(value, meta) ->
+          actions.NotifyTaskModern(value, subscription_meta(meta, id))
+        _ -> action
+      }
+      jsonrpc.Notification(method, Some(action))
+    }
+    _ -> notification
+  }
+}
+
+fn discovery_result(server: Server) -> actions.ClientActionResult {
+  actions.ClientResultDiscover(actions.DiscoverResult(
+    [jsonrpc.latest_protocol_version, jsonrpc.legacy_protocol_version],
+    modern_capabilities(server),
+    server.instructions,
+    None,
+  ))
+}
+
+fn has_task_extension(context: RequestContext) -> Bool {
+  case client_capability_value(context, "extensions") {
+    Some(jsonrpc.VObject(fields)) ->
+      case dict.get(dict.from_list(fields), task_extension) {
+        Ok(jsonrpc.VObject(_)) -> True
+        _ -> False
+      }
+    _ -> False
+  }
+}
+
+fn server_supports_tasks(server: Server) -> Bool {
+  option.is_some(advertised_capabilities(server).tasks)
+  || case dict.get(server.options.extensions, task_extension) {
+    Ok(jsonrpc.VObject(_)) -> True
+    _ -> False
+  }
+}
+
+fn require_task_extension(
+  server: Server,
+  context: RequestContext,
+) -> Result(Nil, jsonrpc.RpcError) {
+  case server_supports_tasks(server), has_task_extension(context) {
+    False, _ ->
+      Error(jsonrpc.method_not_found_error("Tasks extension is not supported"))
+    True, False ->
+      Error(missing_capability(
+        "extensions",
+        jsonrpc.VObject([#(task_extension, jsonrpc.VObject([]))]),
+      ))
+    True, True -> Ok(Nil)
+  }
+}
+
+fn missing_capability(
+  name: String,
+  capability: jsonrpc.Value,
+) -> jsonrpc.RpcError {
+  jsonrpc.RpcError(
+    -32_021,
+    "Required client capability is missing",
+    Some(
+      jsonrpc.VObject([
+        #("requiredCapabilities", jsonrpc.VObject([#(name, capability)])),
+      ]),
+    ),
+  )
+}
+
+fn validate_modern_result(
+  server: Server,
+  context: RequestContext,
+  action: actions.ClientActionRequest,
+  response: actions.ClientActionResult,
+) -> Result(Nil, jsonrpc.RpcError) {
+  case response {
+    actions.ClientResultWithCache(value, _) ->
+      validate_modern_result(server, context, action, value)
+    actions.ClientResultTaskModern(jsonrpc.VObject(fields)) -> {
+      case dict.get(dict.from_list(fields), "resultType") {
+        Ok(jsonrpc.VString("task")) -> {
+          use _ <- result.try(case action {
+            actions.ClientRequestCallTool(_) -> Ok(Nil)
+            _ ->
+              Error(jsonrpc.invalid_params_error(
+                "Only tools/call supports task augmentation",
+              ))
+          })
+          require_task_extension(server, context)
+        }
+        _ -> Ok(Nil)
+      }
+    }
+    actions.ClientResultInputRequired(params) -> {
+      use _ <- result.try(case action {
+        actions.ClientRequestCallTool(_)
+        | actions.ClientRequestReadResource(_)
+        | actions.ClientRequestGetPrompt(_) -> Ok(Nil)
+        _ ->
+          Error(jsonrpc.invalid_params_error(
+            "MRTR is only supported for tools/call, resources/read and prompts/get",
+          ))
+      })
+      use _ <- result.try(case params.input_requests, params.request_state {
+        None, None ->
+          Error(jsonrpc.invalid_params_error(
+            "input_required needs inputRequests or requestState",
+          ))
+        _, _ -> Ok(Nil)
+      })
+      list.try_each(
+        params.input_requests |> option.unwrap(dict.new()) |> dict.values,
+        fn(request) { validate_input_request(context, request) },
+      )
+    }
+    _ -> Ok(Nil)
+  }
+}
+
+fn validate_input_request(
+  context: RequestContext,
+  request: jsonrpc.Value,
+) -> Result(Nil, jsonrpc.RpcError) {
+  let fields = case request {
+    jsonrpc.VObject(fields) -> dict.from_list(fields)
+    _ -> dict.new()
+  }
+  let params = case dict.get(fields, "params") {
+    Ok(jsonrpc.VObject(fields)) -> dict.from_list(fields)
+    _ -> dict.new()
+  }
+  case dict.get(fields, "method") {
+    Ok(jsonrpc.VString("roots/list")) ->
+      require_input_capability(context, "roots", None)
+    Ok(jsonrpc.VString("sampling/createMessage")) -> {
+      use _ <- result.try(require_input_capability(context, "sampling", None))
+      use _ <- result.try(case dict.get(params, "includeContext") {
+        Ok(jsonrpc.VString("thisServer")) | Ok(jsonrpc.VString("allServers")) ->
+          require_input_capability(context, "sampling", Some("context"))
+        _ -> Ok(Nil)
+      })
+      let tools =
+        value_uses_tools(jsonrpc.VObject(dict.to_list(params)))
+        || case dict.get(params, "tools"), dict.get(params, "toolChoice") {
+          Ok(jsonrpc.VArray([])), Error(_) | Error(_), Error(_) -> False
+          _, _ -> True
+        }
+      case tools {
+        True -> require_input_capability(context, "sampling", Some("tools"))
+        False -> Ok(Nil)
+      }
+    }
+    Ok(jsonrpc.VString("elicitation/create")) -> {
+      let mode = case dict.get(params, "mode") {
+        Ok(jsonrpc.VString("url")) -> "url"
+        _ -> "form"
+      }
+      require_input_capability(context, "elicitation", Some(mode))
+    }
+    _ ->
+      Error(jsonrpc.invalid_params_error(
+        "Unsupported MRTR input request method",
+      ))
+  }
+}
+
+fn value_uses_tools(value: jsonrpc.Value) -> Bool {
+  case value {
+    jsonrpc.VArray(values) -> list.any(values, value_uses_tools)
+    jsonrpc.VObject(fields) -> {
+      let kind = dict.get(dict.from_list(fields), "type")
+      kind == Ok(jsonrpc.VString("tool_use"))
+      || kind == Ok(jsonrpc.VString("tool_result"))
+      || list.any(fields, fn(field) { value_uses_tools(field.1) })
+    }
+    _ -> False
+  }
+}
+
+fn require_input_capability(
+  context: RequestContext,
+  name: String,
+  sub: Option(String),
+) -> Result(Nil, jsonrpc.RpcError) {
+  let present = case client_capability_value(context, name), sub {
+    Some(jsonrpc.VObject(_)), None -> True
+    Some(jsonrpc.VObject(fields)), Some(key) ->
+      case dict.get(dict.from_list(fields), key) {
+        Ok(jsonrpc.VObject(_)) -> True
+        _ -> name == "elicitation" && key == "form" && fields == []
+      }
+    _, _ -> False
+  }
+  case present {
+    True -> Ok(Nil)
+    False ->
+      Error(
+        missing_capability(name, case sub {
+          Some(key) -> jsonrpc.VObject([#(key, jsonrpc.VObject([]))])
+          None -> jsonrpc.VObject([])
+        }),
+      )
+  }
+}
+
+fn modern_call_tool(
+  server: Server,
+  context: RequestContext,
+  params: actions.CallToolRequestParams,
+) -> Result(actions.ClientActionResult, jsonrpc.RpcError) {
+  use registered <- result.try(
+    find_tool(server.tools, params.name)
+    |> result.map_error(fn(_) {
+      jsonrpc.invalid_params_error("Unknown tool: " <> params.name)
+    }),
+  )
+  let execute = fn() {
+    run_tool_handler(server, registered.handler, context, params.arguments)
+    |> result.map(actions.ClientResultCallTool)
+  }
+  case
+    has_task_extension(context),
+    server_supports_tasks(server),
+    tool_task_support(registered.tool)
+  {
+    True, True, Some(actions.TaskOptional)
+    | True, True, Some(actions.TaskRequired)
+    ->
+      create_modern_task(server, context, Some(task_store.maximum_ttl_ms), fn() {
+        run_tool_handler(
+          server,
+          registered.handler,
+          modern_task_context(context),
+          params.arguments,
+        )
+        |> result.map(actions.ClientResultCallTool)
+        |> result.map(fn(value) {
+          task_store.ModernComplete(wire.result_value(
+            value,
+            jsonrpc.latest_protocol_version,
+            server.implementation,
+          ))
+        })
+      })
+    _, _, _ -> execute()
+  }
+}
+
+/// An asynchronous task has no request progress or log stream. Use this context
+/// for application task callbacks that retain the initiating caller identity.
+pub fn modern_task_context(context: RequestContext) -> RequestContext {
+  case context {
+    ModernRequestContext(..) -> {
+      let meta =
+        request_meta(context)
+        |> option.map(fn(meta) {
+          actions.RequestMeta(
+            None,
+            meta.extra
+              |> option.map(fn(extra) {
+                actions.Meta(dict.delete(
+                  extra.fields,
+                  "io.modelcontextprotocol/logLevel",
+                ))
+              }),
+          )
+        })
+      ModernRequestContext(..context, notifications: None, meta: meta)
+    }
+    _ -> context
+  }
+}
+
+/// Create an optional Tasks extension handle. The task worker is cancelled and
+/// retained by the task store independently of the request's transport.
+pub fn create_modern_task(
+  server: Server,
+  context: RequestContext,
+  ttl_ms: Option(Int),
+  worker: fn() -> Result(task_store.ModernOutcome, jsonrpc.RpcError),
+) -> Result(actions.ClientActionResult, jsonrpc.RpcError) {
+  use _ <- result.try(require_task_extension(server, context))
+  let task =
+    task_store.create_scoped(
+      server.task_store,
+      ttl_ms,
+      context_task_scope(server, context),
+    )
+  use _ <- result.try(
+    task_store.start_modern_worker(server.task_store, task.task_id, fn() {
+      worker() |> result.try(validate_task_inputs(context, _))
+    }),
+  )
+  Ok(
+    actions.ClientResultTaskModern(
+      jsonrpc.VObject([
+        #("resultType", jsonrpc.VString("task")),
+        ..task_fields(task)
+      ]),
+    ),
+  )
+}
+
+fn validate_task_inputs(
+  context: RequestContext,
+  outcome: task_store.ModernOutcome,
+) -> Result(task_store.ModernOutcome, jsonrpc.RpcError) {
+  case outcome {
+    task_store.ModernComplete(_) -> Ok(outcome)
+    task_store.ModernInputRequired(inputs, resume) -> {
+      use _ <- result.try(
+        list.try_each(dict.values(inputs), validate_input_request(context, _)),
+      )
+      Ok(
+        task_store.ModernInputRequired(inputs, fn(responses) {
+          resume(responses) |> result.try(validate_task_inputs(context, _))
+        }),
+      )
+    }
+  }
+}
+
+fn task_fields(task: actions.Task) -> List(#(String, jsonrpc.Value)) {
+  [
+    #("taskId", jsonrpc.VString(task.task_id)),
+    #(
+      "status",
+      jsonrpc.VString(case task.status {
+        actions.Working -> "working"
+        actions.InputRequired -> "input_required"
+        actions.Completed -> "completed"
+        actions.Failed -> "failed"
+        actions.Cancelled -> "cancelled"
+      }),
+    ),
+    #("createdAt", jsonrpc.VString(task.created_at)),
+    #("lastUpdatedAt", jsonrpc.VString(task.last_updated_at)),
+    #("ttlMs", case task.ttl_ms {
+      Some(ttl) -> jsonrpc.VInt(ttl)
+      None -> jsonrpc.VNull
+    }),
+    #(
+      "pollIntervalMs",
+      jsonrpc.VInt(task.poll_interval_ms |> option.unwrap(5000)),
+    ),
+    ..case task.status_message {
+      Some(message) -> [#("statusMessage", jsonrpc.VString(message))]
+      None -> []
+    }
+  ]
+}
+
+fn modern_task_result(
+  server: Server,
+  context: RequestContext,
+  id: String,
+) -> Result(actions.ClientActionResult, jsonrpc.RpcError) {
+  use snapshot <- result.try(task_store.snapshot_scoped(
+    server.task_store,
+    id,
+    context_task_scope(server, context),
+  ))
+  let task = case snapshot.task.status, snapshot.outcome {
+    actions.Failed, Some(Ok(_)) ->
+      actions.Task(..snapshot.task, status: actions.Completed)
+    _, _ -> snapshot.task
+  }
+  let extra = case task.status, snapshot.outcome {
+    actions.InputRequired, _ -> [
+      #("inputRequests", jsonrpc.VObject(dict.to_list(snapshot.inputs))),
+    ]
+    actions.Completed, Some(Ok(payload)) -> [
+      #("result", task_payload_value(server, payload)),
+    ]
+    actions.Failed, Some(Error(error)) -> [
+      #(
+        "error",
+        jsonrpc.VObject([
+          #("code", jsonrpc.VInt(error.code)),
+          #("message", jsonrpc.VString(error.message)),
+          ..case error.data {
+            Some(data) -> [#("data", data)]
+            None -> []
+          }
+        ]),
+      ),
+    ]
+    _, _ -> []
+  }
+  Ok(
+    actions.ClientResultTaskModern(
+      jsonrpc.VObject([
+        #("resultType", jsonrpc.VString("complete")),
+        ..list.append(task_fields(task), extra)
+      ]),
+    ),
+  )
+}
+
+fn task_payload_value(
+  server: Server,
+  payload: actions.TaskResult,
+) -> jsonrpc.Value {
+  case payload {
+    actions.TaskResultModern(value) -> value
+    actions.TaskCallTool(result) ->
+      wire.result_value(
+        actions.ClientResultCallTool(result),
+        jsonrpc.latest_protocol_version,
+        server.implementation,
+      )
+    actions.TaskCreateMessage(_) | actions.TaskElicit(_) -> jsonrpc.VObject([])
   }
 }
 
@@ -648,7 +1855,7 @@ pub fn handle_notification_with_context(
         }
         actions.NotifyCancelled(params) -> {
           case params.request_id {
-            Some(id) -> runtime.cancel(server.runtime, context.session_id, id)
+            Some(id) -> cancel_incoming_request(server, context, id)
             None -> Nil
           }
           Ok(Nil)
@@ -698,6 +1905,7 @@ pub fn session_metadata(
 
 pub fn close_session(server: Server, session_id: String) -> Nil {
   runtime.close(server.runtime, session_id)
+  runtime.close_subscription_scope(server.subscriptions, session_id)
   streamable_http_store.delete_session(server.http_store, session_id)
 }
 
@@ -714,7 +1922,7 @@ pub fn bind_session(
         server.http_store,
         session_id,
         streamable_http_store.SessionMetadata(
-          protocol_version: jsonrpc.latest_protocol_version,
+          protocol_version: jsonrpc.legacy_protocol_version,
           client_capabilities: actions.ClientCapabilities(
             None,
             None,
@@ -733,6 +1941,20 @@ pub fn bind_session(
 }
 
 fn context_task_scope(
+  server: Server,
+  context: RequestContext,
+) -> Option(String) {
+  case context {
+    ModernRequestContext(principal: principal, ..) -> {
+      // Modern tasks are durable handles and do not belong to a transport
+      // session. Authenticated callers retain access across connections.
+      principal |> option.map(fn(value) { "principal:" <> value })
+    }
+    _ -> legacy_context_task_scope(server, context)
+  }
+}
+
+fn legacy_context_task_scope(
   server: Server,
   context: RequestContext,
 ) -> Option(String) {
@@ -801,6 +2023,13 @@ pub fn send_request(
   context: RequestContext,
   request: jsonrpc.Request(actions.ServerActionRequest),
 ) -> Result(jsonrpc.Response(actions.ServerActionResult), jsonrpc.RpcError) {
+  use _ <- result.try(case is_modern_context(context) {
+    True ->
+      Error(jsonrpc.invalid_params_error(
+        "Modern requests require MRTR input requests instead of server-initiated JSON-RPC requests",
+      ))
+    False -> Ok(Nil)
+  })
   use _ <- result.try(check_server_request_capability(server, context, request))
   let request = associate_request(request, context.task_id)
   case session_id(context) {
@@ -825,6 +2054,18 @@ pub fn send_notification(
   context: RequestContext,
   notification: jsonrpc.Request(actions.ActionNotification),
 ) -> Result(Nil, jsonrpc.RpcError) {
+  case context {
+    ModernRequestContext(..) ->
+      send_modern_notification(server, context, notification)
+    _ -> send_legacy_notification(server, context, notification)
+  }
+}
+
+fn send_legacy_notification(
+  server: Server,
+  context: RequestContext,
+  notification: jsonrpc.Request(actions.ActionNotification),
+) -> Result(Nil, jsonrpc.RpcError) {
   use _ <- result.try(check_outgoing_ready(server, context))
   use _ <- result.try(check_notification_capability(server, notification))
   let notification = associate_notification(notification, context.task_id)
@@ -838,6 +2079,76 @@ pub fn send_notification(
       Error(jsonrpc.invalid_params_error(
         "Server-sent notifications require a streamable HTTP session",
       ))
+  }
+}
+
+fn send_modern_notification(
+  server: Server,
+  context: RequestContext,
+  notification: jsonrpc.Request(actions.ActionNotification),
+) -> Result(Nil, jsonrpc.RpcError) {
+  let assert ModernRequestContext(
+    notifications: sink,
+    request_id: id,
+    worker: worker,
+    ..,
+  ) = context
+  let allowed = case notification {
+    jsonrpc.Notification(_, Some(actions.NotifyProgress(params))) ->
+      progress_token(context) == Some(params.progress_token)
+    jsonrpc.Notification(_, Some(actions.NotifyLoggingMessage(params))) -> {
+      let requested = case
+        request_meta_value(
+          request_meta(context),
+          "io.modelcontextprotocol/logLevel",
+        )
+      {
+        Some(jsonrpc.VString(level)) -> log_rank(level)
+        _ -> None
+      }
+      case requested {
+        None -> False
+        Some(minimum) ->
+          logging_rank(params.level) >= minimum
+          && option.is_some(advertised_capabilities(server).logging)
+      }
+    }
+    _ -> False
+  }
+  let allowed =
+    allowed
+    && case worker {
+      Some(worker) ->
+        runtime.active_worker(
+          server.runtime,
+          runtime_scope(context),
+          id,
+          worker,
+        )
+      None -> False
+    }
+  case allowed, sink {
+    True, Some(subject) -> {
+      process.send(
+        subject,
+        streamable_http_store.DeliverNotification(notification),
+      )
+      Ok(Nil)
+    }
+    _, _ -> Ok(Nil)
+  }
+}
+
+fn logging_rank(level: actions.LoggingLevel) -> Int {
+  case level {
+    actions.Debug -> 0
+    actions.Info -> 1
+    actions.Notice -> 2
+    actions.Warning -> 3
+    actions.Error -> 4
+    actions.Critical -> 5
+    actions.Alert -> 6
+    actions.Emergency -> 7
   }
 }
 
@@ -987,7 +2298,7 @@ fn check_server_request_capability(
           }
           let task = case params {
             actions.ElicitRequestForm(params) -> params.task
-            actions.ElicitRequestUrl(params) -> params.task
+            actions.ElicitRequestUrl(params) -> actions.elicit_url_task(params)
           }
           let task_ok = case task {
             None -> True
@@ -1138,6 +2449,7 @@ fn associate_notification(
               )
           }
         actions.NotifyTaskStatus(_) -> action
+        _ -> action
       }
       jsonrpc.Notification(method, Some(action))
     }
@@ -1170,13 +2482,16 @@ fn associate_request(
               meta: associate_meta(params.meta, task),
             ),
           ))
-        actions.ServerRequestElicit(actions.ElicitRequestUrl(params)) ->
-          actions.ServerRequestElicit(actions.ElicitRequestUrl(
-            actions.ElicitRequestUrlParams(
-              ..params,
-              meta: associate_meta(params.meta, task),
-            ),
-          ))
+        actions.ServerRequestElicit(actions.ElicitRequestUrl(params)) -> {
+          let meta = associate_meta(actions.elicit_url_meta(params), task)
+          let params = case params {
+            actions.ElicitRequestUrlParams(..) ->
+              actions.ElicitRequestUrlParams(..params, meta: meta)
+            actions.ElicitRequestUrlParamsWithoutId(..) ->
+              actions.ElicitRequestUrlParamsWithoutId(..params, meta: meta)
+          }
+          actions.ServerRequestElicit(actions.ElicitRequestUrl(params))
+        }
         actions.ServerRequestListTasks(params) ->
           actions.ServerRequestListTasks(
             actions.PaginatedRequestParams(
@@ -1273,6 +2588,18 @@ fn subscribe_resource(
 }
 
 pub fn notify_resource_updated(server: Server, uri: String) -> Nil {
+  publish_notification(
+    server,
+    jsonrpc.Notification(
+      mcp.method_notify_resource_updated,
+      Some(
+        actions.NotifyResourceUpdated(actions.ResourceUpdatedNotificationParams(
+          uri,
+          None,
+        )),
+      ),
+    ),
+  )
   runtime.subscribers(server.runtime, uri)
   |> list.each(fn(id) {
     let _ =
@@ -1413,6 +2740,7 @@ fn with_related_task_result(
   task_id: String,
 ) -> actions.TaskResult {
   case task_result {
+    actions.TaskResultModern(_) -> task_result
     actions.TaskCallTool(result) ->
       actions.TaskCallTool(with_related_task_call_tool_result(result, task_id))
     actions.TaskCreateMessage(result) ->
@@ -1490,6 +2818,14 @@ fn dispatch_request(
   action: actions.ClientActionRequest,
 ) -> Result(actions.ClientActionResult, jsonrpc.RpcError) {
   case action {
+    actions.ClientRequestWithInput(request, _, _) ->
+      dispatch_request(server, context, request)
+    actions.ClientRequestDiscover(_)
+    | actions.ClientRequestSubscriptionsListen(_)
+    | actions.ClientRequestUpdateTask(_) ->
+      Error(jsonrpc.method_not_found_error(
+        "Modern protocol method requires per-request metadata",
+      ))
     actions.ClientRequestInitialize(params) -> {
       case context.session_id {
         Some(id) -> {
@@ -1500,7 +2836,7 @@ fn dispatch_request(
             server.http_store,
             id,
             streamable_http_store.SessionMetadata(
-              jsonrpc.latest_protocol_version,
+              jsonrpc.legacy_protocol_version,
               params.capabilities,
               True,
               False,
@@ -1548,7 +2884,7 @@ fn initialization_result(server: Server) -> actions.ClientActionResult {
     server
 
   actions.ClientResultInitialize(actions.InitializeResult(
-    protocol_version: jsonrpc.latest_protocol_version,
+    protocol_version: jsonrpc.legacy_protocol_version,
     capabilities: advertised_capabilities(server),
     server_info: implementation,
     instructions: instructions,
@@ -1582,28 +2918,10 @@ pub fn advertised_capabilities(server: Server) -> actions.ServerCapabilities {
   }
 }
 
-fn action_meta(
+pub fn action_meta(
   action: actions.ClientActionRequest,
 ) -> Option(actions.RequestMeta) {
-  case action {
-    actions.ClientRequestInitialize(params) -> params.meta
-    actions.ClientRequestPing(meta) -> meta
-    actions.ClientRequestListResources(params)
-    | actions.ClientRequestListResourceTemplates(params)
-    | actions.ClientRequestListPrompts(params)
-    | actions.ClientRequestListTools(params)
-    | actions.ClientRequestListTasks(params) -> params.meta
-    actions.ClientRequestReadResource(params) -> params.meta
-    actions.ClientRequestSubscribeResource(params) -> params.meta
-    actions.ClientRequestUnsubscribeResource(params) -> params.meta
-    actions.ClientRequestGetPrompt(params) -> params.meta
-    actions.ClientRequestCallTool(params) -> params.meta
-    actions.ClientRequestComplete(params) -> params.meta
-    actions.ClientRequestSetLoggingLevel(params) -> params.meta
-    actions.ClientRequestGetTask(_)
-    | actions.ClientRequestGetTaskResult(_)
-    | actions.ClientRequestCancelTask(_) -> None
-  }
+  actions.request_meta(action)
 }
 
 fn check_request_lifecycle(
@@ -1803,6 +3121,7 @@ fn list_tools_result(
       let RegisteredTool(tool, _) = registered
       tool
     })
+    |> list.sort(fn(a, b) { string.compare(a.name, b.name) })
 
   paginate(listed, params.cursor, "tools", server.options.page_size)
   |> result.map(fn(page) {
@@ -1880,6 +3199,8 @@ fn create_tool_task_result(
         id,
         meta,
       )
+    ModernRequestContext(..) ->
+      ModernRequestContext(..context, task_id: Some(created.task_id))
   }
   let _ =
     task_store.start_worker(server.task_store, created.task_id, fn() {
@@ -1956,9 +3277,9 @@ fn get_task_result(
   context: RequestContext,
   params: actions.TaskIdParams,
 ) -> Result(actions.ClientActionResult, jsonrpc.RpcError) {
-  let task = case context.session_id {
-    None -> task_store.get(server.task_store, params.task_id)
-    Some(_) ->
+  let task = case is_modern_context(context), context.session_id {
+    False, None -> task_store.get(server.task_store, params.task_id)
+    _, _ ->
       task_store.get_scoped(
         server.task_store,
         params.task_id,
@@ -2048,7 +3369,7 @@ fn cancel_task_result(
   context: RequestContext,
   params: actions.TaskIdParams,
 ) -> Result(actions.ClientActionResult, jsonrpc.RpcError) {
-  let actions.TaskIdParams(task_id) = params
+  let task_id = actions.task_id(params)
   let cancelled = case context.session_id {
     None -> task_store.cancel(server.task_store, task_id)
     Some(_) ->

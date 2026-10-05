@@ -263,7 +263,9 @@ fn get_structured_content_tool(
             None,
           )),
         ],
-        structured_content: Some(structured_content),
+        structured_content: Some(
+          jsonrpc.VObject(dict.to_list(structured_content)),
+        ),
         is_error: Some(False),
         meta: None,
       ))

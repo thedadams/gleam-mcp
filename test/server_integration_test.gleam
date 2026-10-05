@@ -126,7 +126,7 @@ pub fn client_can_talk_to_sdk_http_server_test() {
         }),
       )
     }
-    actions.CallToolTask(_) -> should.fail()
+    actions.CallToolTask(_) | actions.CallToolTaskModern(_) -> should.fail()
   }
 
   let #(app_client, complete_result) =
@@ -224,7 +224,7 @@ pub fn client_can_talk_to_sdk_stdio_server_test() {
         }),
       )
     }
-    actions.CallToolTask(_) -> should.fail()
+    actions.CallToolTask(_) | actions.CallToolTaskModern(_) -> should.fail()
   }
 
   let #(_, logging_result) =
@@ -313,7 +313,7 @@ pub fn http_server_rejects_sse_listen_without_session_test() {
       |> request.set_header("accept", "text/event-stream")
       |> request.set_header(
         "mcp-protocol-version",
-        jsonrpc.latest_protocol_version,
+        jsonrpc.legacy_protocol_version,
       )
     })
 
@@ -332,6 +332,7 @@ pub fn http_server_rejects_non_initialize_requests_without_session_test() {
       transport.Http(transport.HttpConfig(base_url, [], Some(5000))),
       capabilities.none(),
     )
+    |> client.with_protocol_version(jsonrpc.legacy_protocol_version)
 
   let #(_, result) = client.list_tools(app_client, None)
 
@@ -349,7 +350,7 @@ pub fn http_server_rejects_non_initialize_requests_with_invalid_session_test() {
     transport.streamable_http_request(
       transport.HttpConfig(base_url, [], Some(5000)),
       Some("invalid-session"),
-      jsonrpc.latest_protocol_version,
+      jsonrpc.legacy_protocol_version,
       capabilities.none(),
       jsonrpc.Request(
         jsonrpc.StringId("tools"),

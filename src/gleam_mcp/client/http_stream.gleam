@@ -41,6 +41,7 @@ type ResponseFormat {
 
 type Mode {
   OneConnection
+  ModernRequest
   ResumableRequest
   ResumableListener
 }
@@ -59,6 +60,9 @@ type ParserState {
     allow_json: Bool,
     completed: Bool,
     status: Result(Nil, StreamError),
+    error_status: Option(Int),
+    accept_error_body: Bool,
+    response_headers: Option(process.Subject(List(http.Header))),
   )
 }
 
@@ -76,6 +80,7 @@ pub fn listen(
     timeout_ms,
     ResumableListener,
     None,
+    None,
     fn(data, _) {
       on_event(data) |> result.map(fn(_) { False }) |> result.map_error(Failed)
     },
@@ -92,9 +97,19 @@ pub fn request(
   timeout_ms: Int,
   on_event: fn(String) -> Result(Nil, String),
 ) -> Result(Option(String), String) {
-  run(method, url, headers, body, timeout_ms, OneConnection, None, fn(data, _) {
-    on_event(data) |> result.map(fn(_) { False }) |> result.map_error(Failed)
-  })
+  run(
+    method,
+    url,
+    headers,
+    body,
+    timeout_ms,
+    OneConnection,
+    None,
+    None,
+    fn(data, _) {
+      on_event(data) |> result.map(fn(_) { False }) |> result.map_error(Failed)
+    },
+  )
   |> result.map_error(error_message)
 }
 
@@ -109,7 +124,63 @@ pub fn request_until(
   timeout_ms: Int,
   on_event: fn(String, Option(String)) -> Result(Bool, StreamError),
 ) -> Result(Option(String), StreamError) {
-  run(method, url, headers, body, timeout_ms, ResumableRequest, None, on_event)
+  run(
+    method,
+    url,
+    headers,
+    body,
+    timeout_ms,
+    ResumableRequest,
+    None,
+    None,
+    on_event,
+  )
+}
+
+/// Modern responses never reconnect or replay. HTTP protocol errors retain
+/// their JSON-RPC body so version negotiation can inspect the actual error.
+pub fn request_modern(
+  url: String,
+  headers: List(#(String, String)),
+  body: String,
+  timeout_ms: Int,
+  stop: Option(process.Subject(Nil)),
+  on_event: fn(String, Option(String)) -> Result(Bool, StreamError),
+) -> Result(Option(String), StreamError) {
+  run(
+    http.Post,
+    url,
+    headers,
+    body,
+    timeout_ms,
+    ModernRequest,
+    stop,
+    None,
+    on_event,
+  )
+}
+
+/// Preserve response header provenance for modern version negotiation.
+pub fn request_modern_with_headers(
+  url: String,
+  headers: List(http.Header),
+  body: String,
+  timeout_ms: Int,
+  stop: Option(process.Subject(Nil)),
+  response_headers: process.Subject(List(http.Header)),
+  on_event: fn(String, Option(String)) -> Result(Bool, StreamError),
+) -> Result(Option(String), StreamError) {
+  run(
+    http.Post,
+    url,
+    headers,
+    body,
+    timeout_ms,
+    ModernRequest,
+    stop,
+    Some(response_headers),
+    on_event,
+  )
 }
 
 /// A listener retains its SSE cursor and retry delay across reconnections.
@@ -119,7 +190,17 @@ pub fn listen_resumable(
   timeout_ms: Int,
   on_event: fn(String, Option(String)) -> Result(Bool, StreamError),
 ) -> Result(Option(String), StreamError) {
-  run(http.Get, url, headers, "", timeout_ms, ResumableListener, None, on_event)
+  run(
+    http.Get,
+    url,
+    headers,
+    "",
+    timeout_ms,
+    ResumableListener,
+    None,
+    None,
+    on_event,
+  )
 }
 
 pub fn listen_until_closed(
@@ -137,6 +218,7 @@ pub fn listen_until_closed(
     timeout_ms,
     ResumableListener,
     Some(stop),
+    None,
     on_event,
   )
 }
@@ -149,6 +231,7 @@ fn run(
   timeout_ms: Int,
   mode: Mode,
   stop: Option(process.Subject(Nil)),
+  response_headers: Option(process.Subject(List(http.Header))),
   on_event: fn(String, Option(String)) -> Result(Bool, StreamError),
 ) -> Result(Option(String), StreamError) {
   let mailbox = process.new_subject()
@@ -179,6 +262,9 @@ fn run(
       method != http.Get,
       False,
       Ok(Nil),
+      None,
+      mode == ModernRequest,
+      response_headers,
     )
   let outcome =
     connect(
@@ -230,6 +316,10 @@ fn connect(
     Ok(next_state) ->
       case next_state.completed || mode == OneConnection {
         True -> Ok(next_state.session_id)
+        False if mode == ModernRequest ->
+          Error(InvalidResponse(
+            "Modern response stream ended before its final JSON-RPC response",
+          ))
         False ->
           case mode == ResumableRequest && next_state.last_event_id == None {
             True ->
@@ -330,17 +420,33 @@ fn loop(
             Failed(_) if state.format == Sse -> Ok(state)
             error -> Error(error)
           }
-        StreamStarted(status, headers) ->
+        StreamStarted(status, headers) -> {
+          case state.response_headers {
+            Some(reply) -> process.send(reply, headers)
+            None -> Nil
+          }
           case status {
             401 | 403 ->
               Error(AuthorizationRequired(
                 status,
                 authentication_challenge(headers),
               ))
+            status
+              if { status < 200 || status >= 300 } && state.accept_error_body
+            ->
+              loop(
+                selector,
+                start_response(
+                  ParserState(..state, error_status: Some(status)),
+                  headers,
+                ),
+                on_event,
+              )
             status if status < 200 || status >= 300 ->
               Error(HttpStatus(status, "HTTP status " <> int.to_string(status)))
             _ -> loop(selector, start_response(state, headers), on_event)
           }
+        }
         StreamChunk(chunk) ->
           loop(selector, process_chunk(state, chunk, on_event), on_event)
         StreamEnded ->
@@ -349,7 +455,15 @@ fn loop(
               case state.status, state.completed {
                 Error(error), _ -> Error(error)
                 _, True -> Ok(state)
-                _, False -> Error(InvalidResponse("Incomplete JSON response"))
+                _, False ->
+                  case state.error_status {
+                    Some(status) ->
+                      Error(HttpStatus(
+                        status,
+                        bit_array.to_string(state.pending) |> result.unwrap(""),
+                      ))
+                    None -> Error(InvalidResponse("Incomplete JSON response"))
+                  }
               }
             _ -> Ok(state)
           }
@@ -367,6 +481,7 @@ fn start_response(
   }
   let state = ParserState(..state, session_id: session_id)
   case header_value(headers, "content-type") {
+    None if state.error_status != None -> ParserState(..state, format: Json)
     None ->
       ParserState(
         ..state,
@@ -386,6 +501,7 @@ fn start_response(
         "application/json" if state.allow_json ->
           ParserState(..state, format: Json)
         "text/event-stream" -> ParserState(..state, format: Sse)
+        _ if state.error_status != None -> ParserState(..state, format: Json)
         _ ->
           ParserState(
             ..state,
@@ -419,7 +535,15 @@ fn process_chunk(
             Ok(body) ->
               case json.parse(body, decode.dynamic) {
                 Error(_) -> state
-                Ok(_) -> deliver(state, body, on_event)
+                Ok(_) ->
+                  case state.error_status {
+                    Some(status) ->
+                      ParserState(
+                        ..state,
+                        status: Error(HttpStatus(status, body)),
+                      )
+                    None -> deliver(state, body, on_event)
+                  }
               }
           }
         }

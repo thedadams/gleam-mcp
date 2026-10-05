@@ -176,7 +176,7 @@ fn extract_sampling_text(
 
 fn initialize_result() -> actions.ClientActionResult {
   actions.ClientResultInitialize(actions.InitializeResult(
-    protocol_version: jsonrpc.latest_protocol_version,
+    protocol_version: jsonrpc.legacy_protocol_version,
     capabilities: server_capabilities.infer(
       has_tools: True,
       has_resources: False,
@@ -205,7 +205,7 @@ fn list_tools_result() -> actions.ClientActionResult {
         name: "roundtrip-elicitation",
         title: None,
         description: Some("Roundtrip test tool"),
-        input_schema: jsonrpc.VObject([]),
+        input_schema: jsonrpc.VObject([#("type", jsonrpc.VString("object"))]),
         execution: None,
         output_schema: None,
         annotations: None,
@@ -216,7 +216,7 @@ fn list_tools_result() -> actions.ClientActionResult {
         name: "roundtrip-sampling",
         title: None,
         description: Some("Roundtrip test tool"),
-        input_schema: jsonrpc.VObject([]),
+        input_schema: jsonrpc.VObject([#("type", jsonrpc.VString("object"))]),
         execution: None,
         output_schema: None,
         annotations: None,

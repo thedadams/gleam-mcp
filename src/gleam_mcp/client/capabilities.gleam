@@ -12,6 +12,7 @@ import gleam_mcp/actions.{
   type ServerActionResult, ClientCapabilities, ClientElicitationCapabilities,
   ClientRootsCapabilities, ClientSamplingCapabilities,
 }
+import gleam_mcp/client/codec
 import gleam_mcp/codec_common
 import gleam_mcp/jsonrpc.{
   type Request, type Response, type RpcError, type Value, VObject,
@@ -19,6 +20,7 @@ import gleam_mcp/jsonrpc.{
 import gleam_mcp/mcp
 import gleam_mcp/server/runtime
 import gleam_mcp/task_store
+import youid/uuid
 
 pub type Root {
   Root(uri: String, name: Option(String), meta: Option(Value))
@@ -78,6 +80,10 @@ pub type Config {
     ),
     request_runtime: runtime.Store(Response(ServerActionResult)),
     request_timeout_ms: Int,
+    notify_tasks: Option(
+      fn(Value, Option(actions.NotificationMeta)) -> Result(Nil, RpcError),
+    ),
+    subscription_acknowledged: Option(fn(Value) -> Result(Nil, RpcError)),
   )
 }
 
@@ -102,6 +108,8 @@ pub fn none() -> Config {
     None,
     runtime.new(),
     60_000,
+    None,
+    None,
   )
 }
 
@@ -508,6 +516,115 @@ pub fn handle_request(
   process.receive_forever(reply)
 }
 
+/// Run an MRTR input with the same validated capability handlers and a deadline.
+/// Task augmentation is a legacy reverse-request feature, not an MRTR result.
+pub fn handle_input(
+  config: Config,
+  action: ServerActionRequest,
+  timeout_ms: Int,
+) -> Result(ServerActionResult, RpcError) {
+  let valid = case action {
+    actions.ServerRequestListRoots(_) -> True
+    actions.ServerRequestCreateMessage(params) -> params.task == None
+    actions.ServerRequestElicit(actions.ElicitRequestForm(params)) ->
+      params.task == None
+    actions.ServerRequestElicit(actions.ElicitRequestUrl(params)) ->
+      actions.elicit_url_task(params) == None
+    _ -> False
+  }
+  case valid {
+    False ->
+      Error(jsonrpc.invalid_params_error(
+        "Unsupported MRTR input request or task augmentation",
+      ))
+    True -> {
+      let timeout = case timeout_ms < config.request_timeout_ms {
+        True -> timeout_ms
+        False -> config.request_timeout_ms
+      }
+      let request =
+        jsonrpc.Request(jsonrpc.StringId(uuid.v4_string()), "", Some(action))
+      use response <- result.try(handle_request(
+        with_request_timeout(config, timeout),
+        request,
+      ))
+      case response {
+        jsonrpc.ResultResponse(_, result) -> Ok(result)
+        jsonrpc.ErrorResponse(_, error) -> Error(error)
+      }
+    }
+  }
+}
+
+pub fn to_request_capabilities(config: Config) -> ClientCapabilities {
+  ClientCapabilities(..to_initialize_capabilities(config), tasks: None)
+}
+
+pub fn modern_capabilities(config: Config) -> Value {
+  let value =
+    codec.encode_client_capabilities_value(to_request_capabilities(config))
+  case value {
+    VObject(fields) ->
+      VObject(
+        list.map(fields, fn(pair) {
+          case pair {
+            #("roots", VObject(fields)) -> #(
+              "roots",
+              VObject(
+                list.filter(fields, fn(field) { field.0 != "listChanged" }),
+              ),
+            )
+            #("sampling", VObject(fields)) -> #(
+              "sampling",
+              VObject(list.filter(fields, fn(field) { field.0 != "context" })),
+            )
+            _ -> pair
+          }
+        }),
+      )
+    _ -> value
+  }
+}
+
+pub fn notification_filter(config: Config) -> Value {
+  VObject([
+    #(
+      "toolsListChanged",
+      jsonrpc.VBool(config.notify_tool_list_changed != None),
+    ),
+    #(
+      "promptsListChanged",
+      jsonrpc.VBool(config.notify_prompt_list_changed != None),
+    ),
+    #(
+      "resourcesListChanged",
+      jsonrpc.VBool(config.notify_resource_list_changed != None),
+    ),
+  ])
+}
+
+pub fn cancel_input(config: Config, id: jsonrpc.RequestId) -> Nil {
+  runtime.cancel(config.request_runtime, None, id)
+}
+
+pub fn with_notify_tasks(
+  config: Config,
+  handler: fn(Value, Option(actions.NotificationMeta)) -> Result(Nil, RpcError),
+) -> Config {
+  Config(..config, notify_tasks: Some(handler))
+}
+
+pub fn with_subscription_acknowledged(
+  config: Config,
+  handler: fn(Value) -> Result(Nil, RpcError),
+) -> Config {
+  Config(..config, subscription_acknowledged: Some(handler))
+}
+
+pub fn acknowledged(config: Config, filter: Value) -> Result(Nil, RpcError) {
+  run_callback_with_params(config.subscription_acknowledged, filter)
+}
+
 /// Start a request and acknowledge registration before returning. `reply_to`
 /// must belong to the process that will receive and send the response.
 pub fn start_request(
@@ -607,7 +724,14 @@ pub fn handle_notification(
           run_callback_with_params(notify_elicitation_complete, params)
         actions.NotifyTaskStatus(params) ->
           run_callback_with_params(notify_task_status, params)
-        actions.NotifyInitialized(_) -> Ok(Nil)
+        actions.NotifyTaskModern(value, meta) ->
+          case config.notify_tasks {
+            Some(handler) -> handler(value, meta)
+            None -> Ok(Nil)
+          }
+        actions.NotifyInitialized(_)
+        | actions.NotifySubscriptionsAcknowledged(_)
+        | actions.NotifySubscriptionsAcknowledgedWithFilter(_, _) -> Ok(Nil)
       }
     jsonrpc.Notification(_, None) -> Ok(Nil)
     jsonrpc.Request(_, method, _) ->
@@ -819,7 +943,7 @@ fn get_task_result(
   params: actions.TaskIdParams,
 ) -> Result(Response(ServerActionResult), RpcError) {
   let Config(task_store: tasks, ..) = config
-  let actions.TaskIdParams(task_id) = params
+  let task_id = actions.task_id(params)
   task_store.get(tasks, task_id)
   |> result.map(fn(task) {
     jsonrpc.ResultResponse(
@@ -835,7 +959,7 @@ fn get_task_payload_result(
   params: actions.TaskIdParams,
 ) -> Result(Response(ServerActionResult), RpcError) {
   let Config(task_store: tasks, ..) = config
-  let actions.TaskIdParams(task_id) = params
+  let task_id = actions.task_id(params)
   task_store.result(tasks, task_id)
   |> result.map(fn(task_result) {
     jsonrpc.ResultResponse(id, actions.ServerResultTaskResult(task_result))
@@ -848,7 +972,7 @@ fn cancel_task_result(
   params: actions.TaskIdParams,
 ) -> Result(Response(ServerActionResult), RpcError) {
   let Config(task_store: tasks, ..) = config
-  let actions.TaskIdParams(task_id) = params
+  let task_id = actions.task_id(params)
   task_store.cancel(tasks, task_id)
   |> result.map(fn(task) {
     jsonrpc.ResultResponse(
@@ -1116,8 +1240,7 @@ fn task_metadata(
   case params {
     actions.ElicitRequestForm(actions.ElicitRequestFormParams(task: task, ..)) ->
       task
-    actions.ElicitRequestUrl(actions.ElicitRequestUrlParams(task: task, ..)) ->
-      task
+    actions.ElicitRequestUrl(params) -> actions.elicit_url_task(params)
   }
 }
 

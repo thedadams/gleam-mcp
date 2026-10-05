@@ -77,7 +77,10 @@ pub fn decode_message_with_error(
 
 fn is_known_request_method(method: String) -> Bool {
   case method {
-    "initialize"
+    "server/discover"
+    | "subscriptions/listen"
+    | "tasks/update"
+    | "initialize"
     | "ping"
     | "resources/list"
     | "resources/templates/list"
@@ -113,33 +116,114 @@ pub fn encode_server_response(
 fn message_decoder() -> decode.Decoder(Message) {
   use _ <- decode.then(codec_common.request_envelope_decoder())
   use _ <- decode.then(codec_common.request_parameters_decoder())
-  decode.then(decode.at(["method"], decode.string), fn(method) {
-    case method {
-      "initialize" -> initialize_message_decoder()
-      "ping" -> ping_message_decoder()
-      "resources/list" -> list_resources_message_decoder()
-      "resources/templates/list" -> list_resource_templates_message_decoder()
-      "resources/read" -> read_resource_message_decoder()
-      "resources/subscribe" -> subscribe_resource_message_decoder()
-      "resources/unsubscribe" -> unsubscribe_resource_message_decoder()
-      "prompts/list" -> list_prompts_message_decoder()
-      "prompts/get" -> get_prompt_message_decoder()
-      "tools/list" -> list_tools_message_decoder()
-      "tools/call" -> call_tool_message_decoder()
-      "tasks/list" -> list_tasks_message_decoder()
-      "tasks/get" -> get_task_message_decoder()
-      "tasks/result" -> get_task_result_message_decoder()
-      "tasks/cancel" -> cancel_task_message_decoder()
-      "completion/complete" -> complete_message_decoder()
-      "logging/setLevel" -> set_logging_level_message_decoder()
-      "notifications/initialized" -> initialized_notification_decoder()
-      "notifications/cancelled"
-      | "notifications/progress"
-      | "notifications/roots/list_changed"
-      | "notifications/tasks/status" -> client_notification_message_decoder()
-      _ -> unknown_message_decoder(method)
-    }
+  let decoder =
+    decode.then(decode.at(["method"], decode.string), fn(method) {
+      case method {
+        "server/discover" ->
+          decode_optional_request_message(
+            mcp.method_discover,
+            None,
+            request_meta_only_decoder(),
+            actions.ClientRequestDiscover,
+          )
+        "subscriptions/listen" ->
+          decode_required_request_message(
+            mcp.method_subscriptions_listen,
+            subscriptions_listen_params_decoder(),
+            actions.ClientRequestSubscriptionsListen,
+          )
+        "tasks/update" ->
+          decode_required_request_message(
+            mcp.method_update_task,
+            task_update_params_decoder(),
+            actions.ClientRequestUpdateTask,
+          )
+        "initialize" -> initialize_message_decoder()
+        "ping" -> ping_message_decoder()
+        "resources/list" -> list_resources_message_decoder()
+        "resources/templates/list" -> list_resource_templates_message_decoder()
+        "resources/read" -> read_resource_message_decoder()
+        "resources/subscribe" -> subscribe_resource_message_decoder()
+        "resources/unsubscribe" -> unsubscribe_resource_message_decoder()
+        "prompts/list" -> list_prompts_message_decoder()
+        "prompts/get" -> get_prompt_message_decoder()
+        "tools/list" -> list_tools_message_decoder()
+        "tools/call" -> call_tool_message_decoder()
+        "tasks/list" -> list_tasks_message_decoder()
+        "tasks/get" -> get_task_message_decoder()
+        "tasks/result" -> get_task_result_message_decoder()
+        "tasks/cancel" -> cancel_task_message_decoder()
+        "completion/complete" -> complete_message_decoder()
+        "logging/setLevel" -> set_logging_level_message_decoder()
+        "notifications/initialized" -> initialized_notification_decoder()
+        "notifications/cancelled"
+        | "notifications/progress"
+        | "notifications/roots/list_changed"
+        | "notifications/tasks/status" -> client_notification_message_decoder()
+        _ -> unknown_message_decoder(method)
+      }
+    })
+  decode.then(decoder, attach_input_responses)
+}
+
+fn attach_input_responses(message: Message) -> decode.Decoder(Message) {
+  use state <- decode.optional_field("params", None, {
+    use state <- decode.optional_field(
+      "requestState",
+      None,
+      decode.map(decode.string, Some),
+    )
+    decode.success(state)
   })
+  use responses <- decode.optional_field("params", None, {
+    use responses <- decode.optional_field(
+      "inputResponses",
+      None,
+      decode.map(decode.dict(decode.string, value_decoder()), Some),
+    )
+    decode.success(responses)
+  })
+  case message, state, responses {
+    _, None, None -> decode.success(message)
+    ClientActionRequest(jsonrpc.Request(id, method, Some(action))), _, _
+      if method != "tasks/update"
+    ->
+      decode.success(
+        ClientActionRequest(jsonrpc.Request(
+          id,
+          method,
+          Some(actions.ClientRequestWithInput(action, state, responses)),
+        )),
+      )
+    _, _, _ -> decode.success(message)
+  }
+}
+
+fn subscriptions_listen_params_decoder() -> decode.Decoder(
+  actions.SubscriptionsListenParams,
+) {
+  use notifications <- decode.field(
+    "notifications",
+    client_codec.subscription_filter_decoder(),
+  )
+  use meta <- decode.then(request_meta_only_decoder())
+  decode.success(actions.SubscriptionsListenParams(Some(notifications), meta))
+}
+
+fn task_update_params_decoder() -> decode.Decoder(actions.TaskUpdateParams) {
+  use task_id <- decode.field("taskId", decode.string)
+  use input <- decode.optional_field(
+    "inputResponses",
+    None,
+    decode.map(
+      decode.map(decode.dict(decode.string, value_decoder()), fn(fields) {
+        jsonrpc.VObject(dict.to_list(fields))
+      }),
+      Some,
+    ),
+  )
+  use meta <- decode.then(request_meta_only_decoder())
+  decode.success(actions.TaskUpdateParams(task_id, input, meta))
 }
 
 fn client_notification_message_decoder() -> decode.Decoder(Message) {
@@ -453,6 +537,55 @@ fn encode_client_action_result(
   result: actions.ClientActionResult,
 ) -> json.Json {
   case result {
+    actions.ClientResultWithCache(inner, hint) ->
+      encode_client_action_result(inner)
+      |> encoded_object_fields
+      |> list.filter(fn(field) { field.0 != "ttlMs" && field.0 != "cacheScope" })
+      |> list.append([
+        #("ttlMs", json.int(hint.ttl_ms)),
+        #(
+          "cacheScope",
+          json.string(case hint.scope {
+            actions.Public -> "public"
+            actions.Private -> "private"
+          }),
+        ),
+      ])
+      |> json.object
+    actions.ClientResultDiscover(value) ->
+      [
+        #(
+          "supportedVersions",
+          json.array(value.supported_versions, json.string),
+        ),
+        #(
+          "capabilities",
+          codec_common.encode_value_object(dict.to_list(value.capabilities)),
+        ),
+      ]
+      |> append_optional(
+        "instructions",
+        option_map(value.instructions, json.string),
+      )
+      |> append_optional("_meta", option_map(value.meta, encode_meta))
+      |> json.object
+    actions.ClientResultSubscriptionsListen(value) ->
+      encode_meta_only(value.meta)
+    actions.ClientResultInputRequired(value) ->
+      [#("resultType", json.string("input_required"))]
+      |> append_optional(
+        "inputRequests",
+        option_map(value.input_requests, fn(fields) {
+          codec_common.encode_value_object(dict.to_list(fields))
+        }),
+      )
+      |> append_optional(
+        "requestState",
+        option_map(value.request_state, json.string),
+      )
+      |> append_optional("_meta", option_map(value.meta, encode_meta))
+      |> json.object
+    actions.ClientResultTaskModern(value) -> encode_value(value)
     actions.ClientResultEmpty(meta) -> encode_meta_only(meta)
     actions.ClientResultInitialize(value) -> encode_initialize_result(value)
     actions.ClientResultListResources(value) ->
@@ -472,6 +605,28 @@ fn encode_client_action_result(
     actions.ClientResultCancelTask(value) -> encode_cancel_task_result(value)
     actions.ClientResultListTasks(value) -> encode_list_tasks_result(value)
   }
+}
+
+fn encoded_object_fields(value: json.Json) -> List(#(String, json.Json)) {
+  let assert Ok(fields) =
+    json.parse(
+      json.to_string(value),
+      decode.dict(decode.string, value_decoder()),
+    )
+  fields
+  |> dict.to_list
+  |> list.map(fn(field) { #(field.0, encode_value(field.1)) })
+}
+
+pub fn encode_server_capabilities_value(
+  capabilities: actions.ServerCapabilities,
+) -> jsonrpc.Value {
+  let assert Ok(value) =
+    json.parse(
+      json.to_string(encode_server_capabilities(capabilities)),
+      value_decoder(),
+    )
+  value
 }
 
 fn encode_root(root: actions.Root) -> json.Json {
@@ -698,14 +853,7 @@ fn encode_call_tool_result(result: actions.CallToolResult) -> json.Json {
   [#("content", json.array(content, encode_content_block))]
   |> append_optional(
     "structuredContent",
-    option_map(structured_content, fn(fields) {
-      dict.to_list(fields)
-      |> list.map(fn(entry) {
-        let #(key, value) = entry
-        #(key, encode_value(value))
-      })
-      |> json.object
-    }),
+    option_map(structured_content, encode_value),
   )
   |> append_optional("isError", option_map(is_error, json.bool))
   |> append_optional("_meta", option_map(meta, encode_meta))
@@ -735,6 +883,7 @@ fn encode_get_task_result(result: actions.GetTaskResult) -> json.Json {
 
 fn encode_task_result(result: actions.TaskResult) -> json.Json {
   case result {
+    actions.TaskResultModern(value) -> encode_value(value)
     actions.TaskCallTool(value) -> encode_call_tool_result(value)
     actions.TaskCreateMessage(value) -> encode_create_message_result(value)
     actions.TaskElicit(value) -> encode_elicit_result(value)
@@ -1354,7 +1503,11 @@ fn task_metadata_decoder() -> decode.Decoder(actions.TaskMetadata) {
 fn task_id_params_decoder() -> decode.Decoder(actions.TaskIdParams) {
   {
     use task_id <- decode.field("taskId", decode.string)
-    decode.success(actions.TaskIdParams(task_id))
+    use meta <- decode.then(request_meta_only_decoder())
+    decode.success(case meta {
+      None -> actions.TaskIdParams(task_id)
+      Some(_) -> actions.TaskIdParamsWithMeta(task_id, meta)
+    })
   }
 }
 

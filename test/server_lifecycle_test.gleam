@@ -625,7 +625,7 @@ fn initialize_request(
     "initialize",
     mcp.method_initialize,
     actions.ClientRequestInitialize(actions.InitializeRequestParams(
-      jsonrpc.latest_protocol_version,
+      jsonrpc.legacy_protocol_version,
       capabilities,
       server_test_support.sample_client_info(),
       None,

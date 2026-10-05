@@ -1,6 +1,7 @@
 import gleam/bit_array
 import gleam/bytes_tree
 import gleam/crypto
+import gleam/dict
 import gleam/erlang/process
 import gleam/http
 import gleam/http/request
@@ -15,12 +16,15 @@ import gleam/uri
 import gleam_mcp/actions
 import gleam_mcp/client/codec as client_codec
 import gleam_mcp/codec_common
+import gleam_mcp/http_headers
 import gleam_mcp/jsonrpc
 import gleam_mcp/server
 import gleam_mcp/server/codec
 import gleam_mcp/server/oauth
 import gleam_mcp/server/streamable_http_store
+import gleam_mcp/wire
 import mist
+import youid/uuid
 
 // 1 MiB
 const default_max_body_bytes = 1_048_576
@@ -103,27 +107,35 @@ fn handle_authorized(
   case authorize_request(server, req) {
     Error(error) -> authorization_error_response(server, error)
     Ok(principal) ->
-      case valid_protocol_header(req) {
+      case req.method == http.Post || valid_protocol_header(req) {
         False -> plain_response(400, "Unsupported MCP protocol version")
         True ->
           case req.method {
-            http.Get -> handle_get(server, req, principal)
+            http.Get ->
+              case modern_header(req) {
+                True -> plain_response(405, "Method Not Allowed")
+                False -> handle_get(server, req, principal)
+              }
             http.Post ->
               handle_post(server, req, max_body_bytes, middleware, principal)
             http.Delete ->
-              case
-                require_existing_session(
-                  server,
-                  request_session_id(req),
-                  principal,
-                )
-              {
-                Ok(id) -> {
-                  server.close_session(server, id)
-                  response.new(204)
-                  |> response.set_body(mist.Bytes(bytes_tree.new()))
-                }
-                Error(error) -> plain_response(error.0, error.1)
+              case modern_header(req) {
+                True -> plain_response(405, "Method Not Allowed")
+                False ->
+                  case
+                    require_existing_session(
+                      server,
+                      request_session_id(req),
+                      principal,
+                    )
+                  {
+                    Ok(id) -> {
+                      server.close_session(server, id)
+                      response.new(204)
+                      |> response.set_body(mist.Bytes(bytes_tree.new()))
+                    }
+                    Error(error) -> plain_response(error.0, error.1)
+                  }
               }
             _ -> plain_response(405, "Method Not Allowed")
           }
@@ -190,10 +202,19 @@ fn valid_origin(server: server.Server, req: request.Request(body)) -> Bool {
 
 fn valid_protocol_header(req: request.Request(body)) -> Bool {
   case request.get_header(req, "mcp-protocol-version") {
-    Ok(version) -> version == jsonrpc.latest_protocol_version
+    Ok(version) ->
+      version == jsonrpc.latest_protocol_version
+      || version == jsonrpc.legacy_protocol_version
     // The specification's legacy default is unsupported by this SDK. Allow
     // initial handshakes without the header; sessions always require it.
     Error(_) -> request_session_id(req) == None
+  }
+}
+
+fn modern_header(req: request.Request(body)) -> Bool {
+  case request.get_header(req, "mcp-protocol-version") {
+    Ok(version) -> version != jsonrpc.legacy_protocol_version
+    Error(_) -> False
   }
 }
 
@@ -268,7 +289,7 @@ fn handle_get(
         initial_response: response.new(200)
           |> response.set_header(
             "mcp-protocol-version",
-            jsonrpc.latest_protocol_version,
+            jsonrpc.legacy_protocol_version,
           )
           |> response.set_header("mcp-session-id", session_id),
         init: fn(listener) {
@@ -294,22 +315,7 @@ fn handle_post(
   middleware: ClientActionMiddleware,
   principal: Option(String),
 ) -> response.Response(mist.ResponseData) {
-  case request_session_id(req) {
-    Some(id) ->
-      case require_existing_session(server, Some(id), principal) {
-        Error(error) -> plain_response(error.0, error.1)
-        Ok(_) ->
-          handle_post_checked(
-            server,
-            req,
-            max_body_bytes,
-            middleware,
-            principal,
-          )
-      }
-    None ->
-      handle_post_checked(server, req, max_body_bytes, middleware, principal)
-  }
+  handle_post_checked(server, req, max_body_bytes, middleware, principal)
 }
 
 fn handle_post_checked(
@@ -353,6 +359,417 @@ fn handle_post_body(
 ) -> response.Response(mist.ResponseData) {
   case codec.decode_message_with_error(body) {
     Ok(message) -> {
+      case
+        modern_header(req)
+        || wire.claims_modern(body)
+        || is_modern_message(message)
+      {
+        True ->
+          handle_modern_message(
+            server,
+            req,
+            body,
+            message,
+            accepts_sse_response,
+            middleware,
+            principal,
+          )
+        False ->
+          handle_legacy_message(
+            server,
+            req,
+            message,
+            requested_session_id,
+            accepts_sse_response,
+            middleware,
+            principal,
+          )
+      }
+    }
+    Error(diagnostic) -> {
+      case modern_header(req) || wire.claims_modern(body) {
+        True ->
+          modern_json_response(
+            server,
+            modern_response_status(jsonrpc.ErrorResponse(
+              diagnostic.id,
+              diagnostic.error,
+            )),
+            jsonrpc.ErrorResponse(diagnostic.id, diagnostic.error),
+          )
+        False ->
+          handle_invalid_legacy_message(
+            server,
+            body,
+            diagnostic,
+            requested_session_id,
+            principal,
+          )
+      }
+    }
+  }
+}
+
+fn is_modern_message(message: codec.Message) -> Bool {
+  case message {
+    codec.ClientActionRequest(jsonrpc.Request(_, _, Some(action))) ->
+      server.is_modern_action(action)
+    _ -> False
+  }
+}
+
+fn handle_modern_message(
+  app: server.Server,
+  req: request.Request(mist.Connection),
+  body: String,
+  message: codec.Message,
+  accepts_sse_response: Bool,
+  middleware: ClientActionMiddleware,
+  principal: Option(String),
+) -> response.Response(mist.ResponseData) {
+  let context = server.modern_request_context(principal, uuid.v4_string(), None)
+  case message {
+    codec.ClientActionRequest(request) -> {
+      let assert jsonrpc.Request(id, method, params) = request
+      let context =
+        server.request_context(
+          context,
+          id,
+          params |> option.then(server.action_meta),
+        )
+      let validation =
+        validate_modern_headers(app, req, method, params)
+        |> result.try(fn(_) {
+          case params {
+            Some(action) -> server.validate_modern_request(app, context, action)
+            None ->
+              Error(jsonrpc.invalid_params_error("Missing request parameters"))
+          }
+        })
+      case validation {
+        Error(error) ->
+          modern_json_response(
+            app,
+            case error.code {
+              -32_601 -> 404
+              _ -> 400
+            },
+            jsonrpc.ErrorResponse(Some(id), error),
+          )
+        Ok(_) ->
+          case middleware(app, context, "", request) {
+            Continue -> {
+              case accepts_sse_response {
+                True ->
+                  handle_modern_streamed_request(app, req, context, request)
+                False -> {
+                  let #(_, rpc) =
+                    server.handle_request_with_context(app, context, request)
+                  modern_json_response(app, modern_response_status(rpc), rpc)
+                }
+              }
+            }
+            RespondRpc(rpc) ->
+              modern_json_response(app, modern_response_status(rpc), rpc)
+            RespondAccepted -> accepted_response(None)
+            RespondPlain(status, body) -> plain_response(status, body)
+          }
+      }
+    }
+    codec.UnknownRequest(id, method) -> {
+      case
+        wire.request_meta(body)
+        |> result.try(fn(_) {
+          validate_standard_headers(req, method, None, None)
+        })
+      {
+        Error(error) ->
+          modern_json_response(app, 400, jsonrpc.ErrorResponse(Some(id), error))
+        Ok(_) ->
+          modern_json_response(
+            app,
+            404,
+            jsonrpc.ErrorResponse(
+              Some(id),
+              jsonrpc.method_not_found_error(method),
+            ),
+          )
+      }
+    }
+    // Modern HTTP has no client-to-server core notifications or responses.
+    _ -> plain_response(400, "Unexpected modern client message: " <> body)
+  }
+}
+
+fn modern_response_status(
+  response: jsonrpc.Response(actions.ClientActionResult),
+) -> Int {
+  case response {
+    jsonrpc.ErrorResponse(_, error) if error.code == -32_601 -> 404
+    jsonrpc.ErrorResponse(_, error)
+      if error.code == -32_602
+      || error.code == -32_020
+      || error.code == -32_021
+      || error.code == -32_022
+    -> 400
+    _ -> 200
+  }
+}
+
+type ModernSseState {
+  ModernSseState(
+    app: server.Server,
+    context: server.RequestContext,
+    listener: process.Subject(streamable_http_store.ListenerMessage),
+  )
+}
+
+type ModernBridgeMessage {
+  ResultReady(Result(actions.ClientActionResult, jsonrpc.RpcError))
+  ConnectionClosed
+}
+
+fn handle_modern_streamed_request(
+  app: server.Server,
+  req: request.Request(mist.Connection),
+  context: server.RequestContext,
+  request: jsonrpc.Request(actions.ClientActionRequest),
+) -> response.Response(mist.ResponseData) {
+  let assert jsonrpc.Request(id, _, _) = request
+  mist.server_sent_events(
+    req,
+    response.new(200)
+      |> response.set_header(
+        "mcp-protocol-version",
+        jsonrpc.latest_protocol_version,
+      )
+      |> response.set_header("x-accel-buffering", "no"),
+    fn(listener) {
+      let assert server.ModernRequestContext(..) = context
+      let context =
+        server.ModernRequestContext(..context, notifications: Some(listener))
+      let listen = case request {
+        jsonrpc.Request(
+          _,
+          _,
+          Some(actions.ClientRequestSubscriptionsListen(params)),
+        ) -> Some(params)
+        _ -> None
+      }
+      case listen {
+        Some(params) -> {
+          case server.listen_subscription(app, context, params) {
+            Ok(_) -> Nil
+            Error(error) ->
+              process.send(
+                listener,
+                streamable_http_store.DeliverResponse(wire.encode_response(
+                  jsonrpc.ErrorResponse(Some(id), error),
+                  jsonrpc.latest_protocol_version,
+                  server.implementation(app),
+                )),
+              )
+          }
+        }
+        None -> {
+          let owner = process.self()
+          let _ =
+            process.spawn_unlinked(fn() {
+              let reply = process.new_subject()
+              let monitor = process.monitor(owner)
+              server.start_request_with_context(app, context, request, reply)
+              let selector =
+                process.new_selector()
+                |> process.select_map(reply, ResultReady)
+                |> process.select_specific_monitor(monitor, fn(_) {
+                  ConnectionClosed
+                })
+              case process.selector_receive_forever(selector) {
+                ResultReady(outcome) -> {
+                  process.demonitor_process(monitor)
+                  let rpc = case outcome {
+                    Ok(value) -> jsonrpc.ResultResponse(id, value)
+                    Error(error) -> jsonrpc.ErrorResponse(Some(id), error)
+                  }
+                  process.send(
+                    listener,
+                    streamable_http_store.DeliverResponse(wire.encode_response(
+                      rpc,
+                      jsonrpc.latest_protocol_version,
+                      server.implementation(app),
+                    )),
+                  )
+                }
+                ConnectionClosed ->
+                  server.cancel_incoming_request(app, context, id)
+              }
+            })
+          Nil
+        }
+      }
+      let _ =
+        process.send_after(
+          listener,
+          1000,
+          streamable_http_store.DeliverResponse(""),
+        )
+      ModernSseState(app, context, listener)
+    },
+    fn(state, message, connection) {
+      case message {
+        streamable_http_store.DeliverRequest(_) -> actor.continue(state)
+        streamable_http_store.DeliverNotification(notification) -> {
+          case
+            mist.send_event(
+              connection,
+              mist.event(
+                client_codec.encode_notification(notification)
+                |> string_tree.from_string,
+              ),
+            )
+          {
+            Ok(_) -> actor.continue(state)
+            Error(_) -> {
+              server.cancel_incoming_request(state.app, state.context, id)
+              actor.stop()
+            }
+          }
+        }
+        streamable_http_store.DeliverResponse("") -> {
+          case mist.send_event(connection, mist.event(string_tree.new())) {
+            Ok(_) -> {
+              let _ =
+                process.send_after(
+                  state.listener,
+                  1000,
+                  streamable_http_store.DeliverResponse(""),
+                )
+              actor.continue(state)
+            }
+            Error(_) -> {
+              server.cancel_incoming_request(state.app, state.context, id)
+              actor.stop()
+            }
+          }
+        }
+        streamable_http_store.DeliverResponse(payload) -> {
+          let _ =
+            mist.send_event(
+              connection,
+              mist.event(string_tree.from_string(payload)),
+            )
+          server.cancel_incoming_request(state.app, state.context, id)
+          actor.stop()
+        }
+        streamable_http_store.CloseListener -> {
+          server.cancel_incoming_request(state.app, state.context, id)
+          actor.stop()
+        }
+      }
+    },
+  )
+}
+
+fn modern_json_response(
+  app: server.Server,
+  status: Int,
+  rpc: jsonrpc.Response(actions.ClientActionResult),
+) -> response.Response(mist.ResponseData) {
+  response.new(status)
+  |> response.set_header("content-type", "application/json")
+  |> response.set_header(
+    "mcp-protocol-version",
+    jsonrpc.latest_protocol_version,
+  )
+  |> response.set_body(
+    mist.Bytes(
+      bytes_tree.from_string(wire.encode_response(
+        rpc,
+        jsonrpc.latest_protocol_version,
+        server.implementation(app),
+      )),
+    ),
+  )
+}
+
+fn validate_modern_headers(
+  app: server.Server,
+  req: request.Request(body),
+  method: String,
+  action: Option(actions.ClientActionRequest),
+) -> Result(Nil, jsonrpc.RpcError) {
+  let action = action |> option.map(actions.request_without_input)
+  let meta = action |> option.then(server.action_meta)
+  let name = case action {
+    Some(actions.ClientRequestCallTool(params)) -> Some(params.name)
+    Some(actions.ClientRequestReadResource(params)) -> Some(params.uri)
+    Some(actions.ClientRequestGetPrompt(params)) -> Some(params.name)
+    Some(actions.ClientRequestGetTask(params))
+    | Some(actions.ClientRequestCancelTask(params)) ->
+      Some(actions.task_id(params))
+    Some(actions.ClientRequestUpdateTask(params)) -> Some(params.task_id)
+    _ -> None
+  }
+  use _ <- result.try(validate_standard_headers(
+    req,
+    method,
+    name,
+    server.protocol_version(meta),
+  ))
+  case action {
+    Some(actions.ClientRequestCallTool(params)) -> {
+      case server.tool_descriptor(app, params.name) {
+        None -> Ok(Nil)
+        Some(tool) -> {
+          let arguments =
+            params.arguments
+            |> option.map(fn(fields) { jsonrpc.VObject(dict.to_list(fields)) })
+            |> option.unwrap(jsonrpc.VObject([]))
+          http_headers.validate_parameters(
+            req.headers,
+            tool.input_schema,
+            arguments,
+          )
+          |> result.map_error(header_error)
+        }
+      }
+    }
+    _ -> Ok(Nil)
+  }
+}
+
+fn validate_standard_headers(
+  req: request.Request(body),
+  method: String,
+  name: Option(String),
+  version: Option(String),
+) -> Result(Nil, jsonrpc.RpcError) {
+  http_headers.validate_standard(
+    req.headers,
+    option.unwrap(version, jsonrpc.latest_protocol_version),
+    method,
+    name,
+  )
+  |> result.map_error(header_error)
+}
+
+fn header_error(message: String) -> jsonrpc.RpcError {
+  jsonrpc.RpcError(-32_020, "Header mismatch: " <> message, None)
+}
+
+fn handle_legacy_message(
+  server: server.Server,
+  req: request.Request(mist.Connection),
+  message: codec.Message,
+  requested_session_id: Option(String),
+  accepts_sse_response: Bool,
+  middleware: ClientActionMiddleware,
+  principal: Option(String),
+) -> response.Response(mist.ResponseData) {
+  case valid_protocol_header(req) {
+    False ->
+      plain_response(400, "Unsupported or missing MCP protocol version header")
+    True -> {
       let session = case requested_session_id, is_initialize_message(message) {
         None, True -> {
           let id = server.ensure_streamable_http_session(server, None)
@@ -375,7 +792,25 @@ fn handle_post_body(
         Error(error) -> plain_response(error.0, error.1)
       }
     }
-    Error(diagnostic) -> {
+  }
+}
+
+fn handle_invalid_legacy_message(
+  server: server.Server,
+  body: String,
+  diagnostic: codec_common.MessageDecodeError,
+  requested_session_id: Option(String),
+  principal: Option(String),
+) -> response.Response(mist.ResponseData) {
+  let valid_session = case requested_session_id {
+    None -> Ok(Nil)
+    Some(_) ->
+      require_existing_session(server, requested_session_id, principal)
+      |> result.map(fn(_) { Nil })
+  }
+  case valid_session {
+    Error(error) -> plain_response(error.0, error.1)
+    Ok(_) -> {
       case codec_common.is_response(body) {
         True ->
           case
@@ -519,7 +954,7 @@ fn handle_streamed_request(
     initial_response: response.new(200)
       |> response.set_header(
         "mcp-protocol-version",
-        jsonrpc.latest_protocol_version,
+        jsonrpc.legacy_protocol_version,
       )
       |> response.set_header("mcp-session-id", session_id),
     init: fn(listener) {
@@ -580,7 +1015,7 @@ fn json_response(
   |> response.set_header("content-type", "application/json")
   |> response.set_header(
     "mcp-protocol-version",
-    jsonrpc.latest_protocol_version,
+    jsonrpc.legacy_protocol_version,
   )
   |> prepend_session_id_header(session_id)
   |> response.set_body(mist.Bytes(bytes_tree.from_string(body)))
@@ -592,7 +1027,7 @@ fn accepted_response(
   response.new(202)
   |> response.set_header(
     "mcp-protocol-version",
-    jsonrpc.latest_protocol_version,
+    jsonrpc.legacy_protocol_version,
   )
   |> prepend_session_id_header(session_id)
   |> response.set_body(mist.Bytes(bytes_tree.from_string("")))

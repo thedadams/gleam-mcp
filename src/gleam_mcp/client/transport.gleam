@@ -1,9 +1,12 @@
+import gleam/dict
+import gleam/dynamic/decode
 import gleam/erlang/process
 import gleam/http
 import gleam/http/request
 import gleam/http/response
 import gleam/httpc
 import gleam/int
+import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
@@ -15,8 +18,10 @@ import gleam_mcp/client/capabilities
 import gleam_mcp/client/codec as client_codec
 import gleam_mcp/client/http_stream
 import gleam_mcp/client/stdio_manager
+import gleam_mcp/http_headers
 import gleam_mcp/jsonrpc.{type Request, type Response}
 import gleam_mcp/server/codec as server_codec
+import gleam_mcp/wire
 
 pub type CompatibilityMode {
   StreamableOnly
@@ -56,6 +61,12 @@ pub type TransportError {
   AuthorizationRequired(status: Int, challenge: Option(String))
   ProcessError(String)
   HttpError(String)
+  ProtocolHttpError(status: Int, body: String)
+  VersionedProtocolHttpError(
+    status: Int,
+    body: String,
+    protocol_version: String,
+  )
   TimeoutError
   SessionExpired
   UnexpectedResponse(String)
@@ -63,6 +74,11 @@ pub type TransportError {
 
 pub type TransportResponse(result) {
   TransportResponse(response: Response(result), session_id: Option(String))
+  VersionedTransportResponse(
+    response: Response(result),
+    session_id: Option(String),
+    protocol_version: String,
+  )
 }
 
 const default_http_timeout_ms = 30_000
@@ -143,8 +159,10 @@ pub fn default_runners_with_manager(manager: stdio_manager.Manager) -> Runners {
         protocol_version,
         capability_config,
         message,
-        client_codec.encode_request,
-        client_codec.decode_response,
+        fn(message) { wire.encode_request(message, protocol_version) },
+        fn(body, message) {
+          wire.decode_response(body, message, protocol_version)
+        },
       )
     },
     streamable_notification: fn(
@@ -213,16 +231,60 @@ fn stdio_process_request(
       to_stdio_manager_config(config),
       session_id,
       capability_config,
-      client_codec.encode_request(message),
+      wire.encode_request(message, message_version(message)),
     )
     |> result.map_error(map_stdio_error),
   )
 
-  client_codec.decode_response(response_payload, message)
+  wire.decode_response(response_payload, message, message_version(message))
   |> result.map_error(UnexpectedResponse)
   |> result.map(fn(response) {
     TransportResponse(response:, session_id: next_session_id)
   })
+}
+
+pub fn stdio_request_until_stopped(
+  manager: stdio_manager.Manager,
+  config: StdioConfig,
+  session_id: Option(String),
+  capability_config: capabilities.Config,
+  message: Request(ClientActionRequest),
+  stop: process.Subject(Nil),
+) -> Result(TransportResponse(ClientActionResult), TransportError) {
+  use #(payload, session_id) <- result.try(
+    stdio_manager.request_until_stopped(
+      manager,
+      to_stdio_manager_config(config),
+      session_id,
+      capability_config,
+      wire.encode_request(message, message_version(message)),
+      stop,
+    )
+    |> result.map_error(map_stdio_error),
+  )
+  wire.decode_response(payload, message, message_version(message))
+  |> result.map_error(UnexpectedResponse)
+  |> result.map(fn(response) { TransportResponse(response, session_id) })
+}
+
+fn message_version(message: Request(ClientActionRequest)) -> String {
+  let params = case message {
+    jsonrpc.Request(_, _, params) | jsonrpc.Notification(_, params) -> params
+  }
+  let version = case params {
+    Some(action) ->
+      actions.request_meta(action)
+      |> option.then(fn(meta) { meta.extra })
+      |> option.then(fn(meta) {
+        dict.get(meta.fields, "io.modelcontextprotocol/protocolVersion")
+        |> option.from_result
+      })
+    None -> None
+  }
+  case version {
+    Some(jsonrpc.VString(value)) -> value
+    _ -> jsonrpc.legacy_protocol_version
+  }
 }
 
 fn stdio_process_notification(
@@ -284,43 +346,227 @@ pub fn streamable_http_request(
   encode: fn(Request(action)) -> String,
   decode: fn(String, Request(action)) -> Result(Response(result), String),
 ) -> Result(TransportResponse(result), TransportError) {
+  streamable_http_request_options(
+    config,
+    session_id,
+    protocol_version,
+    capability_config,
+    message,
+    encode,
+    decode,
+    [],
+    None,
+  )
+}
+
+pub fn streamable_http_request_options(
+  config: HttpConfig,
+  session_id: Option(String),
+  protocol_version: String,
+  capability_config: capabilities.Config,
+  message: Request(action),
+  encode: fn(Request(action)) -> String,
+  decode: fn(String, Request(action)) -> Result(Response(result), String),
+  mirrored: List(http.Header),
+  stop: Option(process.Subject(Nil)),
+) -> Result(TransportResponse(result), TransportError) {
   let HttpConfig(base_url:, ..) = config
   let response_reply = process.new_subject()
-  use next_session_id <- result.try(
-    http_stream.request_until(
-      http.Post,
-      base_url,
-      post_stream_headers(config, session_id, protocol_version),
-      encode(message),
-      http_timeout_ms(config),
-      fn(payload, observed_session_id) {
-        case decode(payload, message) {
-          Ok(response) -> {
-            process.send(response_reply, response)
-            Ok(True)
+  let response_headers = process.new_subject()
+  let streamed = case protocol_version == "2026-07-28" {
+    True ->
+      http_stream.request_modern_with_headers(
+        base_url,
+        modern_headers(config, protocol_version, encode(message), mirrored),
+        encode(message),
+        http_timeout_ms(config),
+        stop,
+        response_headers,
+        fn(payload, _) {
+          case decode(payload, message) {
+            Ok(response) -> {
+              process.send(response_reply, response)
+              Ok(True)
+            }
+            Error(_) -> process_modern_message(capability_config, payload)
           }
-          Error(_) ->
-            process_server_message(
-              config,
-              observed_session_id,
-              protocol_version,
-              capability_config,
-              payload,
-            )
-            |> result.map(fn(_) { False })
-            |> result.map_error(to_stream_error)
-        }
-      },
-    )
-    |> result.map_error(fn(error) { map_stream_error(error, session_id) }),
+        },
+      )
+    False ->
+      http_stream.request_until(
+        http.Post,
+        base_url,
+        post_stream_headers(config, session_id, protocol_version),
+        encode(message),
+        http_timeout_ms(config),
+        fn(payload, observed_session_id) {
+          case decode(payload, message) {
+            Ok(response) -> {
+              process.send(response_reply, response)
+              Ok(True)
+            }
+            Error(_) ->
+              process_server_message(
+                config,
+                observed_session_id,
+                protocol_version,
+                capability_config,
+                payload,
+              )
+              |> result.map(fn(_) { False })
+              |> result.map_error(to_stream_error)
+          }
+        },
+      )
+  }
+  let streamed = case protocol_version == "2026-07-28", streamed {
+    True, Error(http_stream.HttpStatus(status, body)) ->
+      case decode(body, message) {
+        Ok(jsonrpc.ErrorResponse(_, error) as response)
+          if status == 400 || status == 404
+        ->
+          case recognized_modern_error(error.code) {
+            True -> {
+              process.send(response_reply, response)
+              Ok(None)
+            }
+            False -> Error(http_stream.HttpStatus(status, body))
+          }
+        _ -> Error(http_stream.HttpStatus(status, body))
+      }
+    _, _ -> streamed
+  }
+  let version = case process.receive(response_headers, 0) {
+    Ok(headers) ->
+      headers
+      |> list.find(fn(header) {
+        string.lowercase(header.0) == "mcp-protocol-version"
+      })
+      |> option.from_result
+      |> option.map(fn(header) { header.1 })
+    Error(_) -> None
+  }
+  use next_session_id <- result.try(
+    streamed
+    |> result.map_error(fn(error) {
+      case protocol_version == "2026-07-28", error {
+        True, http_stream.HttpStatus(status, body) ->
+          case version {
+            Some(version) -> VersionedProtocolHttpError(status, body, version)
+            None -> ProtocolHttpError(status, body)
+          }
+        _, _ -> map_stream_error(error, session_id)
+      }
+    }),
   )
   case process.receive(response_reply, 0) {
-    Ok(response) ->
-      Ok(TransportResponse(response:, session_id: next_session_id))
+    Ok(response) -> {
+      let session_id = case protocol_version {
+        "2026-07-28" -> None
+        _ -> next_session_id
+      }
+      Ok(case version {
+        Some(version) ->
+          VersionedTransportResponse(response, session_id, version)
+        None -> TransportResponse(response, session_id)
+      })
+    }
     Error(Nil) ->
       Error(UnexpectedResponse(
         "HTTP response did not contain a matching JSON-RPC response",
       ))
+  }
+}
+
+fn recognized_modern_error(code: Int) -> Bool {
+  code == -32_020
+  || code == -32_021
+  || code == -32_022
+  || code == -32_601
+  || code == -32_602
+  || code == -32_700
+}
+
+pub fn modern_headers(
+  config: HttpConfig,
+  version: String,
+  body: String,
+  mirrored: List(http.Header),
+) -> List(http.Header) {
+  let method =
+    json.parse(body, decode.at(["method"], decode.string)) |> result.unwrap("")
+  let name = case method {
+    "tools/call" | "prompts/get" ->
+      json.parse(body, decode.at(["params", "name"], decode.string))
+      |> option.from_result
+    "resources/read" ->
+      json.parse(body, decode.at(["params", "uri"], decode.string))
+      |> option.from_result
+    "tasks/get" | "tasks/update" | "tasks/cancel" ->
+      json.parse(body, decode.at(["params", "taskId"], decode.string))
+      |> option.from_result
+    _ -> None
+  }
+  let defaults =
+    [
+      #("accept", "application/json, text/event-stream"),
+      #("content-type", "application/json"),
+      #("mcp-protocol-version", version),
+      #("mcp-method", method),
+      #("connection", "close"),
+    ]
+    |> prepend_optional_header(
+      "mcp-name",
+      name |> option.map(http_headers.encode_value),
+    )
+  let custom =
+    config.headers
+    |> list.filter_map(fn(pair) {
+      let #(name, value) = pair
+      let name = string.lowercase(name)
+      case
+        list.contains(
+          [
+            "accept",
+            "content-type",
+            "connection",
+            "mcp-method",
+            "mcp-name",
+            "mcp-protocol-version",
+            "mcp-session-id",
+            "last-event-id",
+            "mcp-task-id",
+          ],
+          name,
+        )
+        || string.starts_with(name, "mcp-param-")
+      {
+        True -> Error(Nil)
+        False -> Ok(#(name, value))
+      }
+    })
+  list.append(defaults, list.append(mirrored, custom))
+}
+
+/// Modern servers may send notifications, but never reverse JSON-RPC requests.
+pub fn process_modern_message(
+  config: capabilities.Config,
+  payload: String,
+) -> Result(Bool, http_stream.StreamError) {
+  case client_codec.decode_server_message(payload) {
+    Ok(client_codec.ActionNotification(notification)) ->
+      capabilities.handle_notification(config, notification)
+      |> result.map(fn(_) { False })
+      |> result.map_error(fn(error) {
+        http_stream.InvalidResponse(error.message)
+      })
+    Ok(client_codec.UnknownNotification(_)) -> Ok(False)
+    Ok(client_codec.ServerActionRequest(_))
+    | Ok(client_codec.UnknownRequest(_, _)) ->
+      Error(http_stream.InvalidResponse(
+        "Modern server sent a forbidden JSON-RPC request",
+      ))
+    Error(_) -> Ok(False)
   }
 }
 
@@ -690,13 +936,15 @@ fn transport_error_message(error: TransportError) -> String {
       "HTTP authorization required: " <> int.to_string(status)
     ProcessError(message) -> message
     HttpError(message) -> message
+    ProtocolHttpError(status, _) | VersionedProtocolHttpError(status, _, _) ->
+      "HTTP status " <> int.to_string(status)
     TimeoutError -> "Timed out waiting for transport response"
     SessionExpired -> "MCP session expired"
     UnexpectedResponse(message) -> message
   }
 }
 
-fn map_stream_error(
+pub fn map_stream_error(
   error: http_stream.StreamError,
   session_id: Option(String),
 ) -> TransportError {

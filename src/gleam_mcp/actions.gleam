@@ -1,5 +1,5 @@
 import gleam/dict.{type Dict}
-import gleam/option.{type Option}
+import gleam/option.{type Option, None}
 import gleam_mcp/jsonrpc.{type RequestId, type Value}
 
 pub type Meta {
@@ -47,6 +47,14 @@ pub type LoggingLevel {
 }
 
 pub type ClientActionRequest {
+  ClientRequestDiscover(Option(RequestMeta))
+  ClientRequestSubscriptionsListen(SubscriptionsListenParams)
+  ClientRequestWithInput(
+    request: ClientActionRequest,
+    request_state: Option(String),
+    input_responses: Option(Dict(String, Value)),
+  )
+  ClientRequestUpdateTask(TaskUpdateParams)
   ClientRequestInitialize(InitializeRequestParams)
   ClientRequestPing(Option(RequestMeta))
   ClientRequestListResources(PaginatedRequestParams)
@@ -78,6 +86,11 @@ pub type ServerActionRequest {
 }
 
 pub type ClientActionResult {
+  ClientResultWithCache(result: ClientActionResult, hint: CacheHint)
+  ClientResultDiscover(DiscoverResult)
+  ClientResultSubscriptionsListen(SubscriptionsListenResult)
+  ClientResultInputRequired(InputRequiredResult)
+  ClientResultTaskModern(Value)
   ClientResultEmpty(Option(Meta))
   ClientResultInitialize(InitializeResult)
   ClientResultListResources(ListResourcesResult)
@@ -108,6 +121,12 @@ pub type ServerActionResult {
 }
 
 pub type ActionNotification {
+  NotifyTaskModern(value: Value, meta: Option(NotificationMeta))
+  NotifySubscriptionsAcknowledged(Option(NotificationMeta))
+  NotifySubscriptionsAcknowledgedWithFilter(
+    notifications: Option(Value),
+    meta: Option(NotificationMeta),
+  )
   NotifyInitialized(Option(NotificationMeta))
   NotifyCancelled(CancelledNotificationParams)
   NotifyProgress(ProgressNotificationParams)
@@ -119,6 +138,47 @@ pub type ActionNotification {
   NotifyRootsListChanged(Option(NotificationMeta))
   NotifyElicitationComplete(ElicitationCompleteNotificationParams)
   NotifyTaskStatus(TaskStatusNotificationParams)
+}
+
+/// The modern discovery result. Capabilities retain their complete JSON shape,
+/// including extension capabilities unknown to this SDK.
+pub type DiscoverResult {
+  DiscoverResult(
+    supported_versions: List(String),
+    capabilities: Dict(String, Value),
+    instructions: Option(String),
+    meta: Option(Meta),
+  )
+}
+
+pub type CacheScope {
+  Public
+  Private
+}
+
+pub type CacheHint {
+  CacheHint(ttl_ms: Int, scope: CacheScope)
+}
+
+pub type SubscriptionsListenParams {
+  SubscriptionsListenParams(
+    notifications: Option(Value),
+    meta: Option(RequestMeta),
+  )
+}
+
+pub type SubscriptionsListenResult {
+  SubscriptionsListenResult(meta: Option(Meta))
+}
+
+/// At least one of input_requests and request_state must be present. A state
+/// alone represents a continuation that needs no client input.
+pub type InputRequiredResult {
+  InputRequiredResult(
+    input_requests: Option(Dict(String, Value)),
+    request_state: Option(String),
+    meta: Option(Meta),
+  )
 }
 
 pub type InitializeRequestParams {
@@ -489,7 +549,7 @@ pub type CallToolRequestParams {
 pub type CallToolResult {
   CallToolResult(
     content: List(ContentBlock),
-    structured_content: Option(Dict(String, Value)),
+    structured_content: Option(Value),
     is_error: Option(Bool),
     meta: Option(Meta),
   )
@@ -498,6 +558,7 @@ pub type CallToolResult {
 pub type CallToolResponse {
   CallTool(CallToolResult)
   CallToolTask(CreateTaskResult)
+  CallToolTaskModern(Value)
 }
 
 pub type TaskStatus {
@@ -526,6 +587,134 @@ pub type CreateTaskResult {
 
 pub type TaskIdParams {
   TaskIdParams(task_id: String)
+  TaskIdParamsWithMeta(task_id: String, meta: Option(RequestMeta))
+}
+
+pub type TaskUpdateParams {
+  TaskUpdateParams(
+    task_id: String,
+    input: Option(Value),
+    meta: Option(RequestMeta),
+  )
+}
+
+pub fn task_id(params: TaskIdParams) -> String {
+  case params {
+    TaskIdParams(id) | TaskIdParamsWithMeta(id, _) -> id
+  }
+}
+
+pub fn task_id_meta(params: TaskIdParams) -> Option(RequestMeta) {
+  case params {
+    TaskIdParams(_) -> None
+    TaskIdParamsWithMeta(_, meta) -> meta
+  }
+}
+
+/// Return the metadata attached to the underlying request, including a
+/// multi-round-trip continuation request.
+pub fn request_meta(request: ClientActionRequest) -> Option(RequestMeta) {
+  case request {
+    ClientRequestDiscover(meta) | ClientRequestPing(meta) -> meta
+    ClientRequestSubscriptionsListen(params) -> params.meta
+    ClientRequestWithInput(request, _, _) -> request_meta(request)
+    ClientRequestUpdateTask(params) -> params.meta
+    ClientRequestInitialize(params) -> params.meta
+    ClientRequestListResources(params)
+    | ClientRequestListResourceTemplates(params)
+    | ClientRequestListPrompts(params)
+    | ClientRequestListTools(params)
+    | ClientRequestListTasks(params) -> params.meta
+    ClientRequestReadResource(params) -> params.meta
+    ClientRequestSubscribeResource(params) -> params.meta
+    ClientRequestUnsubscribeResource(params) -> params.meta
+    ClientRequestGetPrompt(params) -> params.meta
+    ClientRequestCallTool(params) -> params.meta
+    ClientRequestComplete(params) -> params.meta
+    ClientRequestSetLoggingLevel(params) -> params.meta
+    ClientRequestGetTask(params)
+    | ClientRequestGetTaskResult(params)
+    | ClientRequestCancelTask(params) -> task_id_meta(params)
+  }
+}
+
+pub fn with_request_meta(
+  request: ClientActionRequest,
+  meta: Option(RequestMeta),
+) -> ClientActionRequest {
+  case request {
+    ClientRequestDiscover(_) -> ClientRequestDiscover(meta)
+    ClientRequestPing(_) -> ClientRequestPing(meta)
+    ClientRequestSubscriptionsListen(params) ->
+      ClientRequestSubscriptionsListen(
+        SubscriptionsListenParams(..params, meta:),
+      )
+    ClientRequestWithInput(request, state, responses) ->
+      ClientRequestWithInput(with_request_meta(request, meta), state, responses)
+    ClientRequestUpdateTask(params) ->
+      ClientRequestUpdateTask(TaskUpdateParams(..params, meta:))
+    ClientRequestInitialize(params) ->
+      ClientRequestInitialize(InitializeRequestParams(..params, meta:))
+    ClientRequestListResources(params) ->
+      ClientRequestListResources(PaginatedRequestParams(..params, meta:))
+    ClientRequestListResourceTemplates(params) ->
+      ClientRequestListResourceTemplates(
+        PaginatedRequestParams(..params, meta:),
+      )
+    ClientRequestListPrompts(params) ->
+      ClientRequestListPrompts(PaginatedRequestParams(..params, meta:))
+    ClientRequestListTools(params) ->
+      ClientRequestListTools(PaginatedRequestParams(..params, meta:))
+    ClientRequestListTasks(params) ->
+      ClientRequestListTasks(PaginatedRequestParams(..params, meta:))
+    ClientRequestReadResource(params) ->
+      ClientRequestReadResource(ReadResourceRequestParams(..params, meta:))
+    ClientRequestSubscribeResource(params) ->
+      ClientRequestSubscribeResource(SubscribeRequestParams(..params, meta:))
+    ClientRequestUnsubscribeResource(params) ->
+      ClientRequestUnsubscribeResource(
+        UnsubscribeRequestParams(..params, meta:),
+      )
+    ClientRequestGetPrompt(params) ->
+      ClientRequestGetPrompt(GetPromptRequestParams(..params, meta:))
+    ClientRequestCallTool(params) ->
+      ClientRequestCallTool(CallToolRequestParams(..params, meta:))
+    ClientRequestComplete(params) ->
+      ClientRequestComplete(CompleteRequestParams(..params, meta:))
+    ClientRequestSetLoggingLevel(params) ->
+      ClientRequestSetLoggingLevel(SetLevelRequestParams(..params, meta:))
+    ClientRequestGetTask(params) ->
+      ClientRequestGetTask(TaskIdParamsWithMeta(task_id(params), meta))
+    ClientRequestGetTaskResult(params) ->
+      ClientRequestGetTaskResult(TaskIdParamsWithMeta(task_id(params), meta))
+    ClientRequestCancelTask(params) ->
+      ClientRequestCancelTask(TaskIdParamsWithMeta(task_id(params), meta))
+  }
+}
+
+pub fn request_state(request: ClientActionRequest) -> Option(String) {
+  case request {
+    ClientRequestWithInput(_, state, _) -> state
+    _ -> None
+  }
+}
+
+pub fn input_responses(
+  request: ClientActionRequest,
+) -> Option(Dict(String, Value)) {
+  case request {
+    ClientRequestWithInput(_, _, responses) -> responses
+    _ -> None
+  }
+}
+
+pub fn request_without_input(
+  request: ClientActionRequest,
+) -> ClientActionRequest {
+  case request {
+    ClientRequestWithInput(inner, _, _) -> request_without_input(inner)
+    _ -> request
+  }
 }
 
 pub type GetTaskResult {
@@ -533,6 +722,7 @@ pub type GetTaskResult {
 }
 
 pub type TaskResult {
+  TaskResultModern(Value)
   TaskCallTool(CallToolResult)
   TaskCreateMessage(CreateMessageResult)
   TaskElicit(ElicitResult)
@@ -644,7 +834,7 @@ pub type ToolResultContent {
   ToolResultContent(
     tool_use_id: String,
     content: List(ContentBlock),
-    structured_content: Option(Dict(String, Value)),
+    structured_content: Option(Value),
     is_error: Option(Bool),
     meta: Option(Meta),
   )
@@ -728,6 +918,33 @@ pub type ElicitRequestUrlParams {
     task: Option(TaskMetadata),
     meta: Option(RequestMeta),
   )
+  ElicitRequestUrlParamsWithoutId(
+    message: String,
+    url: String,
+    task: Option(TaskMetadata),
+    meta: Option(RequestMeta),
+  )
+}
+
+pub fn elicit_url(params: ElicitRequestUrlParams) -> String {
+  case params {
+    ElicitRequestUrlParams(_, _, url, _, _)
+    | ElicitRequestUrlParamsWithoutId(_, url, _, _) -> url
+  }
+}
+
+pub fn elicit_url_task(params: ElicitRequestUrlParams) -> Option(TaskMetadata) {
+  case params {
+    ElicitRequestUrlParams(_, _, _, task, _)
+    | ElicitRequestUrlParamsWithoutId(_, _, task, _) -> task
+  }
+}
+
+pub fn elicit_url_meta(params: ElicitRequestUrlParams) -> Option(RequestMeta) {
+  case params {
+    ElicitRequestUrlParams(_, _, _, _, meta)
+    | ElicitRequestUrlParamsWithoutId(_, _, _, meta) -> meta
+  }
 }
 
 pub type ElicitationCompleteNotificationParams {

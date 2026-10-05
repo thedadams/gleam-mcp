@@ -711,7 +711,7 @@ fn related_notification_meta(
       _,
       _,
       Some(actions.ServerRequestElicit(actions.ElicitRequestUrl(params))),
-    ) -> params.meta
+    ) -> actions.elicit_url_meta(params)
     jsonrpc.Request(_, _, Some(actions.ServerRequestListTasks(params))) ->
       params.meta
     _ -> None

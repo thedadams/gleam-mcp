@@ -25,7 +25,7 @@ pub fn initialize_infers_capabilities_test() {
       mcp.method_initialize,
       Some(
         actions.ClientRequestInitialize(actions.InitializeRequestParams(
-          protocol_version: jsonrpc.latest_protocol_version,
+          protocol_version: jsonrpc.legacy_protocol_version,
           capabilities: capabilities.none()
             |> capabilities.to_initialize_capabilities,
           client_info: server_test_support.sample_client_info(),
@@ -39,7 +39,7 @@ pub fn initialize_infers_capabilities_test() {
 
   case response {
     jsonrpc.ResultResponse(_, actions.ClientResultInitialize(result)) -> {
-      should.equal(result.protocol_version, jsonrpc.latest_protocol_version)
+      should.equal(result.protocol_version, jsonrpc.legacy_protocol_version)
       should.equal(result.instructions, Some("Use the Gleam MCP demo server."))
 
       let actions.ServerCapabilities(

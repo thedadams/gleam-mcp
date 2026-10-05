@@ -12,13 +12,14 @@ import gleam_mcp/mcp
 import gleam_mcp/server
 import gleam_mcp/server/codec
 import gleam_mcp/server/streamable_http_store
+import gleam_mcp/wire
 import stdin
 import youid/uuid
 
 type Message {
   InputLine(String)
   InputClosed
-  RequestFinished(String, jsonrpc.Response(actions.ClientActionResult))
+  RequestFinished(String, String, jsonrpc.Response(actions.ClientActionResult))
   DrainDeadline
 }
 
@@ -37,6 +38,7 @@ type State {
     outgoing_requests: List(jsonrpc.Request(actions.ServerActionRequest)),
     input_closed: Bool,
     write: fn(String) -> Nil,
+    outgoing: process.Subject(streamable_http_store.ListenerMessage),
   )
 }
 
@@ -85,6 +87,7 @@ pub fn serve_with_writer(
       [],
       False,
       write,
+      outgoing,
     )
   loop(state, input, selector)
   process.kill(reader)
@@ -109,8 +112,12 @@ fn loop(
           let _ = process.send_after(input, 5000, DrainDeadline)
           State(..state, input_closed: True, outgoing_requests: [])
         }
-        Input(RequestFinished(worker_id, response)) -> {
-          state.write(codec.encode_response(response))
+        Input(RequestFinished(worker_id, version, response)) -> {
+          state.write(wire.encode_response(
+            response,
+            version,
+            server.implementation(state.app_server),
+          ))
           State(..state, workers: dict.delete(state.workers, worker_id))
         }
         Input(DrainDeadline) -> {
@@ -147,9 +154,43 @@ fn handle_line(
       State(..state, outgoing_requests: remaining)
     }
     False ->
-      case codec.decode_message_with_error(line) {
+      case
+        case wire.claims_modern(line) {
+          True ->
+            wire.decode_message_with_error(
+              line,
+              jsonrpc.latest_protocol_version,
+            )
+          False -> codec.decode_message_with_error(line)
+        }
+      {
         Ok(codec.ClientActionRequest(request)) ->
           case request {
+            jsonrpc.Request(
+              id,
+              _,
+              Some(actions.ClientRequestSubscriptionsListen(params)),
+            ) -> {
+              let context =
+                server.modern_request_context(
+                  None,
+                  state.session_id,
+                  Some(state.outgoing),
+                )
+                |> server.request_context(id, params.meta)
+              case
+                server.listen_subscription(state.app_server, context, params)
+              {
+                Ok(_) -> Nil
+                Error(error) ->
+                  state.write(wire.encode_response(
+                    jsonrpc.ErrorResponse(Some(id), error),
+                    jsonrpc.latest_protocol_version,
+                    server.implementation(state.app_server),
+                  ))
+              }
+              state
+            }
             jsonrpc.Request(_, method, _) if method == mcp.method_initialize -> {
               // Establish negotiated state before reading the client's
               // initialized notification; normal handlers run concurrently.
@@ -163,6 +204,26 @@ fn handle_line(
               state
             }
             _ -> {
+              let modern =
+                wire.claims_modern(line)
+                || case request {
+                  jsonrpc.Request(_, _, Some(action)) ->
+                    server.is_modern_action(action)
+                  _ -> False
+                }
+              let context = case modern {
+                True ->
+                  server.modern_request_context(
+                    None,
+                    state.session_id,
+                    Some(state.outgoing),
+                  )
+                False -> state.context
+              }
+              let version = case server.is_modern_context(context) {
+                True -> jsonrpc.latest_protocol_version
+                False -> jsonrpc.legacy_protocol_version
+              }
               let worker_id = uuid.v4_string()
               let registered = process.new_subject()
               let worker =
@@ -175,12 +236,15 @@ fn handle_line(
                     Ok(result) -> jsonrpc.ResultResponse(id, result)
                     Error(error) -> jsonrpc.ErrorResponse(Some(id), error)
                   }
-                  process.send(input, RequestFinished(worker_id, response))
+                  process.send(
+                    input,
+                    RequestFinished(worker_id, version, response),
+                  )
                 })
               let reply = process.receive_forever(registered)
               server.start_request_with_context(
                 state.app_server,
-                state.context,
+                context,
                 request,
                 reply,
               )
@@ -213,12 +277,14 @@ fn handle_line(
           case codec_common.is_notification(line) {
             True -> Nil
             False ->
-              state.write(
-                codec.encode_response(jsonrpc.ErrorResponse(
-                  error.id,
-                  error.error,
-                )),
-              )
+              state.write(wire.encode_response(
+                jsonrpc.ErrorResponse(error.id, error.error),
+                case wire.claims_modern(line) {
+                  True -> jsonrpc.latest_protocol_version
+                  False -> jsonrpc.legacy_protocol_version
+                },
+                server.implementation(state.app_server),
+              ))
           }
           state
         }

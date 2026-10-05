@@ -252,9 +252,7 @@ pub fn encode_tool_result_content(
   ]
   |> append_optional(
     "structuredContent",
-    option_map(structured_content, fn(fields) {
-      encode_value_object(dict.to_list(fields))
-    }),
+    option_map(structured_content, encode_value),
   )
   |> append_optional("isError", option_map(is_error, json.bool))
   |> append_optional("_meta", option_map(meta, encode_meta))
@@ -426,7 +424,9 @@ fn resource_fields(resource: actions.Resource) -> List(#(String, json.Json)) {
   |> append_optional("_meta", option_map(meta, encode_meta))
 }
 
-fn encode_value_object(fields: List(#(String, jsonrpc.Value))) -> json.Json {
+pub fn encode_value_object(
+  fields: List(#(String, jsonrpc.Value)),
+) -> json.Json {
   fields
   |> list.map(fn(entry) {
     let #(key, value) = entry

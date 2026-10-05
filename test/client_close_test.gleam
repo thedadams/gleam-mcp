@@ -8,6 +8,7 @@ import gleam/option.{Some}
 import gleam_mcp/client
 import gleam_mcp/client/capabilities
 import gleam_mcp/client/transport
+import gleam_mcp/jsonrpc
 import gleeunit/should
 import mist
 
@@ -81,6 +82,8 @@ pub fn closing_http_listener_does_not_depend_on_delete_support_test() {
       )),
       capabilities.none(),
     )
+  let created =
+    client.with_protocol_version(created, jsonrpc.legacy_protocol_version)
   let created = client.Client(..created, session_id: Some("wire-session"))
   let _ =
     process.spawn_unlinked(fn() {

@@ -63,6 +63,31 @@ pub fn decode_server_message(body: String) -> Result(ServerMessage, String) {
   |> result.map_error(json_error_message)
 }
 
+pub fn encode_client_capabilities_value(
+  capabilities: actions.ClientCapabilities,
+) -> jsonrpc.Value {
+  let assert Ok(value) =
+    json.parse(
+      json.to_string(encode_client_capabilities(capabilities)),
+      value_decoder(),
+    )
+  value
+}
+
+pub fn decode_server_capabilities(
+  value: jsonrpc.Value,
+) -> Result(actions.ServerCapabilities, String) {
+  json.parse(json.to_string(encode_value(value)), server_capabilities_decoder())
+  |> result.map_error(json_error_message)
+}
+
+pub fn decode_implementation(
+  value: jsonrpc.Value,
+) -> Result(actions.Implementation, String) {
+  json.parse(json.to_string(encode_value(value)), implementation_decoder())
+  |> result.map_error(json_error_message)
+}
+
 fn encode_action_request(
   request: jsonrpc.Request(actions.ClientActionRequest),
 ) -> json.Json {
@@ -141,6 +166,37 @@ fn base_request_fields(
 
 fn encode_request_params(request: actions.ClientActionRequest) -> json.Json {
   case request {
+    actions.ClientRequestDiscover(meta) -> encode_request_meta_only(meta)
+    actions.ClientRequestSubscriptionsListen(params) ->
+      []
+      |> append_optional(
+        "notifications",
+        option_map(params.notifications, encode_value),
+      )
+      |> append_optional("_meta", option_map(params.meta, encode_request_meta))
+      |> json.object
+    actions.ClientRequestWithInput(inner, state, responses) ->
+      encode_request_params(inner)
+      |> encoded_object_fields
+      |> list.filter(fn(field) {
+        field.0 != "requestState" && field.0 != "inputResponses"
+      })
+      |> append_optional("requestState", option_map(state, json.string))
+      |> append_optional(
+        "inputResponses",
+        option_map(responses, fn(fields) {
+          codec_common.encode_value_object(dict.to_list(fields))
+        }),
+      )
+      |> json.object
+    actions.ClientRequestUpdateTask(params) ->
+      [#("taskId", json.string(params.task_id))]
+      |> append_optional(
+        "inputResponses",
+        option_map(params.input, encode_value),
+      )
+      |> append_optional("_meta", option_map(params.meta, encode_request_meta))
+      |> json.object
     actions.ClientRequestInitialize(params) ->
       encode_initialize_request_params(params)
     actions.ClientRequestPing(meta) -> encode_request_meta_only(meta)
@@ -195,6 +251,23 @@ fn encode_notification_params(
   notification: actions.ActionNotification,
 ) -> json.Json {
   case notification {
+    actions.NotifyTaskModern(value, meta) ->
+      value
+      |> encode_value
+      |> encoded_object_fields
+      |> list.filter(fn(field) { field.0 != "_meta" })
+      |> append_optional("_meta", option_map(meta, encode_notification_meta))
+      |> json.object
+    actions.NotifySubscriptionsAcknowledged(meta) ->
+      encode_notification_meta_only(meta)
+    actions.NotifySubscriptionsAcknowledgedWithFilter(notifications, meta) ->
+      []
+      |> append_optional(
+        "notifications",
+        option_map(notifications, encode_value),
+      )
+      |> append_optional("_meta", option_map(meta, encode_notification_meta))
+      |> json.object
     actions.NotifyInitialized(meta) -> encode_notification_meta_only(meta)
     actions.NotifyCancelled(params) ->
       encode_cancelled_notification_params(params)
@@ -433,23 +506,43 @@ fn encode_elicit_request_form_params(
 fn encode_elicit_request_url_params(
   params: actions.ElicitRequestUrlParams,
 ) -> json.Json {
-  let actions.ElicitRequestUrlParams(message, elicitation_id, url, task, meta) =
-    params
+  let elicitation_id = case params {
+    actions.ElicitRequestUrlParams(_, id, _, _, _) -> Some(id)
+    actions.ElicitRequestUrlParamsWithoutId(..) -> None
+  }
 
   [
     #("mode", json.string("url")),
-    #("message", json.string(message)),
-    #("elicitationId", json.string(elicitation_id)),
-    #("url", json.string(url)),
+    #("message", json.string(params.message)),
+    #("url", json.string(actions.elicit_url(params))),
   ]
-  |> append_optional("task", option_map(task, encode_task_metadata))
-  |> append_optional("_meta", option_map(meta, encode_request_meta))
+  |> append_optional("elicitationId", option_map(elicitation_id, json.string))
+  |> append_optional(
+    "task",
+    option_map(actions.elicit_url_task(params), encode_task_metadata),
+  )
+  |> append_optional(
+    "_meta",
+    option_map(actions.elicit_url_meta(params), encode_request_meta),
+  )
   |> json.object
 }
 
 fn encode_task_id_params(params: actions.TaskIdParams) -> json.Json {
-  let actions.TaskIdParams(task_id) = params
-  json.object([#("taskId", json.string(task_id))])
+  [#("taskId", json.string(actions.task_id(params)))]
+  |> append_optional(
+    "_meta",
+    option_map(actions.task_id_meta(params), encode_request_meta),
+  )
+  |> json.object
+}
+
+fn encoded_object_fields(value: json.Json) -> List(#(String, json.Json)) {
+  let assert Ok(fields) =
+    json.parse(json.to_string(value), value_dict_decoder())
+  fields
+  |> dict.to_list
+  |> list.map(fn(field) { #(field.0, encode_value(field.1)) })
 }
 
 fn encode_cancelled_notification_params(
@@ -912,6 +1005,35 @@ pub fn server_message_decoder() -> decode.Decoder(ServerMessage) {
   use _ <- decode.then(codec_common.request_parameters_decoder())
   decode.then(decode.at(["method"], decode.string), fn(method) {
     case method {
+      "notifications/tasks" ->
+        decode_required_server_notification_message(
+          mcp.method_notify_task,
+          {
+            use fields <- decode.then(value_dict_decoder())
+            use meta <- decode.then(notification_meta_only_decoder())
+            decode.success(actions.NotifyTaskModern(
+              jsonrpc.VObject(dict.to_list(dict.delete(fields, "_meta"))),
+              meta,
+            ))
+          },
+          fn(notification) { notification },
+        )
+      "notifications/subscriptions/acknowledged" ->
+        decode_required_server_notification_message(
+          mcp.method_notify_subscriptions_acknowledged,
+          {
+            use notifications <- decode.field(
+              "notifications",
+              subscription_filter_decoder(),
+            )
+            use meta <- decode.then(notification_meta_only_decoder())
+            decode.success(actions.NotifySubscriptionsAcknowledgedWithFilter(
+              Some(notifications),
+              meta,
+            ))
+          },
+          fn(notification) { notification },
+        )
       method if method == mcp.method_ping -> ping_message_decoder()
       method if method == mcp.method_list_roots -> list_roots_message_decoder()
       method if method == mcp.method_create_message ->
@@ -1185,6 +1307,10 @@ fn optional_params_decoder(
 
 fn notification_method(notification: actions.ActionNotification) -> String {
   case notification {
+    actions.NotifyTaskModern(_, _) -> mcp.method_notify_task
+    actions.NotifySubscriptionsAcknowledged(_)
+    | actions.NotifySubscriptionsAcknowledgedWithFilter(_, _) ->
+      mcp.method_notify_subscriptions_acknowledged
     actions.NotifyInitialized(_) -> mcp.method_initialized
     actions.NotifyCancelled(_) -> mcp.method_notify_cancelled
     actions.NotifyProgress(_) -> mcp.method_notify_progress
@@ -1413,7 +1539,43 @@ fn server_error_response_decoder() -> decode.Decoder(
 fn action_result_decoder(
   action: actions.ClientActionRequest,
 ) -> decode.Decoder(actions.ClientActionResult) {
+  use result_type <- decode.optional_field(
+    "resultType",
+    None,
+    decode.map(decode.string, Some),
+  )
+  case result_type {
+    Some("input_required") ->
+      decode.map(
+        input_required_result_decoder(),
+        actions.ClientResultInputRequired,
+      )
+    _ -> complete_action_result_decoder(action)
+  }
+}
+
+fn complete_action_result_decoder(
+  action: actions.ClientActionRequest,
+) -> decode.Decoder(actions.ClientActionResult) {
   case action {
+    actions.ClientRequestDiscover(_) ->
+      decode.map(discover_result_decoder(), actions.ClientResultDiscover)
+    actions.ClientRequestSubscriptionsListen(_) -> {
+      use meta <- decode.optional_field(
+        "_meta",
+        None,
+        decode.optional(meta_decoder()),
+      )
+      decode.success(
+        actions.ClientResultSubscriptionsListen(
+          actions.SubscriptionsListenResult(meta),
+        ),
+      )
+    }
+    actions.ClientRequestWithInput(inner, _, _) ->
+      complete_action_result_decoder(inner)
+    actions.ClientRequestUpdateTask(_) ->
+      decode.map(value_decoder(), actions.ClientResultTaskModern)
     actions.ClientRequestInitialize(_) ->
       decode.map(initialize_result_decoder(), actions.ClientResultInitialize)
     actions.ClientRequestPing(_) -> empty_result_decoder()
@@ -1459,6 +1621,96 @@ fn action_result_decoder(
     actions.ClientRequestCancelTask(_) ->
       decode.map(cancel_task_result_decoder(), actions.ClientResultCancelTask)
   }
+}
+
+fn discover_result_decoder() -> decode.Decoder(actions.DiscoverResult) {
+  use versions <- decode.field("supportedVersions", decode.list(decode.string))
+  use capabilities <- decode.field("capabilities", value_dict_decoder())
+  use instructions <- decode.optional_field(
+    "instructions",
+    None,
+    decode.map(decode.string, Some),
+  )
+  use meta <- decode.optional_field(
+    "_meta",
+    None,
+    decode.map(meta_decoder(), Some),
+  )
+  decode.success(actions.DiscoverResult(
+    versions,
+    capabilities,
+    instructions,
+    meta,
+  ))
+}
+
+fn input_required_result_decoder() -> decode.Decoder(
+  actions.InputRequiredResult,
+) {
+  use result_type <- decode.field("resultType", decode.string)
+  case result_type {
+    "input_required" -> {
+      use requests <- decode.optional_field(
+        "inputRequests",
+        None,
+        decode.map(value_dict_decoder(), Some),
+      )
+      use state <- decode.optional_field(
+        "requestState",
+        None,
+        decode.map(decode.string, Some),
+      )
+      use meta <- decode.optional_field(
+        "_meta",
+        None,
+        decode.map(meta_decoder(), Some),
+      )
+      case requests, state {
+        None, None ->
+          decode.failure(
+            actions.InputRequiredResult(None, None, None),
+            expected: "inputRequests or requestState",
+          )
+        _, _ ->
+          decode.success(actions.InputRequiredResult(requests, state, meta))
+      }
+    }
+    _ ->
+      decode.failure(
+        actions.InputRequiredResult(None, None, None),
+        expected: "input_required resultType",
+      )
+  }
+}
+
+pub fn subscription_filter_decoder() -> decode.Decoder(jsonrpc.Value) {
+  use fields <- decode.then(value_dict_decoder())
+  use _tools <- decode.optional_field(
+    "toolsListChanged",
+    None,
+    decode.map(decode.bool, Some),
+  )
+  use _prompts <- decode.optional_field(
+    "promptsListChanged",
+    None,
+    decode.map(decode.bool, Some),
+  )
+  use _resources <- decode.optional_field(
+    "resourcesListChanged",
+    None,
+    decode.map(decode.bool, Some),
+  )
+  use _subscriptions <- decode.optional_field(
+    "resourceSubscriptions",
+    None,
+    decode.map(decode.list(decode.string), Some),
+  )
+  use _extensions <- decode.optional_field(
+    "extensions",
+    None,
+    decode.map(decode.dict(decode.string, value_dict_decoder()), Some),
+  )
+  decode.success(jsonrpc.VObject(dict.to_list(fields)))
 }
 
 fn server_action_result_decoder(
@@ -1653,7 +1905,7 @@ fn call_tool_result_decoder() -> decode.Decoder(actions.CallToolResult) {
     use structured_content <- decode.optional_field(
       "structuredContent",
       None,
-      decode.optional(value_dict_decoder()),
+      decode.map(value_decoder(), Some),
     )
     use is_error <- decode.optional_field(
       "isError",
@@ -1932,7 +2184,11 @@ fn elicit_request_url_params_decoder() -> decode.Decoder(
 ) {
   {
     use message <- decode.field("message", decode.string)
-    use elicitation_id <- decode.field("elicitationId", decode.string)
+    use elicitation_id <- decode.optional_field(
+      "elicitationId",
+      None,
+      decode.map(decode.string, Some),
+    )
     use url <- decode.field("url", decode.string)
     use task <- decode.optional_field(
       "task",
@@ -1944,13 +2200,10 @@ fn elicit_request_url_params_decoder() -> decode.Decoder(
       None,
       decode.optional(request_meta_decoder()),
     )
-    decode.success(actions.ElicitRequestUrlParams(
-      message,
-      elicitation_id,
-      url,
-      task,
-      meta,
-    ))
+    decode.success(case elicitation_id {
+      Some(id) -> actions.ElicitRequestUrlParams(message, id, url, task, meta)
+      None -> actions.ElicitRequestUrlParamsWithoutId(message, url, task, meta)
+    })
   }
 }
 
@@ -2017,7 +2270,11 @@ fn task_metadata_decoder() -> decode.Decoder(actions.TaskMetadata) {
 fn task_id_params_decoder() -> decode.Decoder(actions.TaskIdParams) {
   {
     use task_id <- decode.field("taskId", decode.string)
-    decode.success(actions.TaskIdParams(task_id))
+    use meta <- decode.then(request_meta_only_decoder())
+    decode.success(case meta {
+      None -> actions.TaskIdParams(task_id)
+      Some(_) -> actions.TaskIdParamsWithMeta(task_id, meta)
+    })
   }
 }
 
@@ -2652,7 +2909,7 @@ fn tool_decoder() -> decode.Decoder(actions.Tool) {
       None,
       decode.optional(decode.string),
     )
-    use input_schema <- decode.field("inputSchema", value_decoder())
+    use input_schema <- decode.field("inputSchema", tool_input_schema_decoder())
     use execution <- decode.optional_field(
       "execution",
       None,
@@ -2661,7 +2918,7 @@ fn tool_decoder() -> decode.Decoder(actions.Tool) {
     use output_schema <- decode.optional_field(
       "outputSchema",
       None,
-      decode.optional(value_decoder()),
+      decode.optional(schema_object_decoder()),
     )
     use annotations <- decode.optional_field(
       "annotations",
@@ -2701,6 +2958,24 @@ fn tool_execution_decoder() -> decode.Decoder(actions.ToolExecution) {
     )
     decode.success(actions.ToolExecution(task_support: task_support))
   }
+}
+
+fn tool_input_schema_decoder() -> decode.Decoder(jsonrpc.Value) {
+  use fields <- decode.then(value_dict_decoder())
+  use schema_type <- decode.field("type", decode.string)
+  case schema_type {
+    "object" -> decode.success(jsonrpc.VObject(dict.to_list(fields)))
+    _ ->
+      decode.failure(
+        jsonrpc.VObject([]),
+        expected: "JSON Schema with type object",
+      )
+  }
+}
+
+fn schema_object_decoder() -> decode.Decoder(jsonrpc.Value) {
+  use fields <- decode.then(value_dict_decoder())
+  decode.success(jsonrpc.VObject(dict.to_list(fields)))
 }
 
 fn task_support_decoder() -> decode.Decoder(actions.TaskSupport) {
@@ -2959,7 +3234,7 @@ fn tool_result_content_decoder() -> decode.Decoder(actions.ToolResultContent) {
     use structured_content <- decode.optional_field(
       "structuredContent",
       None,
-      decode.optional(value_dict_decoder()),
+      decode.map(value_decoder(), Some),
     )
     use is_error <- decode.optional_field(
       "isError",
@@ -3113,7 +3388,7 @@ fn error_decoder() -> decode.Decoder(jsonrpc.RpcError) {
   }
 }
 
-fn value_decoder() -> decode.Decoder(jsonrpc.Value) {
+pub fn value_decoder() -> decode.Decoder(jsonrpc.Value) {
   use <- decode.recursive
   decode.one_of(decode.map(decode.string, jsonrpc.VString), or: [
     decode.map(decode.int, jsonrpc.VInt),

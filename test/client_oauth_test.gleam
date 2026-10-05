@@ -87,7 +87,7 @@ pub fn server_metadata_and_challenge_are_consumed_by_client_test() {
     |> should.be_ok
   let discovery =
     oauth.discover_with_sender(
-      oauth.new(resource, "client", redirect),
+      oauth.new(resource, "client", redirect) |> oauth.with_issuer(issuer),
       Some(challenge),
       fn(req) {
         case req.host {
@@ -108,7 +108,7 @@ pub fn discovery_preserves_resource_query_and_rejects_issuer_query_test() {
     "https://mcp.example.test/.well-known/oauth-protected-resource?tenant=a",
   ])
   oauth.discover_with_sender(
-    oauth.new(resource, "client", redirect),
+    oauth.new(resource, "client", redirect) |> oauth.with_issuer(issuer),
     None,
     fn(_) {
       Ok(json_response(resource_document(resource, [issuer <> "?tenant=a"])))
@@ -117,7 +117,7 @@ pub fn discovery_preserves_resource_query_and_rejects_issuer_query_test() {
   |> should.be_error
   should.equal(oauth.authorization_metadata_urls("https://auth.test:bad"), [])
   oauth.discover_with_sender(
-    oauth.new(resource, "client", redirect),
+    oauth.new(resource, "client", redirect) |> oauth.with_issuer(issuer),
     None,
     fn(_) {
       Ok(json_response(resource_document(resource, ["https://auth.test:bad"])))
@@ -127,7 +127,8 @@ pub fn discovery_preserves_resource_query_and_rejects_issuer_query_test() {
 }
 
 pub fn public_clients_require_declared_none_authentication_test() {
-  let config = oauth.new(resource, "client", redirect)
+  let config =
+    oauth.new(resource, "client", redirect) |> oauth.with_issuer(issuer)
   let discovery = discovered(config)
   let metadata =
     oauth.AuthorizationServerMetadata(
@@ -141,7 +142,8 @@ pub fn public_clients_require_declared_none_authentication_test() {
 }
 
 pub fn authorization_issuer_redirect_and_pin_are_verified_test() {
-  let config = oauth.new(resource, "client", redirect)
+  let config =
+    oauth.new(resource, "client", redirect) |> oauth.with_issuer(issuer)
   let discovery = discovered(config)
   let other_issuer = "https://different.example.test"
   let resource_metadata =
@@ -229,7 +231,8 @@ pub fn canonical_resource_normalizes_scheme_host_without_dropping_path_test() {
 
 pub fn resource_and_oidc_discovery_follows_required_fallback_order_test() {
   let requests = process.new_subject()
-  let config = oauth.new(resource, "public-client", redirect)
+  let config =
+    oauth.new(resource, "public-client", redirect) |> oauth.with_issuer(issuer)
   let discovered =
     oauth.discover_with_sender(config, None, fn(req) {
       should.equal(req.method, http.Get)
@@ -267,7 +270,9 @@ pub fn challenge_metadata_and_scopes_take_precedence_test() {
     |> should.be_ok
   let discovered =
     oauth.discover_with_sender(
-      oauth.new(resource, "client", redirect) |> oauth.with_scopes(["ignored"]),
+      oauth.new(resource, "client", redirect)
+        |> oauth.with_issuer(issuer)
+        |> oauth.with_scopes(["ignored"]),
       Some(challenge),
       fn(req) {
         process.send(requests, req.path)
@@ -288,7 +293,8 @@ pub fn challenge_metadata_and_scopes_take_precedence_test() {
 }
 
 pub fn discovery_rejects_resource_and_issuer_substitution_test() {
-  let config = oauth.new(resource, "client", redirect)
+  let config =
+    oauth.new(resource, "client", redirect) |> oauth.with_issuer(issuer)
   oauth.discover_with_sender(config, None, fn(_) {
     Ok(
       json_response(
@@ -319,7 +325,8 @@ pub fn discovery_rejects_resource_and_issuer_substitution_test() {
 }
 
 pub fn pkce_is_mandatory_and_authorization_binds_resource_test() {
-  let config = oauth.new(resource, "public-client", redirect)
+  let config =
+    oauth.new(resource, "public-client", redirect) |> oauth.with_issuer(issuer)
   let discovery = discovered(config)
   let unsupported =
     oauth.Discovery(
@@ -354,7 +361,8 @@ pub fn pkce_is_mandatory_and_authorization_binds_resource_test() {
 }
 
 pub fn code_exchange_checks_state_and_sends_pkce_and_resource_test() {
-  let config = oauth.new(resource, "public-client", redirect)
+  let config =
+    oauth.new(resource, "public-client", redirect) |> oauth.with_issuer(issuer)
   let pending = oauth.begin(config, discovered(config)) |> should.be_ok
   let pending_url = uri.parse(oauth.authorization_url(pending)) |> should.be_ok
   let params =
@@ -423,7 +431,8 @@ pub fn code_exchange_checks_state_and_sends_pkce_and_resource_test() {
 }
 
 pub fn refresh_includes_resource_and_preserves_rotated_refresh_token_test() {
-  let config = oauth.new(resource, "client", redirect)
+  let config =
+    oauth.new(resource, "client", redirect) |> oauth.with_issuer(issuer)
   let discovery = discovered(config)
   let pending = oauth.begin(config, discovery) |> should.be_ok
   let tokens =
@@ -455,7 +464,8 @@ pub fn refresh_includes_resource_and_preserves_rotated_refresh_token_test() {
   |> should.be_ok
   should.equal(
     oauth.refresh_with_sender(
-      oauth.new(resource, "different-client", redirect),
+      oauth.new(resource, "different-client", redirect)
+        |> oauth.with_issuer(issuer),
       discovery,
       rotated,
       fn(_) { panic },
@@ -465,7 +475,8 @@ pub fn refresh_includes_resource_and_preserves_rotated_refresh_token_test() {
 }
 
 pub fn expired_tokens_and_oauth_errors_are_explicit_test() {
-  let config = oauth.new(resource, "client", redirect)
+  let config =
+    oauth.new(resource, "client", redirect) |> oauth.with_issuer(issuer)
   let discovery = discovered(config)
   let pending = oauth.begin(config, discovery) |> should.be_ok
   let tokens =
@@ -503,7 +514,9 @@ pub fn expired_tokens_and_oauth_errors_are_explicit_test() {
 pub fn insecure_endpoints_require_explicit_loopback_opt_in_test() {
   let local_resource = "http://127.0.0.1:1234/mcp"
   let local_issuer = "http://127.0.0.1:5678"
-  let config = oauth.new(local_resource, "client", redirect)
+  let config =
+    oauth.new(local_resource, "client", redirect)
+    |> oauth.with_issuer(local_issuer)
   let sender = fn(req: request.Request(String)) {
     case req.port {
       Some(1234) ->

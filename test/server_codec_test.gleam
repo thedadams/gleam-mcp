@@ -23,7 +23,7 @@ pub fn decode_message_parses_initialize_request_test() {
     "{"
     <> "\"jsonrpc\":\"2.0\",\"id\":\"req-1\",\"method\":\"initialize\",\"params\":{"
     <> "\"protocolVersion\":\""
-    <> jsonrpc.latest_protocol_version
+    <> jsonrpc.legacy_protocol_version
     <> "\",\"capabilities\":{},\"clientInfo\":{\"name\":\"test-client\",\"version\":\"1.0.0\"}}}"
 
   case codec.decode_message(body) |> should.be_ok {
@@ -34,7 +34,7 @@ pub fn decode_message_parses_initialize_request_test() {
     )) -> {
       should.equal(id, jsonrpc.StringId("req-1"))
       should.equal(method, "initialize")
-      should.equal(params.protocol_version, jsonrpc.latest_protocol_version)
+      should.equal(params.protocol_version, jsonrpc.legacy_protocol_version)
       should.equal(params.client_info.name, "test-client")
     }
     _ -> should.fail()
@@ -62,7 +62,7 @@ pub fn encode_response_serializes_initialize_result_test() {
       "initialize",
       Some(
         actions.ClientRequestInitialize(actions.InitializeRequestParams(
-          protocol_version: jsonrpc.latest_protocol_version,
+          protocol_version: jsonrpc.legacy_protocol_version,
           capabilities: actions.ClientCapabilities(None, None, None, None, None),
           client_info: server_test_support.sample_client_info(),
           meta: None,
@@ -75,7 +75,7 @@ pub fn encode_response_serializes_initialize_result_test() {
 
   should.be_true(string.contains(
     encoded,
-    "\"protocolVersion\":\"" <> jsonrpc.latest_protocol_version <> "\"",
+    "\"protocolVersion\":\"" <> jsonrpc.legacy_protocol_version <> "\"",
   ))
   should.be_true(string.contains(
     encoded,

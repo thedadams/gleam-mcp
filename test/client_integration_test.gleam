@@ -54,7 +54,7 @@ fn basic_request_with_transport(config: transport.Config) {
     ..,
   ) = init
 
-  should.equal(protocol_version, jsonrpc.latest_protocol_version)
+  should.equal(protocol_version, jsonrpc.legacy_protocol_version)
   should.be_false(string.is_empty(server_name))
   should.be_false(string.is_empty(server_version))
 
@@ -137,7 +137,7 @@ fn basic_request_with_transport(config: transport.Config) {
     actions.CallTool(actions.CallToolResult(content:, ..)) -> {
       should.be_true(has_text_content(content, "Echo: hello"))
     }
-    actions.CallToolTask(_) -> should.fail()
+    actions.CallToolTask(_) | actions.CallToolTaskModern(_) -> should.fail()
   }
 }
 
@@ -742,7 +742,7 @@ fn server_sent_request_server(kind: InteractionKind) -> server.Server {
   |> server.add_tool_with_context(
     tool_name(kind),
     "Roundtrip test tool",
-    jsonrpc.VObject([]),
+    jsonrpc.VObject([#("type", jsonrpc.VString("object"))]),
     fn(app_server, context, _) {
       case kind {
         Elicitation ->

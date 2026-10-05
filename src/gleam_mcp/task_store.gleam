@@ -20,6 +20,28 @@ type Entry {
     scope: Option(String),
     worker: Option(process.Pid),
     monitor: Option(process.Monitor),
+    inputs: Dict(String, jsonrpc.Value),
+    resume: Option(
+      fn(Dict(String, jsonrpc.Value)) -> Result(ModernOutcome, jsonrpc.RpcError),
+    ),
+  )
+}
+
+/// Modern tasks can wait for MRTR input before resuming their monitored worker.
+pub type ModernOutcome {
+  ModernComplete(jsonrpc.Value)
+  ModernInputRequired(
+    inputs: Dict(String, jsonrpc.Value),
+    resume: fn(Dict(String, jsonrpc.Value)) ->
+      Result(ModernOutcome, jsonrpc.RpcError),
+  )
+}
+
+pub type Snapshot {
+  Snapshot(
+    task: actions.Task,
+    outcome: Option(Result(actions.TaskResult, jsonrpc.RpcError)),
+    inputs: Dict(String, jsonrpc.Value),
   )
 }
 
@@ -55,6 +77,27 @@ type Message {
     task_id: String,
     pid: process.Pid,
     outcome: Result(actions.TaskResult, jsonrpc.RpcError),
+  )
+  StartModern(
+    task_id: String,
+    worker: fn() -> Result(ModernOutcome, jsonrpc.RpcError),
+    reply: process.Subject(Result(Nil, jsonrpc.RpcError)),
+  )
+  ModernFinished(
+    task_id: String,
+    pid: process.Pid,
+    outcome: Result(ModernOutcome, jsonrpc.RpcError),
+  )
+  Peek(
+    task_id: String,
+    access: Access,
+    reply: process.Subject(Result(Snapshot, jsonrpc.RpcError)),
+  )
+  SubmitInputs(
+    task_id: String,
+    access: Access,
+    inputs: Dict(String, jsonrpc.Value),
+    reply: process.Subject(Result(Nil, jsonrpc.RpcError)),
   )
   WorkerDown(process.Down)
   Expire(task_id: String)
@@ -115,6 +158,33 @@ pub fn start_worker(
   worker: fn() -> Result(actions.TaskResult, jsonrpc.RpcError),
 ) -> Result(Nil, jsonrpc.RpcError) {
   call(store, fn(reply_to) { StartWorker(task_id, worker, reply_to) })
+}
+
+pub fn start_modern_worker(
+  store: Store,
+  task_id: String,
+  worker: fn() -> Result(ModernOutcome, jsonrpc.RpcError),
+) -> Result(Nil, jsonrpc.RpcError) {
+  call(store, fn(reply) { StartModern(task_id, worker, reply) })
+}
+
+/// Read status and a final payload without blocking. Ownership is checked even
+/// for completed tasks, and an unknown task reveals no other caller's state.
+pub fn snapshot_scoped(
+  store: Store,
+  task_id: String,
+  scope: Option(String),
+) -> Result(Snapshot, jsonrpc.RpcError) {
+  call(store, fn(reply) { Peek(task_id, Scoped(scope), reply) })
+}
+
+pub fn submit_inputs_scoped(
+  store: Store,
+  task_id: String,
+  scope: Option(String),
+  inputs: Dict(String, jsonrpc.Value),
+) -> Result(Nil, jsonrpc.RpcError) {
+  call(store, fn(reply) { SubmitInputs(task_id, Scoped(scope), inputs, reply) })
 }
 
 pub fn complete(
@@ -239,7 +309,7 @@ fn loop(
         dict.insert(
           entries,
           task.task_id,
-          Entry(task, None, [], scope, None, None),
+          Entry(task, None, [], scope, None, None, dict.new(), None),
         ),
       )
     }
@@ -261,6 +331,131 @@ fn loop(
         start_task_worker(entries, task_id, Store(subject), worker)
       process.send(reply_to, response)
       loop(subject, next_entries)
+    }
+    StartModern(task_id, worker, reply) -> {
+      let #(next, response) =
+        start_modern_task(entries, task_id, subject, worker)
+      process.send(reply, response)
+      loop(subject, next)
+    }
+    Peek(task_id, access, reply) -> {
+      process.send(reply, case find_entry(entries, task_id, access) {
+        Ok(entry) -> Ok(Snapshot(entry.task, entry.outcome, entry.inputs))
+        Error(_) -> Error(task_not_found_error(task_id))
+      })
+      loop(subject, entries)
+    }
+    SubmitInputs(task_id, access, inputs, reply) -> {
+      case find_entry(entries, task_id, access) {
+        Error(_) -> {
+          process.send(reply, Error(task_not_found_error(task_id)))
+          loop(subject, entries)
+        }
+        Ok(entry) -> {
+          case entry.resume, entry.task.status {
+            Some(resume), actions.InputRequired -> {
+              // Unknown and already consumed keys are ignored. Retain missing
+              // inputs until a later update supplies them all.
+              let supplied =
+                dict.filter(inputs, fn(key, _) {
+                  dict.has_key(entry.inputs, key)
+                })
+              let remaining =
+                dict.filter(entry.inputs, fn(key, _) {
+                  !dict.has_key(supplied, key)
+                })
+              case dict.size(supplied) > 0 {
+                False -> {
+                  process.send(reply, Ok(Nil))
+                  loop(subject, entries)
+                }
+                True -> {
+                  let next_resume = fn(more) {
+                    resume(dict.merge(supplied, more))
+                  }
+                  let entry =
+                    Entry(..entry, inputs: remaining, resume: Some(next_resume))
+                  let entries = dict.insert(entries, task_id, entry)
+                  case dict.size(remaining) == 0 {
+                    False -> {
+                      process.send(reply, Ok(Nil))
+                      loop(subject, entries)
+                    }
+                    True -> {
+                      let #(next, response) =
+                        start_modern_task(entries, task_id, subject, fn() {
+                          next_resume(dict.new())
+                        })
+                      process.send(reply, response)
+                      loop(subject, next)
+                    }
+                  }
+                }
+              }
+            }
+            _, _ -> {
+              process.send(reply, Ok(Nil))
+              loop(subject, entries)
+            }
+          }
+        }
+      }
+    }
+    ModernFinished(task_id, pid, outcome) -> {
+      case dict.get(entries, task_id) {
+        Ok(entry) if entry.worker == Some(pid) -> {
+          release_monitor(entry.monitor)
+          let entry = Entry(..entry, worker: None, monitor: None)
+          let entries = dict.insert(entries, task_id, entry)
+          case outcome {
+            Ok(ModernInputRequired(inputs, resume)) -> {
+              case dict.size(inputs) > 0 {
+                True -> {
+                  let entry =
+                    Entry(
+                      ..entry,
+                      task: set_task_status(
+                        entry.task,
+                        actions.InputRequired,
+                        None,
+                      ),
+                      inputs: inputs,
+                      resume: Some(resume),
+                    )
+                  loop(subject, dict.insert(entries, task_id, entry))
+                }
+                False -> {
+                  let #(next, _, waiters, outcome) =
+                    complete_task(
+                      entries,
+                      task_id,
+                      Error(jsonrpc.invalid_params_error(
+                        "Task input requests must not be empty",
+                      )),
+                    )
+                  notify_waiters(waiters, outcome)
+                  loop(subject, next)
+                }
+              }
+            }
+            outcome -> {
+              let outcome = case outcome {
+                Ok(ModernComplete(value)) -> Ok(actions.TaskResultModern(value))
+                Ok(ModernInputRequired(..)) ->
+                  Error(jsonrpc.invalid_params_error(
+                    "Task input requests must not be empty",
+                  ))
+                Error(error) -> Error(error)
+              }
+              let #(next, _, waiters, result) =
+                complete_task(entries, task_id, outcome)
+              notify_waiters(waiters, result)
+              loop(subject, next)
+            }
+          }
+        }
+        _ -> loop(subject, entries)
+      }
     }
     WorkerReady(task_id, pid, ready) -> {
       case dict.get(entries, task_id) {
@@ -390,6 +585,47 @@ fn start_task_worker(
         )
       }
     Error(Nil) -> #(entries, Error(task_not_found_error(task_id)))
+  }
+}
+
+fn start_modern_task(
+  entries: Dict(String, Entry),
+  task_id: String,
+  subject: process.Subject(Message),
+  worker: fn() -> Result(ModernOutcome, jsonrpc.RpcError),
+) -> #(Dict(String, Entry), Result(Nil, jsonrpc.RpcError)) {
+  case dict.get(entries, task_id) {
+    Ok(entry) ->
+      case is_terminal(entry.task.status), entry.worker {
+        False, None -> {
+          let pid =
+            process.spawn_unlinked(fn() {
+              let ready = process.new_subject()
+              process.send(subject, WorkerReady(task_id, process.self(), ready))
+              process.receive_forever(ready)
+              process.send(
+                subject,
+                ModernFinished(task_id, process.self(), worker()),
+              )
+            })
+          let monitor = process.monitor(pid)
+          let entry =
+            Entry(
+              ..entry,
+              worker: Some(pid),
+              monitor: Some(monitor),
+              task: set_task_status(entry.task, actions.Working, None),
+              inputs: dict.new(),
+              resume: None,
+            )
+          #(dict.insert(entries, task_id, entry), Ok(Nil))
+        }
+        _, _ -> #(
+          entries,
+          Error(jsonrpc.invalid_params_error("Task cannot start another worker")),
+        )
+      }
+    Error(_) -> #(entries, Error(task_not_found_error(task_id)))
   }
 }
 
@@ -682,6 +918,7 @@ fn with_related_task(
   task_id: String,
 ) -> actions.TaskResult {
   case result {
+    actions.TaskResultModern(_) -> result
     actions.TaskCallTool(value) ->
       actions.TaskCallTool(
         actions.CallToolResult(

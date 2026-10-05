@@ -49,9 +49,28 @@ jobs:
           cat /tmp/mcp-everything.log
           exit 1
 
+      - name: Install official July 2026 SDK fixture
+        run: |
+          npm install --prefix /tmp/mcp-2026-sdk --no-audit --no-fund @modelcontextprotocol/server@2.3.0 @modelcontextprotocol/client@2.3.0 @modelcontextprotocol/node@2.1.1 zod@4.6.5
+          cp test/fixtures/mcp_2026_server.mjs /tmp/mcp-2026-sdk/server.mjs
+          cp test/fixtures/mcp_2026_client.mjs /tmp/mcp-2026-sdk/client.mjs
+          PORT=3002 node /tmp/mcp-2026-sdk/server.mjs > /tmp/mcp-2026-sdk.log 2>&1 &
+          for _ in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:3002/health; then
+              exit 0
+            fi
+            sleep 1
+          done
+          cat /tmp/mcp-2026-sdk.log
+          exit 1
+
       - name: Run tests
         env:
           MCP_EVERYTHING_URL: http://127.0.0.1:3001/mcp
           MCP_EVERYTHING_STDIO_COMMAND: npx
           MCP_EVERYTHING_STDIO_ARGS: "-y @modelcontextprotocol/server-everything@2026.1.26"
+          MCP_2026_URL: http://127.0.0.1:3002/mcp
+          MCP_2026_STDIO_COMMAND: node
+          MCP_2026_STDIO_ARGS: /tmp/mcp-2026-sdk/server.mjs stdio
+          MCP_2026_CLIENT_SCRIPT: /tmp/mcp-2026-sdk/client.mjs
         run: gleam test

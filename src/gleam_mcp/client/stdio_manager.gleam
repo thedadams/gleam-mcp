@@ -2,8 +2,10 @@ import child_process
 import child_process/stdio as process_stdio
 import gleam/bit_array
 import gleam/dict
+import gleam/dynamic/decode
 import gleam/erlang/process
 import gleam/int
+import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
@@ -51,6 +53,14 @@ type Command {
     capability_config: capabilities.Config,
     reply_to: process.Subject(Result(Option(String), String)),
   )
+  Subscribe(
+    Config,
+    Option(String),
+    String,
+    process.Subject(Result(String, String)),
+    process.Subject(Result(Option(String), String)),
+  )
+  AbortRequest(Option(String), Option(jsonrpc.RequestId))
 }
 
 type Session {
@@ -76,6 +86,12 @@ type SessionCommand {
     capability_config: capabilities.Config,
     reply_to: process.Subject(Result(Nil, String)),
   )
+  PerformSubscribe(
+    String,
+    process.Subject(Result(String, String)),
+    process.Subject(Result(Nil, String)),
+  )
+  AbortPending(Option(jsonrpc.RequestId))
 }
 
 type SessionEvent {
@@ -90,11 +106,24 @@ type PendingRequest {
     token: String,
     timer: process.Timer,
     capability_config: capabilities.Config,
+    request_id: Option(jsonrpc.RequestId),
+    modern: Bool,
   )
 }
 
 type Listener {
   Listener(capability_config: capabilities.Config)
+  ModernIdle(capability_config: capabilities.Config)
+  Subscription(
+    id: jsonrpc.RequestId,
+    events: process.Subject(Result(String, String)),
+    capability_config: capabilities.Config,
+  )
+}
+
+type StoppableReply {
+  Reply(Result(#(String, Option(String)), String))
+  Stopped
 }
 
 pub fn start() -> Manager {
@@ -153,6 +182,37 @@ pub fn request(
   }
 }
 
+pub fn request_until_stopped(
+  manager: Manager,
+  config: Config,
+  session_id: Option(String),
+  capability_config: capabilities.Config,
+  payload: String,
+  stop: process.Subject(Nil),
+) -> Result(#(String, Option(String)), String) {
+  let Manager(subject) = manager
+  let reply = process.new_subject()
+  process.send(
+    subject,
+    Request(config, session_id, capability_config, payload, reply),
+  )
+  let selector =
+    process.new_selector()
+    |> process.select_map(reply, Reply)
+    |> process.select_map(stop, fn(_) { Stopped })
+  case process.selector_receive(selector, manager_timeout_ms(config)) {
+    Ok(Reply(response)) -> response
+    Ok(Stopped) -> {
+      process.send(subject, AbortRequest(session_id, message_id(payload)))
+      Error("cancelled")
+    }
+    Error(_) -> {
+      process.send(subject, AbortRequest(session_id, message_id(payload)))
+      Error("timeout")
+    }
+  }
+}
+
 pub fn notification(
   manager: Manager,
   config: Config,
@@ -203,6 +263,22 @@ pub fn listen(
   }
 }
 
+/// Register a modern subscription without occupying the ordinary request slot.
+/// Events are delivered to a subject owned by the caller running the listener.
+pub fn subscribe(
+  manager: Manager,
+  config: Config,
+  session_id: Option(String),
+  payload: String,
+  events: process.Subject(Result(String, String)),
+) -> Result(Option(String), String) {
+  let Manager(subject) = manager
+  let reply = process.new_subject()
+  process.send(subject, Subscribe(config, session_id, payload, events, reply))
+  process.receive(reply, manager_timeout_ms(config))
+  |> result.unwrap(Error("timeout"))
+}
+
 fn loop(
   subject: process.Subject(Command),
   sessions: dict.Dict(String, Session),
@@ -246,6 +322,7 @@ fn loop(
                 process.receive(reply, timeout_ms(config) + 100)
                 |> result.unwrap(Error("timeout"))
               case response {
+                Error("cancelled") | Error("Stdio transport is busy") -> Nil
                 Error(_) -> process.send(subject, SessionFailed(id))
                 Ok(_) -> Nil
               }
@@ -322,6 +399,44 @@ fn loop(
           loop(subject, next_sessions)
         }
       }
+    }
+    Subscribe(config, session_id, payload, events, reply_to) -> {
+      case ensure_session(sessions, config, session_id) {
+        Error(error) -> {
+          process.send(reply_to, Error(error))
+          loop(subject, sessions)
+        }
+        Ok(#(next_sessions, id)) -> {
+          let assert Ok(Session(session)) = dict.get(next_sessions, id)
+          let ready = process.new_subject()
+          let _ =
+            process.spawn_unlinked(fn() {
+              let reply = process.new_subject()
+              process.send(ready, reply)
+              let outcome =
+                process.receive(reply, timeout_ms(config) + 100)
+                |> result.unwrap(Error("timeout"))
+              process.send(reply_to, result.map(outcome, fn(_) { Some(id) }))
+            })
+          process.send(
+            session,
+            PerformSubscribe(payload, events, process.receive_forever(ready)),
+          )
+          loop(subject, next_sessions)
+        }
+      }
+    }
+    AbortRequest(session_id, id) -> {
+      sessions
+      |> dict.to_list
+      |> list.each(fn(entry) {
+        let #(key, Session(session)) = entry
+        case session_id == None || session_id == Some(key) {
+          True -> process.send(session, AbortPending(id))
+          False -> Nil
+        }
+      })
+      loop(subject, sessions)
     }
   }
 }
@@ -411,6 +526,7 @@ fn session_loop(
       case pending {
         Some(request) if request.token == token -> {
           notify_pending_error(pending, "timeout")
+          notify_listener_error(listener, "timeout")
           stop_program(handle)
         }
         _ -> session_loop(subject, handle, buffer, pending, listener)
@@ -423,8 +539,22 @@ fn session_loop(
           notify_pending_error(pending, "Stdio transport process exited")
       }
     }
+    Ok(SessionEvent(AbortPending(id))) -> {
+      case pending {
+        Some(request) if request.request_id == id -> {
+          notify_pending_error(pending, "cancelled")
+          let _ = case id {
+            Some(id) -> child_process.writeln(handle, cancellation_payload(id))
+            None -> Ok(Nil)
+          }
+          session_loop(subject, handle, buffer, None, listener)
+        }
+        _ -> session_loop(subject, handle, buffer, pending, listener)
+      }
+    }
     Ok(SessionEvent(Shutdown(reply))) -> {
       notify_pending_error(pending, "Stdio transport closed")
+      notify_listener_error(listener, "Stdio transport closed")
       stop_program(handle)
       process.send(reply, Nil)
     }
@@ -450,8 +580,19 @@ fn session_loop(
                 subject,
                 handle,
                 buffer,
-                Some(PendingRequest(reply_to, token, timer, capability_config)),
-                listener,
+                Some(PendingRequest(
+                  reply_to,
+                  token,
+                  timer,
+                  capability_config,
+                  message_id(payload),
+                  modern_request(payload),
+                )),
+                case modern_request(payload), listener {
+                  True, Some(Subscription(_, _, _)) -> listener
+                  True, _ -> Some(ModernIdle(capability_config))
+                  False, _ -> listener
+                },
               )
             }
             Error(_) ->
@@ -462,6 +603,24 @@ fn session_loop(
       case child_process.writeln(handle, payload) {
         Ok(Nil) -> {
           process.send(reply_to, Ok(Nil))
+          let cancelled =
+            json.parse(
+              payload,
+              decode.at(
+                ["params", "requestId"],
+                decode.one_of(decode.map(decode.string, jsonrpc.StringId), [
+                  decode.map(decode.int, jsonrpc.IntId),
+                ]),
+              ),
+            )
+            |> option.from_result
+          let method = json.parse(payload, decode.at(["method"], decode.string))
+          let listener = case listener {
+            Some(Subscription(id, _, config))
+              if cancelled == Some(id) && method == Ok("notifications/cancelled")
+            -> Some(ModernIdle(config))
+            _ -> listener
+          }
           session_loop(subject, handle, buffer, pending, listener)
         }
         Error(_) ->
@@ -487,6 +646,34 @@ fn session_loop(
           )
         }
       }
+    Ok(SessionEvent(PerformSubscribe(payload, events, reply_to))) -> {
+      case listener, message_id(payload) {
+        None, Some(id) | Some(ModernIdle(_)), Some(id) -> {
+          let config = listener_config(pending, listener)
+          case child_process.writeln(handle, payload) {
+            Ok(_) -> {
+              process.send(reply_to, Ok(Nil))
+              session_loop(
+                subject,
+                handle,
+                buffer,
+                pending,
+                Some(Subscription(id, events, config)),
+              )
+            }
+            Error(_) ->
+              process.send(reply_to, Error("Stdio transport process exited"))
+          }
+        }
+        _, _ -> {
+          process.send(
+            reply_to,
+            Error("Stdio subscription already active or invalid request ID"),
+          )
+          session_loop(subject, handle, buffer, pending, listener)
+        }
+      }
+    }
     Ok(ProcessData(data)) ->
       case
         process_output(
@@ -505,11 +692,23 @@ fn session_loop(
             next_pending,
             next_listener,
           )
-        Error(error) -> notify_pending_error(pending, error)
+        Error(error) -> {
+          notify_pending_error(pending, error)
+          notify_listener_error(listener, error)
+          stop_program(handle)
+        }
       }
     Ok(ProcessExited(_)) -> {
+      notify_listener_error(listener, "Stdio transport process exited")
       notify_pending_error(pending, "Stdio transport process exited")
     }
+  }
+}
+
+fn notify_listener_error(listener: Option(Listener), message: String) -> Nil {
+  case listener {
+    Some(Subscription(_, events, _)) -> process.send(events, Error(message))
+    _ -> Nil
   }
 }
 
@@ -552,15 +751,36 @@ fn process_line(
 ) -> Result(#(Option(PendingRequest), Option(Listener)), String) {
   case string.starts_with(string.trim(line), "{") {
     False -> Ok(#(pending, listener))
-    True ->
-      case looks_like_jsonrpc_response(line), pending {
-        True, Some(PendingRequest(reply_to:, timer:, ..)) -> {
+    True -> {
+      let observed_id = message_id(line)
+      let null_error =
+        json.parse(line, decode.at(["id"], decode.optional(decode.string)))
+        == Ok(None)
+        && string.contains(line, "\"error\"")
+      let missing_id_error = error_without_id(line)
+      case looks_like_jsonrpc_response(line), pending, listener {
+        True,
+          Some(PendingRequest(reply_to:, timer:, request_id:, modern:, ..)),
+          _
+          if observed_id == request_id
+          || null_error
+          || { modern && missing_id_error }
+        -> {
           let _ = process.cancel_timer(timer)
           process.send(reply_to, Ok(line))
           Ok(#(None, listener))
         }
-        _, _ -> handle_server_message(subject, handle, line, pending, listener)
+        True, _, Some(Subscription(id, events, config))
+          if observed_id == Some(id)
+        -> {
+          process.send(events, Ok(line))
+          Ok(#(pending, Some(ModernIdle(config))))
+        }
+        True, _, _ -> Ok(#(pending, listener))
+        _, _, _ ->
+          handle_server_message(subject, handle, line, pending, listener)
       }
+    }
   }
 }
 
@@ -571,55 +791,155 @@ fn handle_server_message(
   pending: Option(PendingRequest),
   listener: Option(Listener),
 ) -> Result(#(Option(PendingRequest), Option(Listener)), String) {
-  let capability_config = case pending, listener {
-    Some(PendingRequest(capability_config:, ..)), _ -> capability_config
-    None, Some(Listener(capability_config: capability_config)) ->
-      capability_config
-    None, None -> capabilities.none()
+  let capability_config = listener_config(pending, listener)
+  let modern = case pending, listener {
+    Some(request), _ -> request.modern
+    _, Some(Subscription(_, _, _)) | _, Some(ModernIdle(_)) -> True
+    _, _ -> False
   }
-
-  case client_codec.decode_server_message(line) {
-    Ok(client_codec.ServerActionRequest(request)) -> {
-      let registered = process.new_subject()
-      let _ =
-        process.spawn_unlinked(fn() {
-          let reply = process.new_subject()
-          process.send(registered, reply)
-          let response = case process.receive_forever(reply) {
-            Ok(response) -> response
-            Error(error) -> {
-              let assert jsonrpc.Request(id, _, _) = request
-              jsonrpc.ErrorResponse(Some(id), error)
-            }
-          }
-          process.send(
-            subject,
-            DeliverReply(server_codec.encode_server_response(response)),
-          )
-        })
-      capabilities.start_request(
-        capability_config,
-        request,
-        process.receive_forever(registered),
-      )
+  let tagged = has_subscription_id(line)
+  let tagged_id = subscription_id(line)
+  let subscription = case listener {
+    Some(Subscription(id, events, _)) if tagged && tagged_id == Some(id) ->
+      Some(events)
+    _ -> None
+  }
+  case subscription {
+    Some(events) -> {
+      process.send(events, Ok(line))
       Ok(#(pending, listener))
     }
-    Ok(client_codec.ActionNotification(notification)) ->
-      capabilities.handle_notification(capability_config, notification)
-      |> result.map_error(rpc_error_message)
-      |> result.map(fn(_) { #(pending, listener) })
-    Ok(client_codec.UnknownRequest(id, method)) ->
-      send_server_message(
-        handle,
-        server_codec.encode_server_response(jsonrpc.ErrorResponse(
-          Some(id),
-          jsonrpc.method_not_found_error(method),
-        )),
-      )
-      |> result.map(fn(_) { #(pending, listener) })
-    Ok(client_codec.UnknownNotification(_)) -> Ok(#(pending, listener))
-    Error(_) -> Ok(#(pending, listener))
+    None if tagged -> Ok(#(pending, listener))
+    None ->
+      case client_codec.decode_server_message(line) {
+        Ok(client_codec.ServerActionRequest(_))
+          | Ok(client_codec.UnknownRequest(_, _))
+          if modern
+        -> Error("Modern stdio server sent a forbidden JSON-RPC request")
+        Ok(client_codec.ServerActionRequest(request)) -> {
+          let registered = process.new_subject()
+          let _ =
+            process.spawn_unlinked(fn() {
+              let reply = process.new_subject()
+              process.send(registered, reply)
+              let response = case process.receive_forever(reply) {
+                Ok(response) -> response
+                Error(error) -> {
+                  let assert jsonrpc.Request(id, _, _) = request
+                  jsonrpc.ErrorResponse(Some(id), error)
+                }
+              }
+              process.send(
+                subject,
+                DeliverReply(server_codec.encode_server_response(response)),
+              )
+            })
+          capabilities.start_request(
+            capability_config,
+            request,
+            process.receive_forever(registered),
+          )
+          Ok(#(pending, listener))
+        }
+        Ok(client_codec.ActionNotification(notification)) ->
+          capabilities.handle_notification(capability_config, notification)
+          |> result.map_error(rpc_error_message)
+          |> result.map(fn(_) { #(pending, listener) })
+        Ok(client_codec.UnknownRequest(id, method)) ->
+          send_server_message(
+            handle,
+            server_codec.encode_server_response(jsonrpc.ErrorResponse(
+              Some(id),
+              jsonrpc.method_not_found_error(method),
+            )),
+          )
+          |> result.map(fn(_) { #(pending, listener) })
+        Ok(client_codec.UnknownNotification(_)) -> Ok(#(pending, listener))
+        Error(_) -> Ok(#(pending, listener))
+      }
   }
+}
+
+fn listener_config(
+  pending: Option(PendingRequest),
+  listener: Option(Listener),
+) -> capabilities.Config {
+  case pending, listener {
+    Some(PendingRequest(capability_config:, ..)), _ -> capability_config
+    _, Some(Listener(config))
+    | _, Some(ModernIdle(config))
+    | _, Some(Subscription(_, _, config))
+    -> config
+    _, None -> capabilities.none()
+  }
+}
+
+fn error_without_id(line: String) -> Bool {
+  case json.parse(line, decode.dict(decode.string, decode.dynamic)) {
+    Ok(fields) ->
+      dict.has_key(fields, "error")
+      && !dict.has_key(fields, "id")
+      && !dict.has_key(fields, "method")
+    Error(_) -> False
+  }
+}
+
+fn subscription_id(payload: String) -> Option(jsonrpc.RequestId) {
+  json.parse(
+    payload,
+    decode.at(
+      ["params", "_meta", "io.modelcontextprotocol/subscriptionId"],
+      decode.one_of(decode.map(decode.string, jsonrpc.StringId), [
+        decode.map(decode.int, jsonrpc.IntId),
+      ]),
+    ),
+  )
+  |> option.from_result
+}
+
+fn message_id(payload: String) -> Option(jsonrpc.RequestId) {
+  json.parse(
+    payload,
+    decode.at(
+      ["id"],
+      decode.one_of(decode.map(decode.string, jsonrpc.StringId), [
+        decode.map(decode.int, jsonrpc.IntId),
+      ]),
+    ),
+  )
+  |> option.from_result
+}
+
+fn cancellation_payload(id: jsonrpc.RequestId) -> String {
+  let id = case id {
+    jsonrpc.StringId(value) -> json.string(value)
+    jsonrpc.IntId(value) -> json.int(value)
+  }
+  "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":"
+  <> json.to_string(id)
+  <> "}}"
+}
+
+fn modern_request(payload: String) -> Bool {
+  json.parse(
+    payload,
+    decode.at(
+      ["params", "_meta", "io.modelcontextprotocol/protocolVersion"],
+      decode.string,
+    ),
+  )
+  == Ok("2026-07-28")
+}
+
+fn has_subscription_id(payload: String) -> Bool {
+  json.parse(
+    payload,
+    decode.at(
+      ["params", "_meta", "io.modelcontextprotocol/subscriptionId"],
+      decode.dynamic,
+    ),
+  )
+  |> result.is_ok
 }
 
 fn send_server_message(
@@ -678,7 +998,7 @@ fn looks_like_jsonrpc_response(line: String) -> Bool {
     True -> has_id && has_jsonrpc
     False ->
       case has_error {
-        True -> has_id && has_jsonrpc
+        True -> has_jsonrpc
         False -> False
       }
   }
