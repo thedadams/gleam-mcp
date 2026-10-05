@@ -459,6 +459,7 @@ pub fn discover_with_sender(
     config,
     resource,
     urls,
+    hinted != None,
     send,
   ))
   use issuer <- result.try(select_issuer(config, metadata.authorization_servers))
@@ -544,6 +545,7 @@ fn fetch_resource_metadata(
   config: Config,
   resource: String,
   urls: List(String),
+  hinted: Bool,
   send: Sender,
 ) -> Result(ResourceMetadata, Error) {
   case urls {
@@ -552,7 +554,7 @@ fn fetch_resource_metadata(
       use _ <- result.try(validate_endpoint(config, url))
       case fetch_json(url, send) {
         Error(DiscoveryFailed(_)) | Error(HttpFailure) ->
-          fetch_resource_metadata(config, resource, rest, send)
+          fetch_resource_metadata(config, resource, rest, hinted, send)
         Error(error) -> Error(error)
         Ok(body) -> {
           use metadata <- result.try(
@@ -562,7 +564,13 @@ fn fetch_resource_metadata(
             )),
           )
           use claimed <- result.try(canonical_resource(metadata.resource))
-          case claimed != resource || metadata.authorization_servers == [] {
+          // A root well-known fallback describes the origin resource. A
+          // challenge URL instead describes the exact endpoint challenged.
+          let expected = case hinted {
+            True -> resource
+            False -> metadata_resource_for_url(resource, url)
+          }
+          case claimed != expected || metadata.authorization_servers == [] {
             True ->
               Error(InvalidMetadata(
                 "Resource mismatch or missing authorization servers",
@@ -584,6 +592,29 @@ fn fetch_resource_metadata(
       }
     }
   }
+}
+
+fn metadata_resource_for_url(resource: String, url: String) -> String {
+  let assert Ok(parsed) = uri.parse(resource)
+  let assert Ok(origin) = uri.origin(parsed)
+  let query = case parsed.query {
+    Some(query) -> "?" <> query
+    None -> ""
+  }
+  case url == origin <> "/.well-known/oauth-protected-resource" <> query {
+    True -> origin <> query
+    False -> resource
+  }
+}
+
+fn valid_discovery_resource(endpoint: String, advertised: String) -> Bool {
+  let assert Ok(parsed) = uri.parse(endpoint)
+  let assert Ok(origin) = uri.origin(parsed)
+  let query = case parsed.query {
+    Some(query) -> "?" <> query
+    None -> ""
+  }
+  advertised == endpoint || advertised == origin <> query
 }
 
 fn select_issuer(
@@ -675,6 +706,7 @@ pub fn begin(
 ) -> Result(PendingAuthorization, Error) {
   use resource <- result.try(validate_config(config))
   use _ <- result.try(validate_discovery(config, discovery, resource))
+  use resource <- result.try(canonical_resource(discovery.resource.resource))
   let metadata = discovery.authorization_server
   use _ <- result.try(client_authentication(config, metadata))
   use _ <- result.try(
@@ -875,6 +907,14 @@ fn exchange_verified(
     True -> {
       let config = pending.config
       use resource <- result.try(validate_config(config))
+      use _ <- result.try(validate_discovery(
+        config,
+        pending.discovery,
+        resource,
+      ))
+      use resource <- result.try(canonical_resource(
+        pending.discovery.resource.resource,
+      ))
       let assert Ok(endpoint) =
         uri.parse(pending.discovery.authorization_server.token_endpoint)
       let assert Ok(redirect) = uri.parse(config.redirect_uri)
@@ -953,6 +993,7 @@ pub fn refresh_with_sender(
       ))
       let assert Ok(endpoint) =
         uri.parse(discovery.authorization_server.token_endpoint)
+      use audience <- result.try(canonical_resource(discovery.resource.resource))
       use req <- result.try(
         token_request.to_http_request_with_modifiers(
           token_request.RefreshTokenGrantRequest(
@@ -963,7 +1004,7 @@ pub fn refresh_with_sender(
           ),
           [
             fn(req) {
-              Ok(request.set_body(req, [#("resource", resource), ..req.body]))
+              Ok(request.set_body(req, [#("resource", audience), ..req.body]))
             },
           ],
         )
@@ -1203,7 +1244,7 @@ fn validate_discovery(
     })
     |> option.unwrap(False)
   case
-    advertised != resource
+    !valid_discovery_resource(resource, advertised)
     || wrong_issuer
     || !list.contains(
       discovery.resource.authorization_servers,

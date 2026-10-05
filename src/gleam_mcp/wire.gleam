@@ -11,6 +11,7 @@ import gleam_mcp/actions
 import gleam_mcp/client/codec as client_codec
 import gleam_mcp/codec_common
 import gleam_mcp/jsonrpc.{type Value, VInt, VObject, VString}
+import gleam_mcp/mcp
 import gleam_mcp/server/codec as server_codec
 
 pub type CacheHint =
@@ -166,10 +167,10 @@ fn validate_result(
   version: String,
 ) -> Result(Nil, String) {
   let discriminator = dict.get(fields, "resultType")
-  use kind <- result.try(case discriminator, is_modern(version) {
-    Error(_), False -> Ok("complete")
-    Ok(VString(kind)), _ -> Ok(kind)
-    _, _ -> Error("Result requires a string resultType")
+  use kind <- result.try(case discriminator {
+    Error(_) -> Ok("complete")
+    Ok(VString(kind)) -> Ok(kind)
+    _ -> Error("Result requires a string resultType")
   })
   case kind {
     "complete" ->
@@ -261,7 +262,10 @@ pub fn decode_message_with_error(
   body: String,
   version: String,
 ) -> Result(server_codec.Message, codec_common.MessageDecodeError) {
-  use message <- result.try(server_codec.decode_message_with_error(body))
+  use message <- result.try(server_codec.decode_message_with_error_for_version(
+    body,
+    version,
+  ))
   case is_modern(version) {
     False -> Ok(message)
     True -> {
@@ -494,20 +498,7 @@ fn object_field(
 }
 
 fn removed_method(method: String) -> Bool {
-  case method {
-    "initialize"
-    | "notifications/initialized"
-    | "ping"
-    | "logging/setLevel"
-    | "resources/subscribe"
-    | "resources/unsubscribe"
-    | "tasks/list"
-    | "tasks/result"
-    | "notifications/tasks/status"
-    | "notifications/roots/list_changed"
-    | "notifications/elicitation/complete" -> True
-    _ -> False
-  }
+  list.contains(mcp.removed_modern_methods, method)
 }
 
 pub fn encode_response(

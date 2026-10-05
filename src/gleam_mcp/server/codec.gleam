@@ -29,6 +29,21 @@ pub fn decode_message(body: String) -> Result(Message, String) {
 pub fn decode_message_with_error(
   body: String,
 ) -> Result(Message, codec_common.MessageDecodeError) {
+  decode_message_diagnostic(body, None)
+}
+
+/// Classify removed methods before trying to decode their former parameters.
+pub fn decode_message_with_error_for_version(
+  body: String,
+  version: String,
+) -> Result(Message, codec_common.MessageDecodeError) {
+  decode_message_diagnostic(body, Some(version))
+}
+
+fn decode_message_diagnostic(
+  body: String,
+  version: Option(String),
+) -> Result(Message, codec_common.MessageDecodeError) {
   case json.parse(body, decode.dynamic) {
     Error(error) ->
       Error(codec_common.MessageDecodeError(
@@ -54,7 +69,7 @@ pub fn decode_message_with_error(
             jsonrpc.RpcError(-32_600, "Invalid JSON-RPC request", None),
           ))
         Ok(_) ->
-          case json.parse(body, message_decoder()) {
+          case json.parse(body, message_decoder_for_version(version)) {
             Ok(message) -> Ok(message)
             Error(error) -> {
               let method =
@@ -114,53 +129,69 @@ pub fn encode_server_response(
 }
 
 fn message_decoder() -> decode.Decoder(Message) {
+  message_decoder_for_version(None)
+}
+
+fn message_decoder_for_version(
+  version: Option(String),
+) -> decode.Decoder(Message) {
   use _ <- decode.then(codec_common.request_envelope_decoder())
   use _ <- decode.then(codec_common.request_parameters_decoder())
   let decoder =
     decode.then(decode.at(["method"], decode.string), fn(method) {
-      case method {
-        "server/discover" ->
-          decode_optional_request_message(
-            mcp.method_discover,
-            None,
-            request_meta_only_decoder(),
-            actions.ClientRequestDiscover,
-          )
-        "subscriptions/listen" ->
-          decode_required_request_message(
-            mcp.method_subscriptions_listen,
-            subscriptions_listen_params_decoder(),
-            actions.ClientRequestSubscriptionsListen,
-          )
-        "tasks/update" ->
-          decode_required_request_message(
-            mcp.method_update_task,
-            task_update_params_decoder(),
-            actions.ClientRequestUpdateTask,
-          )
-        "initialize" -> initialize_message_decoder()
-        "ping" -> ping_message_decoder()
-        "resources/list" -> list_resources_message_decoder()
-        "resources/templates/list" -> list_resource_templates_message_decoder()
-        "resources/read" -> read_resource_message_decoder()
-        "resources/subscribe" -> subscribe_resource_message_decoder()
-        "resources/unsubscribe" -> unsubscribe_resource_message_decoder()
-        "prompts/list" -> list_prompts_message_decoder()
-        "prompts/get" -> get_prompt_message_decoder()
-        "tools/list" -> list_tools_message_decoder()
-        "tools/call" -> call_tool_message_decoder()
-        "tasks/list" -> list_tasks_message_decoder()
-        "tasks/get" -> get_task_message_decoder()
-        "tasks/result" -> get_task_result_message_decoder()
-        "tasks/cancel" -> cancel_task_message_decoder()
-        "completion/complete" -> complete_message_decoder()
-        "logging/setLevel" -> set_logging_level_message_decoder()
-        "notifications/initialized" -> initialized_notification_decoder()
-        "notifications/cancelled"
-        | "notifications/progress"
-        | "notifications/roots/list_changed"
-        | "notifications/tasks/status" -> client_notification_message_decoder()
-        _ -> unknown_message_decoder(method)
+      case
+        version == Some(jsonrpc.latest_protocol_version)
+        && list.contains(mcp.removed_modern_methods, method)
+      {
+        True -> unknown_message_decoder(method)
+        False -> {
+          case method {
+            "server/discover" ->
+              decode_optional_request_message(
+                mcp.method_discover,
+                None,
+                request_meta_only_decoder(),
+                actions.ClientRequestDiscover,
+              )
+            "subscriptions/listen" ->
+              decode_required_request_message(
+                mcp.method_subscriptions_listen,
+                subscriptions_listen_params_decoder(),
+                actions.ClientRequestSubscriptionsListen,
+              )
+            "tasks/update" ->
+              decode_required_request_message(
+                mcp.method_update_task,
+                task_update_params_decoder(),
+                actions.ClientRequestUpdateTask,
+              )
+            "initialize" -> initialize_message_decoder()
+            "ping" -> ping_message_decoder()
+            "resources/list" -> list_resources_message_decoder()
+            "resources/templates/list" ->
+              list_resource_templates_message_decoder()
+            "resources/read" -> read_resource_message_decoder()
+            "resources/subscribe" -> subscribe_resource_message_decoder()
+            "resources/unsubscribe" -> unsubscribe_resource_message_decoder()
+            "prompts/list" -> list_prompts_message_decoder()
+            "prompts/get" -> get_prompt_message_decoder()
+            "tools/list" -> list_tools_message_decoder()
+            "tools/call" -> call_tool_message_decoder()
+            "tasks/list" -> list_tasks_message_decoder()
+            "tasks/get" -> get_task_message_decoder()
+            "tasks/result" -> get_task_result_message_decoder()
+            "tasks/cancel" -> cancel_task_message_decoder()
+            "completion/complete" -> complete_message_decoder()
+            "logging/setLevel" -> set_logging_level_message_decoder()
+            "notifications/initialized" -> initialized_notification_decoder()
+            "notifications/cancelled"
+            | "notifications/progress"
+            | "notifications/roots/list_changed"
+            | "notifications/tasks/status" ->
+              client_notification_message_decoder()
+            _ -> unknown_message_decoder(method)
+          }
+        }
       }
     })
   decode.then(decoder, attach_input_responses)

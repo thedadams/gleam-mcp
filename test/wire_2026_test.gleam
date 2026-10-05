@@ -6,7 +6,7 @@ import gleam_mcp/wire
 import gleeunit/should
 
 pub fn main() {
-  results_require_a_known_discriminator_in_modern_mode_test()
+  results_default_to_complete_and_validate_explicit_discriminators_test()
   modern_continuations_require_input_or_opaque_state_test()
   result_encoding_adds_identity_and_conservative_cache_defaults_test()
   explicit_cache_hints_survive_encoding_and_decoding_test()
@@ -19,7 +19,7 @@ pub fn main() {
   task_results_are_restricted_to_negotiated_tool_calls_test()
 }
 
-pub fn results_require_a_known_discriminator_in_modern_mode_test() {
+pub fn results_default_to_complete_and_validate_explicit_discriminators_test() {
   let request = tool_call()
   wire.decode_response(
     response("{\"content\":[]}"),
@@ -29,6 +29,14 @@ pub fn results_require_a_known_discriminator_in_modern_mode_test() {
   |> should.be_ok
   wire.decode_response(
     response("{\"content\":[]}"),
+    request,
+    jsonrpc.latest_protocol_version,
+  )
+  |> should.be_ok
+  wire.decode_response(response("{}"), request, jsonrpc.latest_protocol_version)
+  |> should.be_error
+  wire.decode_response(
+    response("{\"resultType\":12,\"content\":[]}"),
     request,
     jsonrpc.latest_protocol_version,
   )

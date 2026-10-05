@@ -337,6 +337,74 @@ pub fn pinned_modern_discovery_never_initializes_legacy_test() {
   should.equal(process.receive(called, 0), Error(Nil))
 }
 
+pub fn modern_discovery_retries_supported_version_once_with_fresh_id_test() {
+  let reject = process.new_subject()
+  let ids = process.new_subject()
+  process.send(reject, Nil)
+  let app =
+    mocked_client(capabilities.none(), fn(_, request) {
+      let assert jsonrpc.Request(id, method, _) = request
+      should.equal(method, "server/discover")
+      process.send(ids, id)
+      let response = case process.receive(reject, 0) {
+        Ok(_) -> jsonrpc.ErrorResponse(Some(id), supported_modern_error())
+        Error(_) ->
+          jsonrpc.ResultResponse(
+            id,
+            actions.ClientResultDiscover(actions.DiscoverResult(
+              [jsonrpc.latest_protocol_version],
+              dict.new(),
+              None,
+              None,
+            )),
+          )
+      }
+      Ok(transport.TransportResponse(response, None))
+    })
+    |> client.with_protocol_version(jsonrpc.latest_protocol_version)
+  let #(app, _) = client.connect(app, implementation()) |> should.be_ok
+  let first = process.receive(ids, 0) |> should.be_ok
+  let second = process.receive(ids, 0) |> should.be_ok
+  should.be_true(first != second)
+  should.equal(process.receive(ids, 0), Error(Nil))
+  let #(_, result) = client.close(app)
+  result |> should.be_ok
+}
+
+pub fn modern_discovery_never_retries_version_rejection_indefinitely_test() {
+  let ids = process.new_subject()
+  let app =
+    mocked_client(capabilities.none(), fn(_, request) {
+      let assert jsonrpc.Request(id, _, _) = request
+      process.send(ids, id)
+      Ok(transport.TransportResponse(
+        jsonrpc.ErrorResponse(Some(id), supported_modern_error()),
+        None,
+      ))
+    })
+    |> client.with_protocol_version(jsonrpc.latest_protocol_version)
+  client.connect(app, implementation()) |> should.be_error
+  process.receive(ids, 0) |> should.be_ok
+  process.receive(ids, 0) |> should.be_ok
+  should.equal(process.receive(ids, 0), Error(Nil))
+}
+
+fn supported_modern_error() {
+  jsonrpc.RpcError(
+    -32_022,
+    "Unsupported",
+    Some(
+      jsonrpc.VObject([
+        #(
+          "supported",
+          jsonrpc.VArray([jsonrpc.VString(jsonrpc.latest_protocol_version)]),
+        ),
+        #("requested", jsonrpc.VString(jsonrpc.latest_protocol_version)),
+      ]),
+    ),
+  )
+}
+
 pub fn mrtr_state_only_rounds_are_bounded_and_use_new_ids_test() {
   let called = process.new_subject()
   let app =

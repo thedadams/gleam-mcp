@@ -2,6 +2,7 @@ import gleam/bit_array
 import gleam/bytes_tree
 import gleam/crypto
 import gleam/dict
+import gleam/erlang/atom
 import gleam/erlang/process
 import gleam/http
 import gleam/http/request
@@ -23,6 +24,8 @@ import gleam_mcp/server/codec
 import gleam_mcp/server/oauth
 import gleam_mcp/server/streamable_http_store
 import gleam_mcp/wire
+import glisten/socket/options
+import glisten/transport as socket_transport
 import mist
 import youid/uuid
 
@@ -202,9 +205,11 @@ fn valid_origin(server: server.Server, req: request.Request(body)) -> Bool {
 
 fn valid_protocol_header(req: request.Request(body)) -> Bool {
   case request.get_header(req, "mcp-protocol-version") {
-    Ok(version) ->
+    Ok(value) -> {
+      let version = http_headers.trim_ows(value)
       version == jsonrpc.latest_protocol_version
       || version == jsonrpc.legacy_protocol_version
+    }
     // The specification's legacy default is unsupported by this SDK. Allow
     // initial handshakes without the header; sessions always require it.
     Error(_) -> request_session_id(req) == None
@@ -213,7 +218,8 @@ fn valid_protocol_header(req: request.Request(body)) -> Bool {
 
 fn modern_header(req: request.Request(body)) -> Bool {
   case request.get_header(req, "mcp-protocol-version") {
-    Ok(version) -> version != jsonrpc.legacy_protocol_version
+    Ok(version) ->
+      http_headers.trim_ows(version) != jsonrpc.legacy_protocol_version
     Error(_) -> False
   }
 }
@@ -357,7 +363,15 @@ fn handle_post_body(
   middleware: ClientActionMiddleware,
   principal: Option(String),
 ) -> response.Response(mist.ResponseData) {
-  case codec.decode_message_with_error(body) {
+  let decoded = case modern_header(req) || wire.claims_modern(body) {
+    True ->
+      codec.decode_message_with_error_for_version(
+        body,
+        jsonrpc.latest_protocol_version,
+      )
+    False -> codec.decode_message_with_error(body)
+  }
+  case decoded {
     Ok(message) -> {
       case
         modern_header(req)
@@ -526,7 +540,32 @@ type ModernSseState {
 
 type ModernBridgeMessage {
   ResultReady(Result(actions.ClientActionResult, jsonrpc.RpcError))
+  EventReady(streamable_http_store.ListenerMessage)
   ConnectionClosed
+}
+
+type ModernOpening {
+  OpeningError(jsonrpc.RpcError)
+  OpeningStream(process.Subject(ModernAttachment))
+}
+
+type ModernAttachment {
+  AttachModernListener(
+    process.Subject(streamable_http_store.ListenerMessage),
+    process.Subject(Nil),
+  )
+  ActivateModernListener
+}
+
+type ModernAttachmentMessage {
+  Attached(ModernAttachment)
+  AttachmentOwnerClosed
+}
+
+type ModernOpeningMessage {
+  Opened(ModernOpening)
+  OpeningBridgeClosed
+  OpeningConnectionClosed
 }
 
 fn handle_modern_streamed_request(
@@ -536,138 +575,386 @@ fn handle_modern_streamed_request(
   request: jsonrpc.Request(actions.ClientActionRequest),
 ) -> response.Response(mist.ResponseData) {
   let assert jsonrpc.Request(id, _, _) = request
-  mist.server_sent_events(
-    req,
-    response.new(200)
-      |> response.set_header(
-        "mcp-protocol-version",
-        jsonrpc.latest_protocol_version,
-      )
-      |> response.set_header("x-accel-buffering", "no"),
-    fn(listener) {
-      let assert server.ModernRequestContext(..) = context
-      let context =
-        server.ModernRequestContext(..context, notifications: Some(listener))
-      let listen = case request {
-        jsonrpc.Request(
-          _,
-          _,
-          Some(actions.ClientRequestSubscriptionsListen(params)),
-        ) -> Some(params)
-        _ -> None
+  let opening = process.new_subject()
+  let registered = process.new_subject()
+  let owner = process.self()
+  let bridge =
+    process.spawn_unlinked(fn() {
+      start_modern_bridge(app, context, request, owner, opening, registered)
+    })
+  let monitor = process.monitor(bridge)
+  // A cancellation must follow runtime registration. Once the request has
+  // registered, enable close events even while this connection's handler waits
+  // for the first result, before any response headers have been written.
+  let registration =
+    process.new_selector()
+    |> process.select_map(registered, fn(_) { True })
+    |> process.select_specific_monitor(monitor, fn(_) { False })
+    |> process.selector_receive_forever
+  let selector =
+    process.new_selector()
+    |> process.select_map(opening, Opened)
+    |> process.select_specific_monitor(monitor, fn(_) { OpeningBridgeClosed })
+    |> process.select_record(atom.create("tcp_closed"), 1, fn(_) {
+      OpeningConnectionClosed
+    })
+    |> process.select_record(atom.create("ssl_closed"), 1, fn(_) {
+      OpeningConnectionClosed
+    })
+    |> process.select_record(atom.create("tcp_error"), 2, fn(_) {
+      OpeningConnectionClosed
+    })
+    |> process.select_record(atom.create("ssl_error"), 2, fn(_) {
+      OpeningConnectionClosed
+    })
+  let first = case registration {
+    False -> OpeningBridgeClosed
+    True -> {
+      case
+        socket_transport.set_opts(req.body.transport, req.body.socket, [
+          options.ActiveMode(options.Once),
+        ])
+      {
+        Ok(_) -> process.selector_receive_forever(selector)
+        Error(_) -> OpeningConnectionClosed
       }
-      case listen {
-        Some(params) -> {
-          case server.listen_subscription(app, context, params) {
-            Ok(_) -> Nil
-            Error(error) ->
-              process.send(
+    }
+  }
+  process.demonitor_process(monitor)
+  case first {
+    Opened(OpeningError(error)) ->
+      modern_json_response(
+        app,
+        modern_response_status(jsonrpc.ErrorResponse(Some(id), error)),
+        jsonrpc.ErrorResponse(Some(id), error),
+      )
+    OpeningBridgeClosed -> {
+      server.cancel_incoming_request(app, context, id)
+      modern_json_response(
+        app,
+        200,
+        jsonrpc.ErrorResponse(
+          Some(id),
+          jsonrpc.RpcError(-32_603, "Response bridge stopped", None),
+        ),
+      )
+    }
+    OpeningConnectionClosed -> {
+      server.cancel_incoming_request(app, context, id)
+      process.kill(bridge)
+      response.new(204) |> response.set_body(mist.Bytes(bytes_tree.new()))
+    }
+    Opened(OpeningStream(attachment)) ->
+      modern_sse_response(app, req, context, id, attachment)
+  }
+}
+
+// Wait before committing SSE's HTTP 200. A handler may discover a missing
+// capability while constructing its result, after request validation succeeded.
+// Notifications and successful final results still use the streaming response.
+fn start_modern_bridge(
+  app: server.Server,
+  context: server.RequestContext,
+  request: jsonrpc.Request(actions.ClientActionRequest),
+  owner: process.Pid,
+  opening: process.Subject(ModernOpening),
+  registered: process.Subject(Nil),
+) -> Nil {
+  let assert jsonrpc.Request(id, _, _) = request
+  let listener = process.new_subject()
+  let reply = process.new_subject()
+  let attachment = process.new_subject()
+  let owner_monitor = process.monitor(owner)
+  let assert server.ModernRequestContext(..) = context
+  let context =
+    server.ModernRequestContext(..context, notifications: Some(listener))
+  case request {
+    jsonrpc.Request(
+      _,
+      _,
+      Some(actions.ClientRequestSubscriptionsListen(params)),
+    ) -> {
+      case server.listen_subscription(app, context, params) {
+        Ok(_) -> Nil
+        Error(error) -> process.send(reply, Error(error))
+      }
+    }
+    _ -> server.start_request_with_context(app, context, request, reply)
+  }
+  process.send(registered, Nil)
+  let selector =
+    process.new_selector()
+    |> process.select_map(reply, ResultReady)
+    |> process.select_map(listener, EventReady)
+    |> process.select_specific_monitor(owner_monitor, fn(_) { ConnectionClosed })
+  await_modern_opening(
+    app,
+    context,
+    id,
+    opening,
+    attachment,
+    selector,
+    owner_monitor,
+  )
+}
+
+fn await_modern_opening(
+  app: server.Server,
+  context: server.RequestContext,
+  id: jsonrpc.RequestId,
+  opening: process.Subject(ModernOpening),
+  attachment: process.Subject(ModernAttachment),
+  selector: process.Selector(ModernBridgeMessage),
+  owner_monitor: process.Monitor,
+) -> Nil {
+  case process.selector_receive_forever(selector) {
+    ConnectionClosed -> server.cancel_incoming_request(app, context, id)
+    ResultReady(Error(error)) -> {
+      process.demonitor_process(owner_monitor)
+      process.send(opening, OpeningError(error))
+    }
+    ResultReady(Ok(value)) -> {
+      let first = modern_result_event(app, id, Ok(value))
+      process.send(opening, OpeningStream(attachment))
+      attach_modern_bridge(
+        app,
+        context,
+        id,
+        attachment,
+        selector,
+        owner_monitor,
+        first,
+      )
+    }
+    EventReady(streamable_http_store.DeliverRequest(_))
+    | EventReady(streamable_http_store.DeliverResponse("")) ->
+      await_modern_opening(
+        app,
+        context,
+        id,
+        opening,
+        attachment,
+        selector,
+        owner_monitor,
+      )
+    EventReady(streamable_http_store.CloseListener) -> {
+      process.demonitor_process(owner_monitor)
+      process.send(
+        opening,
+        OpeningError(jsonrpc.RpcError(-32_603, "Request cancelled", None)),
+      )
+      server.cancel_incoming_request(app, context, id)
+    }
+    EventReady(first) -> {
+      process.send(opening, OpeningStream(attachment))
+      attach_modern_bridge(
+        app,
+        context,
+        id,
+        attachment,
+        selector,
+        owner_monitor,
+        first,
+      )
+    }
+  }
+}
+
+// The bridge owns notification/result subjects throughout the handoff, so
+// messages sent before the SSE actor exists remain in its mailbox in order.
+fn attach_modern_bridge(
+  app: server.Server,
+  context: server.RequestContext,
+  id: jsonrpc.RequestId,
+  attachment: process.Subject(ModernAttachment),
+  selector: process.Selector(ModernBridgeMessage),
+  owner_monitor: process.Monitor,
+  first: streamable_http_store.ListenerMessage,
+) -> Nil {
+  let attachments =
+    process.new_selector()
+    |> process.select_map(attachment, Attached)
+    |> process.select_specific_monitor(owner_monitor, fn(_) {
+      AttachmentOwnerClosed
+    })
+  case process.selector_receive(attachments, 1000) {
+    Ok(Attached(AttachModernListener(listener, ready))) -> {
+      process.demonitor_process(owner_monitor)
+      let assert Ok(owner) = process.subject_owner(listener)
+      let monitor = process.monitor(owner)
+      let selector =
+        selector
+        |> process.deselect_specific_monitor(owner_monitor)
+        |> process.select_specific_monitor(monitor, fn(_) { ConnectionClosed })
+      process.send(ready, Nil)
+      // Mist transfers the socket after its actor's initialiser returns. Do
+      // not deliver a final result until that transfer has completed: the actor
+      // may stop as soon as it receives the result.
+      let activation =
+        process.new_selector()
+        |> process.select_map(attachment, Attached)
+        |> process.select_specific_monitor(monitor, fn(_) {
+          AttachmentOwnerClosed
+        })
+      case process.selector_receive(activation, 1000) {
+        Ok(Attached(ActivateModernListener)) -> {
+          process.send(listener, first)
+          case first {
+            streamable_http_store.DeliverResponse(_) ->
+              process.demonitor_process(monitor)
+            _ ->
+              forward_modern_bridge(
+                app,
+                context,
+                id,
                 listener,
-                streamable_http_store.DeliverResponse(wire.encode_response(
-                  jsonrpc.ErrorResponse(Some(id), error),
-                  jsonrpc.latest_protocol_version,
-                  server.implementation(app),
-                )),
+                selector,
+                monitor,
               )
           }
         }
-        None -> {
-          let owner = process.self()
-          let _ =
-            process.spawn_unlinked(fn() {
-              let reply = process.new_subject()
-              let monitor = process.monitor(owner)
-              server.start_request_with_context(app, context, request, reply)
-              let selector =
-                process.new_selector()
-                |> process.select_map(reply, ResultReady)
-                |> process.select_specific_monitor(monitor, fn(_) {
-                  ConnectionClosed
-                })
-              case process.selector_receive_forever(selector) {
-                ResultReady(outcome) -> {
-                  process.demonitor_process(monitor)
-                  let rpc = case outcome {
-                    Ok(value) -> jsonrpc.ResultResponse(id, value)
-                    Error(error) -> jsonrpc.ErrorResponse(Some(id), error)
-                  }
-                  process.send(
-                    listener,
-                    streamable_http_store.DeliverResponse(wire.encode_response(
-                      rpc,
-                      jsonrpc.latest_protocol_version,
-                      server.implementation(app),
-                    )),
-                  )
-                }
-                ConnectionClosed ->
-                  server.cancel_incoming_request(app, context, id)
-              }
-            })
-          Nil
+        _ -> {
+          process.demonitor_process(monitor)
+          server.cancel_incoming_request(app, context, id)
         }
       }
-      let _ =
-        process.send_after(
-          listener,
-          1000,
-          streamable_http_store.DeliverResponse(""),
-        )
-      ModernSseState(app, context, listener)
-    },
-    fn(state, message, connection) {
+    }
+    _ -> {
+      process.demonitor_process(owner_monitor)
+      server.cancel_incoming_request(app, context, id)
+    }
+  }
+}
+
+fn forward_modern_bridge(
+  app: server.Server,
+  context: server.RequestContext,
+  id: jsonrpc.RequestId,
+  listener: process.Subject(streamable_http_store.ListenerMessage),
+  selector: process.Selector(ModernBridgeMessage),
+  monitor: process.Monitor,
+) -> Nil {
+  case process.selector_receive_forever(selector) {
+    ConnectionClosed -> server.cancel_incoming_request(app, context, id)
+    ResultReady(outcome) -> {
+      process.demonitor_process(monitor)
+      process.send(listener, modern_result_event(app, id, outcome))
+    }
+    EventReady(message) -> {
+      process.send(listener, message)
       case message {
-        streamable_http_store.DeliverRequest(_) -> actor.continue(state)
-        streamable_http_store.DeliverNotification(notification) -> {
-          case
-            mist.send_event(
-              connection,
-              mist.event(
-                client_codec.encode_notification(notification)
-                |> string_tree.from_string,
-              ),
-            )
-          {
-            Ok(_) -> actor.continue(state)
-            Error(_) -> {
-              server.cancel_incoming_request(state.app, state.context, id)
-              actor.stop()
-            }
-          }
-        }
-        streamable_http_store.DeliverResponse("") -> {
-          case mist.send_event(connection, mist.event(string_tree.new())) {
-            Ok(_) -> {
-              let _ =
-                process.send_after(
-                  state.listener,
-                  1000,
-                  streamable_http_store.DeliverResponse(""),
-                )
-              actor.continue(state)
-            }
-            Error(_) -> {
-              server.cancel_incoming_request(state.app, state.context, id)
-              actor.stop()
-            }
-          }
-        }
-        streamable_http_store.DeliverResponse(payload) -> {
-          let _ =
-            mist.send_event(
-              connection,
-              mist.event(string_tree.from_string(payload)),
-            )
-          server.cancel_incoming_request(state.app, state.context, id)
-          actor.stop()
-        }
+        streamable_http_store.DeliverResponse(payload) if payload != "" ->
+          process.demonitor_process(monitor)
         streamable_http_store.CloseListener -> {
-          server.cancel_incoming_request(state.app, state.context, id)
-          actor.stop()
+          process.demonitor_process(monitor)
+          server.cancel_incoming_request(app, context, id)
         }
+        _ ->
+          forward_modern_bridge(app, context, id, listener, selector, monitor)
       }
-    },
-  )
+    }
+  }
+}
+
+fn modern_result_event(
+  app: server.Server,
+  id: jsonrpc.RequestId,
+  outcome: Result(actions.ClientActionResult, jsonrpc.RpcError),
+) -> streamable_http_store.ListenerMessage {
+  let rpc = case outcome {
+    Ok(value) -> jsonrpc.ResultResponse(id, value)
+    Error(error) -> jsonrpc.ErrorResponse(Some(id), error)
+  }
+  streamable_http_store.DeliverResponse(wire.encode_response(
+    rpc,
+    jsonrpc.latest_protocol_version,
+    server.implementation(app),
+  ))
+}
+
+fn modern_sse_response(
+  app: server.Server,
+  req: request.Request(mist.Connection),
+  context: server.RequestContext,
+  id: jsonrpc.RequestId,
+  attachment: process.Subject(ModernAttachment),
+) -> response.Response(mist.ResponseData) {
+  let response =
+    mist.server_sent_events(
+      req,
+      response.new(200)
+        |> response.set_header(
+          "mcp-protocol-version",
+          jsonrpc.latest_protocol_version,
+        )
+        |> response.set_header("x-accel-buffering", "no"),
+      fn(listener) {
+        let ready = process.new_subject()
+        process.send(attachment, AttachModernListener(listener, ready))
+        let assert Ok(Nil) = process.receive(ready, 1000)
+        let _ =
+          process.send_after(
+            listener,
+            1000,
+            streamable_http_store.DeliverResponse(""),
+          )
+        ModernSseState(app, context, listener)
+      },
+      fn(state, message, connection) {
+        case message {
+          streamable_http_store.DeliverRequest(_) -> actor.continue(state)
+          streamable_http_store.DeliverNotification(notification) -> {
+            case
+              mist.send_event(
+                connection,
+                mist.event(
+                  client_codec.encode_notification(notification)
+                  |> string_tree.from_string,
+                ),
+              )
+            {
+              Ok(_) -> actor.continue(state)
+              Error(_) -> {
+                server.cancel_incoming_request(state.app, state.context, id)
+                actor.stop()
+              }
+            }
+          }
+          streamable_http_store.DeliverResponse("") -> {
+            case mist.send_event(connection, mist.event(string_tree.new())) {
+              Ok(_) -> {
+                let _ =
+                  process.send_after(
+                    state.listener,
+                    1000,
+                    streamable_http_store.DeliverResponse(""),
+                  )
+                actor.continue(state)
+              }
+              Error(_) -> {
+                server.cancel_incoming_request(state.app, state.context, id)
+                actor.stop()
+              }
+            }
+          }
+          streamable_http_store.DeliverResponse(payload) -> {
+            let _ =
+              mist.send_event(
+                connection,
+                mist.event(string_tree.from_string(payload)),
+              )
+            server.cancel_incoming_request(state.app, state.context, id)
+            actor.stop()
+          }
+          streamable_http_store.CloseListener -> {
+            server.cancel_incoming_request(state.app, state.context, id)
+            actor.stop()
+          }
+        }
+      },
+    )
+  process.send(attachment, ActivateModernListener)
+  response
 }
 
 fn modern_json_response(

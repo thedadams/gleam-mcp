@@ -246,26 +246,44 @@ pub fn encode_value(value: String) -> String {
 }
 
 pub fn decode_value(value: String) -> Result(String, String) {
-  use _ <- result.try(
-    case value == string.trim(value) && safe_bytes(<<value:utf8>>) {
-      True -> Ok(Nil)
-      False -> Error("Invalid plain HTTP header value")
-    },
-  )
+  let value = trim_ows(value)
+  use _ <- result.try(case safe_bytes(<<value:utf8>>) {
+    True -> Ok(Nil)
+    False -> Error("Invalid plain HTTP header value")
+  })
   case string.starts_with(value, "=?base64?") && string.ends_with(value, "?=") {
     True -> {
+      let encoded = value |> string.drop_start(9) |> string.drop_end(2)
       use bytes <- result.try(
-        value
-        |> string.drop_start(9)
-        |> string.drop_end(2)
+        encoded
         |> bit_array.base64_decode
         |> result.map_error(fn(_) { "Invalid Base64 header sentinel" }),
       )
+      use _ <- result.try(case bit_array.base64_encode(bytes, True) == encoded {
+        True -> Ok(Nil)
+        False -> Error("Invalid Base64 header sentinel")
+      })
       bit_array.to_string(bytes)
       |> result.map_error(fn(_) { "Header sentinel does not contain UTF-8" })
     }
     False -> Ok(value)
   }
+}
+
+/// HTTP field parsing removes only optional SP and HTAB at the boundaries.
+/// Other whitespace remains visible to the ASCII/control validation.
+pub fn trim_ows(value: String) -> String {
+  value
+  |> string.to_graphemes
+  |> list.drop_while(is_ows)
+  |> list.reverse
+  |> list.drop_while(is_ows)
+  |> list.reverse
+  |> string.concat
+}
+
+fn is_ows(value: String) -> Bool {
+  value == " " || value == "\t"
 }
 
 pub fn standard(
@@ -310,7 +328,7 @@ fn find_header(
 ) -> Result(Option(String), String) {
   case list.filter(headers, fn(header) { string.lowercase(header.0) == name }) {
     [] -> Ok(None)
-    [#(_, value)] -> Ok(Some(value))
+    [#(_, value)] -> Ok(Some(trim_ows(value)))
     _ -> Error("Duplicate mirrored HTTP header: " <> name)
   }
 }
@@ -329,7 +347,7 @@ fn compare_required(
   use actual <- result.try(case encoded {
     True -> decode_value(header)
     False ->
-      case header == string.trim(header) && safe_bytes(<<header:utf8>>) {
+      case safe_bytes(<<header:utf8>>) {
         True -> Ok(header)
         False -> Error("Invalid HTTP header: " <> name)
       }

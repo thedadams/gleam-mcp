@@ -46,13 +46,57 @@ pub fn header_encoding_handles_unicode_controls_and_literal_sentinels_test() {
     },
   )
   should.equal(http_headers.encode_value("plain ASCII"), "plain ASCII")
-  list.each(
-    ["=?base64?bad!?=", "=?base64?/w==?=", "raw\r\n", "é", " padded "],
-    fn(value) { http_headers.decode_value(value) |> should.be_error },
-  )
+  list.each(["=?base64?bad!?=", "=?base64?/w==?=", "raw\r\n", "é"], fn(value) {
+    http_headers.decode_value(value) |> should.be_error
+  })
   let encoded =
     "=?base64?" <> bit_array.base64_encode(<<"é":utf8>>, True) <> "?="
   should.equal(http_headers.encode_value("é"), encoded)
+}
+
+pub fn header_decoding_trims_only_http_optional_whitespace_test() {
+  http_headers.decode_value(" \tAlice\t ") |> should.equal(Ok("Alice"))
+  http_headers.decode_value(" \t=?base64?IHBhZGRlZCA=?=\t ")
+  |> should.equal(Ok(" padded "))
+  list.each(
+    ["\rAlice", "Alice\n", "\u{000b}Alice", "\u{00a0}Alice", "Alice\u{2003}"],
+    fn(value) { http_headers.decode_value(value) |> should.be_error },
+  )
+  http_headers.validate_standard(
+    [
+      #("MCP-PROTOCOL-VERSION", " \t2026-07-28\t "),
+      #("MCP-METHOD", "\t tools/call \t"),
+      #("MCP-NAME", "  echo\t"),
+    ],
+    "2026-07-28",
+    "tools/call",
+    Some("echo"),
+  )
+  |> should.be_ok
+  http_headers.validate_parameters(
+    [#("Mcp-Param-Value", " \tAlice\t ")],
+    schema([#("value", annotation("Value", "string"))]),
+    VObject([#("value", VString("Alice"))]),
+  )
+  |> should.be_ok
+}
+
+pub fn header_sentinels_require_padded_base64_alphabet_test() {
+  http_headers.decode_value("=?base64?SGVsbG8=?=") |> should.equal(Ok("Hello"))
+  list.each(
+    [
+      "=?base64?SGVsbG8?=",
+      "=?base64?SGVs!!!bG8=?=",
+      "=?base64?SGVs bG8=?=",
+      "=?base64?SGVsbG8===?=",
+      "=?base64?SGVsbG9=?=",
+    ],
+    fn(value) { http_headers.decode_value(value) |> should.be_error },
+  )
+  // Only a complete sentinel is interpreted as encoded data.
+  http_headers.decode_value("SGVsbG8=") |> should.equal(Ok("SGVsbG8="))
+  http_headers.decode_value("=?base64?SGVsbG8=")
+  |> should.equal(Ok("=?base64?SGVsbG8="))
 }
 
 pub fn invalid_header_annotations_are_rejected_test() {

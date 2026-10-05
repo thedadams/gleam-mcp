@@ -240,7 +240,11 @@ pub fn resource_and_oidc_discovery_follows_required_fallback_order_test() {
       process.send(requests, uri.to_string(request.to_uri(req)))
       case req.path {
         "/.well-known/oauth-protected-resource" ->
-          Ok(json_response(resource_document(resource, [issuer])))
+          Ok(
+            json_response(
+              resource_document("https://mcp.example.test", [issuer]),
+            ),
+          )
         "/tenant/.well-known/openid-configuration" ->
           Ok(json_response(authorization_document(issuer, ["S256"])))
         _ -> Ok(response.new(404) |> response.set_body(""))

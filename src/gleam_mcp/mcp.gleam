@@ -74,6 +74,20 @@ pub const method_notify_cancelled = "notifications/cancelled"
 
 pub const method_notify_progress = "notifications/progress"
 
+pub const removed_modern_methods = [
+  "initialize",
+  "notifications/initialized",
+  "ping",
+  "logging/setLevel",
+  "resources/subscribe",
+  "resources/unsubscribe",
+  "tasks/list",
+  "tasks/result",
+  "notifications/tasks/status",
+  "notifications/roots/list_changed",
+  "notifications/elicitation/complete",
+]
+
 pub type Message {
   Request(id: RequestId, method: String, params: Option(Dict(String, Value)))
   Notification(method: String, params: Option(Dict(String, Value)))

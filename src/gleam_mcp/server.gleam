@@ -961,6 +961,15 @@ pub fn validate_modern_request(
     }
     actions.ClientRequestSubscriptionsListen(params) ->
       validate_subscription_filter(params.notifications)
+    actions.ClientRequestCallTool(params) -> {
+      use _ <- result.try(check_client_request_capability(server, action))
+      case
+        tool_descriptor(server, params.name) |> option.then(tool_task_support)
+      {
+        Some(actions.TaskRequired) -> require_task_extension(server, context)
+        _ -> Ok(Nil)
+      }
+    }
     actions.ClientRequestInitialize(_)
     | actions.ClientRequestPing(_)
     | actions.ClientRequestSubscribeResource(_)
@@ -1594,6 +1603,29 @@ fn require_input_capability(
           None -> jsonrpc.VObject([])
         }),
       )
+  }
+}
+
+/// Execute a registered tool from a custom request handler without calling that
+/// handler again. The current request context retains caller metadata, runtime
+/// cancellation, and notification gating; task dispatch follows the negotiated
+/// protocol and the tool's declared task support.
+pub fn dispatch_registered_tool(
+  server: Server,
+  context: RequestContext,
+  params: actions.CallToolRequestParams,
+) -> Result(actions.ClientActionResult, jsonrpc.RpcError) {
+  case is_modern_context(context) {
+    True -> {
+      use _ <- result.try(validate_modern_request(
+        server,
+        context,
+        actions.ClientRequestCallTool(params),
+      ))
+      modern_call_tool(server, context, params)
+    }
+    False ->
+      dispatch_request(server, context, actions.ClientRequestCallTool(params))
   }
 }
 

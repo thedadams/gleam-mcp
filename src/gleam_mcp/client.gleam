@@ -6,6 +6,7 @@ import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
+import gleam/time/timestamp
 import gleam_mcp/actions.{
   type ActionNotification, type ClientActionRequest, type ClientActionResult,
   type Implementation,
@@ -236,6 +237,26 @@ fn connect_modern(
     True -> transport_timeout(client)
     False -> client.discovery_timeout_ms
   }
+  connect_modern_attempt(client, info, True, clock_ms() + timeout)
+}
+
+fn clock_ms() -> Int {
+  let #(seconds, nanoseconds) =
+    timestamp.system_time() |> timestamp.to_unix_seconds_and_nanoseconds
+  seconds * 1000 + nanoseconds / 1_000_000
+}
+
+fn connect_modern_attempt(
+  client: Client,
+  info: Implementation,
+  retry_version: Bool,
+  deadline: Int,
+) -> Result(#(Client, ConnectionInfo), ClientError) {
+  let timeout = deadline - clock_ms()
+  use _ <- result.try(case timeout > 0 {
+    True -> Ok(Nil)
+    False -> Error(Transport(transport.TimeoutError))
+  })
   let #(probed, response) =
     send_request(
       with_request_timeout(client, timeout),
@@ -277,13 +298,24 @@ fn connect_modern(
       }
     }
     Ok(jsonrpc.ErrorResponse(_, error)) if error.code == -32_022 ->
-      case client.version_negotiation, supported_versions(error.data) {
-        Auto, versions ->
-          case list.contains(versions, jsonrpc.legacy_protocol_version) {
-            True -> connect_legacy(close_probe(probed), info)
-            False -> Error(Rpc(error))
+      case
+        retry_version
+        && list.contains(
+          supported_versions(error.data),
+          jsonrpc.latest_protocol_version,
+        )
+      {
+        True -> connect_modern_attempt(probed, info, False, deadline)
+        False -> {
+          case client.version_negotiation, supported_versions(error.data) {
+            Auto, versions ->
+              case list.contains(versions, jsonrpc.legacy_protocol_version) {
+                True -> connect_legacy(close_probe(probed), info)
+                False -> Error(Rpc(error))
+              }
+            _, _ -> Error(Rpc(error))
           }
-        _, _ -> Error(Rpc(error))
+        }
       }
     Ok(jsonrpc.ErrorResponse(_, error)) ->
       case client.version_negotiation, client.transport_config {
