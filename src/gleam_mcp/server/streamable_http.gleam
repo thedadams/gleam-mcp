@@ -11,6 +11,7 @@ import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
 import gleam/result
+import gleam/set
 import gleam/string
 import gleam/string_tree
 import gleam/uri
@@ -288,7 +289,21 @@ fn handle_get(
 ) -> response.Response(mist.ResponseData) {
   case require_existing_session(server, request_session_id(req), principal) {
     Ok(session_id) -> {
-      let listener_id = server.new_streamable_http_listener_id()
+      let last_id =
+        request.get_header(req, "last-event-id") |> option.from_result
+      let resumed_stream =
+        last_id
+        |> option.then(fn(id) {
+          server.resume_legacy_stream(server, session_id, id)
+        })
+      let listener_id = case resumed_stream {
+        Some(stream) -> stream
+        None ->
+          case server.has_legacy_event_store(server) {
+            True -> "notifications"
+            False -> server.new_streamable_http_listener_id()
+          }
+      }
 
       mist.server_sent_events(
         request: req,
@@ -305,7 +320,14 @@ fn handle_get(
             listener_id,
             listener,
           )
-          SseState(server, session_id, listener_id)
+          // Attach before taking the snapshot. Live events overlapping the
+          // snapshot are queued and deduplicated after replay has been flushed.
+          let replay = case last_id {
+            Some(id) -> server.replay_legacy_events(server, session_id, id)
+            None -> []
+          }
+          send_priming_event(server, session_id, listener_id, listener)
+          SseState(server, session_id, listener_id, replay, set.new())
         },
         loop: handle_sse_message,
       )
@@ -902,7 +924,9 @@ fn modern_sse_response(
       },
       fn(state, message, connection) {
         case message {
-          streamable_http_store.DeliverRequest(_) -> actor.continue(state)
+          streamable_http_store.DeliverRequest(_)
+          | streamable_http_store.DeliverReplay(_, _, _) ->
+            actor.continue(state)
           streamable_http_store.DeliverNotification(notification) -> {
             case
               mist.send_event(
@@ -1251,19 +1275,21 @@ fn handle_streamed_request(
         listener_id,
         listener,
       )
+      send_priming_event(server, session_id, listener_id, listener)
       let _ =
         process.spawn_unlinked(fn() {
           let #(_, rpc_response) =
             server.handle_request_with_context(server, context, message)
-          process.send(
-            listener,
-            streamable_http_store.DeliverResponse(codec.encode_response(
-              rpc_response,
-            )),
+          let payload = codec.encode_response(rpc_response)
+          server.send_legacy_stream_response(
+            server,
+            session_id,
+            listener_id,
+            payload,
           )
           Nil
         })
-      SseState(server, session_id, listener_id)
+      SseState(server, session_id, listener_id, [], set.new())
     },
     loop: handle_sse_message,
   )
@@ -1276,6 +1302,19 @@ fn should_stream_request_response(
     jsonrpc.Request(_, _, Some(actions.ClientRequestGetTaskResult(_)))
     | jsonrpc.Request(_, _, Some(actions.ClientRequestCallTool(_))) -> True
     _ -> False
+  }
+}
+
+fn send_priming_event(
+  app: server.Server,
+  session_id: String,
+  listener_id: String,
+  listener: process.Subject(streamable_http_store.ListenerMessage),
+) -> Nil {
+  case server.record_legacy_event(app, session_id, listener_id, "") {
+    Some(id) ->
+      process.send(listener, streamable_http_store.DeliverReplay(id, "", False))
+    None -> Nil
   }
 }
 
@@ -1347,7 +1386,13 @@ fn request_session_id(req: request.Request(body)) -> Option(String) {
 }
 
 type SseState {
-  SseState(server: server.Server, session_id: String, listener_id: String)
+  SseState(
+    server: server.Server,
+    session_id: String,
+    listener_id: String,
+    replay: List(#(String, String)),
+    seen: set.Set(String),
+  )
 }
 
 fn handle_sse_message(
@@ -1355,26 +1400,93 @@ fn handle_sse_message(
   message: streamable_http_store.ListenerMessage,
   connection: mist.SSEConnection,
 ) -> actor.Next(SseState, streamable_http_store.ListenerMessage) {
-  let SseState(server: app_server, session_id:, listener_id:) = state
+  case flush_replay(state, connection) {
+    Ok(state) -> handle_live_sse_message(state, message, connection)
+    Error(Nil) -> actor.stop()
+  }
+}
+
+fn flush_replay(
+  state: SseState,
+  connection: mist.SSEConnection,
+) -> Result(SseState, Nil) {
+  case state.replay {
+    [] -> Ok(state)
+    [#(id, payload), ..rest] -> {
+      let state = SseState(..state, replay: rest)
+      use state <- result.try(send_replayed_event(
+        state,
+        connection,
+        id,
+        payload,
+        codec_common.is_response(payload),
+      ))
+      flush_replay(state, connection)
+    }
+  }
+}
+
+fn close_sse(state: SseState) -> Nil {
+  server.unregister_current_streamable_http_listener(
+    state.server,
+    state.session_id,
+    state.listener_id,
+  )
+}
+
+fn send_replayed_event(
+  state: SseState,
+  connection: mist.SSEConnection,
+  id: String,
+  payload: String,
+  close: Bool,
+) -> Result(SseState, Nil) {
+  case set.contains(state.seen, id) {
+    True -> Ok(state)
+    False -> {
+      let sent =
+        mist.send_event(
+          connection,
+          mist.event(payload |> string_tree.from_string)
+            |> mist.event_id(id)
+            |> mist.event_name("message"),
+        )
+      case sent, close {
+        Ok(Nil), False ->
+          Ok(SseState(..state, seen: set.insert(state.seen, id)))
+        _, _ -> {
+          close_sse(state)
+          Error(Nil)
+        }
+      }
+    }
+  }
+}
+
+fn handle_live_sse_message(
+  state: SseState,
+  message: streamable_http_store.ListenerMessage,
+  connection: mist.SSEConnection,
+) -> actor.Next(SseState, streamable_http_store.ListenerMessage) {
+  let SseState(server: app_server, session_id:, listener_id:, ..) = state
 
   case message {
     streamable_http_store.DeliverRequest(request) -> {
-      case
-        mist.send_event(
-          connection,
-          mist.event(
-            client_codec.encode_server_request(request)
-            |> string_tree.from_string,
-          ),
-        )
+      let payload = client_codec.encode_server_request(request)
+      let event =
+        mist.event(payload |> string_tree.from_string)
+        |> mist.event_name("message")
+      let sent = case
+        server.record_legacy_event(app_server, session_id, listener_id, payload)
       {
-        Ok(Nil) -> actor.continue(state)
+        Some(id) -> send_replayed_event(state, connection, id, payload, False)
+        None ->
+          mist.send_event(connection, event) |> result.map(fn(_) { state })
+      }
+      case sent {
+        Ok(state) -> actor.continue(state)
         Error(Nil) -> {
-          server.unregister_streamable_http_listener(
-            app_server,
-            session_id,
-            listener_id,
-          )
+          close_sse(state)
           actor.stop()
         }
       }
@@ -1386,31 +1498,24 @@ fn handle_sse_message(
           mist.event(
             client_codec.encode_notification(notification)
             |> string_tree.from_string,
-          ),
+          )
+            |> mist.event_name("message"),
         )
       {
         Ok(Nil) -> actor.continue(state)
         Error(Nil) -> {
-          server.unregister_streamable_http_listener(
-            app_server,
-            session_id,
-            listener_id,
-          )
+          close_sse(state)
           actor.stop()
         }
       }
     streamable_http_store.DeliverResponse(payload) -> {
-      let _ =
-        server.unregister_streamable_http_listener(
-          app_server,
-          session_id,
-          listener_id,
-        )
+      close_sse(state)
 
       case
         mist.send_event(
           connection,
-          mist.event(payload |> string_tree.from_string),
+          mist.event(payload |> string_tree.from_string)
+            |> mist.event_name("message"),
         )
       {
         Ok(Nil) -> actor.stop()
@@ -1418,12 +1523,14 @@ fn handle_sse_message(
       }
     }
     streamable_http_store.CloseListener -> {
-      server.unregister_streamable_http_listener(
-        app_server,
-        session_id,
-        listener_id,
-      )
+      close_sse(state)
       actor.stop()
+    }
+    streamable_http_store.DeliverReplay(id, payload, close) -> {
+      case send_replayed_event(state, connection, id, payload, close) {
+        Ok(state) -> actor.continue(state)
+        Error(Nil) -> actor.stop()
+      }
     }
   }
 }

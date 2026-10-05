@@ -392,3 +392,69 @@ fn sample_task_result() -> actions.TaskResult {
     meta: None,
   ))
 }
+
+pub fn application_task_lifecycle_preserves_initial_and_final_stage_messages_test() {
+  let store = task_store.new()
+  let task =
+    task_store.create_scoped_with_lifecycle(
+      store,
+      Some(1000),
+      Some("owner"),
+      1000,
+      Some(task_store.TaskLifecycle(Some("Gathering sources..."), None, None)),
+    )
+  should.equal(task.status_message, Some("Gathering sources..."))
+  task_store.update_status(
+    store,
+    task.task_id,
+    actions.Working,
+    Some("Generating report..."),
+  )
+  |> should.be_ok
+  let completed =
+    task_store.complete(store, task.task_id, Ok(sample_task_result()))
+    |> should.be_ok
+  should.equal(completed.status, actions.Completed)
+  should.equal(completed.status_message, Some("Generating report..."))
+  task_store.result_scoped(store, task.task_id, Some("owner")) |> should.be_ok
+}
+
+pub fn configured_cancellation_payload_is_owner_checked_and_defaults_remain_unchanged_test() {
+  let store = task_store.new()
+  let lifecycle =
+    task_store.TaskLifecycle(
+      Some("Working..."),
+      Some("Client cancelled task execution."),
+      Some(actions.Meta(dict.new())),
+    )
+  let task =
+    task_store.create_scoped_with_lifecycle(
+      store,
+      Some(1000),
+      Some("owner"),
+      1000,
+      Some(lifecycle),
+    )
+  task_store.cancel_result_scoped(store, task.task_id, Some("other"))
+  |> should.be_error
+  let unchanged = task_store.get(store, task.task_id) |> should.be_ok
+  should.equal(unchanged.status, actions.Working)
+  let cancelled =
+    task_store.cancel_result_scoped(store, task.task_id, Some("owner"))
+    |> should.be_ok
+  should.equal(cancelled.task.status, actions.Cancelled)
+  should.equal(
+    cancelled.task.status_message,
+    Some("Client cancelled task execution."),
+  )
+  should.equal(cancelled.meta, Some(actions.Meta(dict.new())))
+
+  let ordinary = task_store.create(store, Some(1000))
+  let default_result =
+    task_store.cancel_result(store, ordinary.task_id) |> should.be_ok
+  should.equal(
+    default_result.task.status_message,
+    Some("The task was cancelled by request."),
+  )
+  should.equal(default_result.meta, None)
+}

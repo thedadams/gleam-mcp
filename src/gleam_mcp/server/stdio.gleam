@@ -316,6 +316,10 @@ fn handle_outgoing(
       state.write(payload)
       state
     }
+    streamable_http_store.DeliverReplay(_, payload, _) -> {
+      state.write(payload)
+      state
+    }
     streamable_http_store.CloseListener -> state
   }
 }

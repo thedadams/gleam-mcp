@@ -48,6 +48,7 @@ type Message(a) {
   Close(String, process.Subject(Nil))
   Subscribe(String, String, Bool, process.Subject(Nil))
   Subscribers(String, process.Subject(List(String)))
+  SubscribedUris(String, process.Subject(List(String)))
 }
 
 pub fn new() -> Store(a) {
@@ -164,6 +165,14 @@ pub fn subscribers(store: Store(a), uri: String) -> List(String) {
   process.send(subject, Subscribers(uri, reply))
   let assert Ok(sessions) = process.receive(reply, 1000)
   sessions
+}
+
+pub fn subscribed_uris(store: Store(a), session: String) -> List(String) {
+  let Store(subject) = store
+  let reply = process.new_subject()
+  process.send(subject, SubscribedUris(session, reply))
+  let assert Ok(uris) = process.receive(reply, 1000)
+  uris
 }
 
 fn loop(
@@ -331,6 +340,13 @@ fn loop(
             }
           }),
       )
+      loop(subject, pending, subscriptions)
+    }
+    SubscribedUris(session, reply) -> {
+      process.send(reply, case dict.get(subscriptions, session) {
+        Ok(uris) -> uris
+        Error(_) -> []
+      })
       loop(subject, pending, subscriptions)
     }
   }

@@ -90,6 +90,20 @@ pub type ModernRequestHandler =
   fn(Server, RequestContext, actions.ClientActionRequest) ->
     Result(actions.ClientActionResult, jsonrpc.RpcError)
 
+/// Optional persistence for legacy HTTP SSE events. Modern streams deliberately
+/// have no event IDs and do not use this store.
+pub type LegacyEventStore {
+  LegacyEventStore(
+    record: fn(String, String, String) -> String,
+    replay: fn(String, String) -> List(#(String, String)),
+  )
+  ResumableLegacyEventStore(
+    record: fn(String, String, String) -> String,
+    replay: fn(String, String) -> List(#(String, String)),
+    resume: fn(String, String) -> Option(String),
+  )
+}
+
 type Options {
   Options(
     allowed_origins: List(String),
@@ -100,6 +114,17 @@ type Options {
     modern_handler: Option(ModernRequestHandler),
     state_secret: BitArray,
     extensions: dict.Dict(String, jsonrpc.Value),
+    projection: Option(fn(Server, RequestContext) -> Server),
+    session_close: Option(fn(String) -> Nil),
+    legacy_events: Option(LegacyEventStore),
+    context_logging: Option(
+      fn(RequestContext, actions.LoggingLevel) -> Result(Nil, jsonrpc.RpcError),
+    ),
+    resource_subscription: Option(
+      fn(RequestContext, String, Bool) -> Result(Nil, jsonrpc.RpcError),
+    ),
+    tool_task_options: dict.Dict(String, #(Option(Int), Int)),
+    tool_task_lifecycles: dict.Dict(String, task_store.TaskLifecycle),
   )
 }
 
@@ -164,14 +189,21 @@ pub fn new(implementation: actions.Implementation) -> Server {
     None,
     None,
     Options(
-      [],
-      None,
-      None,
-      server_sent_request_timeout_ms,
-      100,
-      None,
-      crypto.strong_random_bytes(32),
-      dict.new(),
+      allowed_origins: [],
+      notifications: None,
+      capabilities: None,
+      request_timeout_ms: server_sent_request_timeout_ms,
+      page_size: 100,
+      modern_handler: None,
+      state_secret: crypto.strong_random_bytes(32),
+      extensions: dict.new(),
+      projection: None,
+      session_close: None,
+      legacy_events: None,
+      context_logging: None,
+      resource_subscription: None,
+      tool_task_options: dict.new(),
+      tool_task_lifecycles: dict.new(),
     ),
   )
 }
@@ -409,6 +441,161 @@ pub fn with_notification_handler(
   Server(
     ..server,
     options: Options(..server.options, notifications: Some(handler)),
+  )
+}
+
+/// Select a session-specific registry before validating and dispatching a request.
+/// The returned server should retain this server's stores and options, using the
+/// registration functions to add tools or resources for the current context.
+pub fn with_server_projection(
+  server: Server,
+  project: fn(Server, RequestContext) -> Server,
+) -> Server {
+  Server(
+    ..server,
+    options: Options(..server.options, projection: Some(project)),
+  )
+}
+
+/// Release application-owned state when a transport session closes.
+pub fn with_session_close_handler(
+  server: Server,
+  close: fn(String) -> Nil,
+) -> Server {
+  Server(
+    ..server,
+    options: Options(..server.options, session_close: Some(close)),
+  )
+}
+
+pub fn project_server(server: Server, context: RequestContext) -> Server {
+  case server.options.projection {
+    Some(project) -> project(server, context)
+    None -> server
+  }
+}
+
+pub fn with_legacy_event_store(
+  server: Server,
+  store: LegacyEventStore,
+) -> Server {
+  Server(
+    ..server,
+    options: Options(..server.options, legacy_events: Some(store)),
+  )
+}
+
+/// Configure retention and polling for tasks created by a registered tool.
+/// The configured TTL overrides the initiating request's requested retention.
+pub fn with_tool_task_options(
+  server: Server,
+  name: String,
+  ttl_ms: Option(Int),
+  poll_interval_ms: Int,
+) -> Server {
+  Server(
+    ..server,
+    options: Options(
+      ..server.options,
+      tool_task_options: dict.insert(server.options.tool_task_options, name, #(
+        ttl_ms,
+        int.max(poll_interval_ms, 0),
+      )),
+    ),
+  )
+}
+
+/// Set application status text and cancellation metadata for a tool's tasks.
+pub fn with_tool_task_lifecycle(
+  server: Server,
+  name: String,
+  lifecycle: task_store.TaskLifecycle,
+) -> Server {
+  Server(
+    ..server,
+    options: Options(
+      ..server.options,
+      tool_task_lifecycles: dict.insert(
+        server.options.tool_task_lifecycles,
+        name,
+        lifecycle,
+      ),
+    ),
+  )
+}
+
+pub fn record_legacy_event(
+  server: Server,
+  session: String,
+  stream: String,
+  payload: String,
+) -> Option(String) {
+  server.options.legacy_events
+  |> option.map(fn(store) { store.record(session, stream, payload) })
+}
+
+pub fn has_legacy_event_store(server: Server) -> Bool {
+  option.is_some(server.options.legacy_events)
+}
+
+pub fn resume_legacy_stream(
+  server: Server,
+  session: String,
+  last_event_id: String,
+) -> Option(String) {
+  case server.options.legacy_events {
+    Some(ResumableLegacyEventStore(resume: resume, ..)) ->
+      resume(session, last_event_id)
+    _ -> None
+  }
+}
+
+fn legacy_event_recorder(
+  server: Server,
+  session: String,
+) -> Option(fn(String, String) -> String) {
+  server.options.legacy_events
+  |> option.map(fn(store) {
+    fn(stream, payload) { store.record(session, stream, payload) }
+  })
+}
+
+/// Deliver a completed legacy request to the active connection for its stream.
+/// Persistence remains available when the original connection has disconnected.
+pub fn send_legacy_stream_response(
+  server: Server,
+  session: String,
+  stream: String,
+  payload: String,
+) -> Nil {
+  streamable_http_store.send_stream_response(
+    server.http_store,
+    session,
+    stream,
+    payload,
+    legacy_event_recorder(server, session),
+  )
+}
+
+pub fn replay_legacy_events(
+  server: Server,
+  session: String,
+  last_event_id: String,
+) -> List(#(String, String)) {
+  case server.options.legacy_events {
+    Some(store) -> store.replay(session, last_event_id)
+    None -> []
+  }
+}
+
+/// Return a registry view containing only tools available to this client.
+pub fn filter_tools(
+  server: Server,
+  visible: fn(actions.Tool) -> Bool,
+) -> Server {
+  Server(
+    ..server,
+    tools: list.filter(server.tools, fn(entry) { visible(entry.tool) }),
   )
 }
 
@@ -691,6 +878,18 @@ pub fn set_logging_handler(server: Server, handler: LoggingHandler) -> Server {
   Server(..server, logging_handler: Some(handler))
 }
 
+pub fn set_context_logging_handler(
+  server: Server,
+  handler: fn(RequestContext, actions.LoggingLevel) ->
+    Result(Nil, jsonrpc.RpcError),
+) -> Server {
+  Server(
+    ..server,
+    logging_handler: Some(fn(_) { Ok(Nil) }),
+    options: Options(..server.options, context_logging: Some(handler)),
+  )
+}
+
 pub fn set_task_result_request_handler(
   server: Server,
   handler: TaskResultRequestHandler,
@@ -765,6 +964,7 @@ pub fn start_request_with_context(
         _, _ -> context
       }
       let context = request_context(context, id, action_meta(action))
+      let server = project_server(server, context)
       let duplicate_subscription = case runtime_scope(context) {
         Some(scope) ->
           runtime.subscription_active(server.subscriptions, scope, id)
@@ -1598,23 +1798,34 @@ fn modern_call_tool(
   {
     True, True, Some(actions.TaskOptional)
     | True, True, Some(actions.TaskRequired)
-    ->
-      create_modern_task(server, context, Some(task_store.maximum_ttl_ms), fn() {
-        run_tool_handler(
-          server,
-          registered.handler,
-          modern_task_context(context),
-          params.arguments,
-        )
-        |> result.map(actions.ClientResultCallTool)
-        |> result.map(fn(value) {
-          task_store.ModernComplete(wire.result_value(
-            value,
-            jsonrpc.latest_protocol_version,
-            server.implementation,
-          ))
-        })
-      })
+    -> {
+      let #(ttl, poll) =
+        tool_task_options(server, params.name, Some(task_store.maximum_ttl_ms))
+      create_modern_task_with_poll_interval(
+        server,
+        context,
+        ttl,
+        poll,
+        dict.get(server.options.tool_task_lifecycles, params.name)
+          |> option.from_result,
+        fn() {
+          run_tool_handler(
+            server,
+            registered.handler,
+            modern_task_context(context),
+            params.arguments,
+          )
+          |> result.map(actions.ClientResultCallTool)
+          |> result.map(fn(value) {
+            task_store.ModernComplete(wire.result_value(
+              value,
+              jsonrpc.latest_protocol_version,
+              server.implementation,
+            ))
+          })
+        },
+      )
+    }
     _, _, _ -> execute()
   }
 }
@@ -1652,12 +1863,32 @@ pub fn create_modern_task(
   ttl_ms: Option(Int),
   worker: fn() -> Result(task_store.ModernOutcome, jsonrpc.RpcError),
 ) -> Result(actions.ClientActionResult, jsonrpc.RpcError) {
+  create_modern_task_with_poll_interval(
+    server,
+    context,
+    ttl_ms,
+    5000,
+    None,
+    worker,
+  )
+}
+
+fn create_modern_task_with_poll_interval(
+  server: Server,
+  context: RequestContext,
+  ttl_ms: Option(Int),
+  poll_interval_ms: Int,
+  lifecycle: Option(task_store.TaskLifecycle),
+  worker: fn() -> Result(task_store.ModernOutcome, jsonrpc.RpcError),
+) -> Result(actions.ClientActionResult, jsonrpc.RpcError) {
   use _ <- result.try(require_task_extension(server, context))
   let task =
-    task_store.create_scoped(
+    task_store.create_scoped_with_lifecycle(
       server.task_store,
       ttl_ms,
       context_task_scope(server, context),
+      poll_interval_ms,
+      lifecycle,
     )
   use _ <- result.try(
     task_store.start_modern_worker(server.task_store, task.task_id, fn() {
@@ -1883,9 +2114,18 @@ pub fn session_metadata(
 }
 
 pub fn close_session(server: Server, session_id: String) -> Nil {
+  case session_metadata(server, session_id) {
+    Some(metadata) if metadata.principal != None -> Nil
+    _ ->
+      task_store.close_scope(server.task_store, Some("session:" <> session_id))
+  }
   runtime.close(server.runtime, session_id)
   runtime.close_subscription_scope(server.subscriptions, session_id)
   streamable_http_store.delete_session(server.http_store, session_id)
+  case server.options.session_close {
+    Some(close) -> close(session_id)
+    None -> Nil
+  }
 }
 
 /// Bind a newly allocated transport session to its authenticated user.
@@ -1980,6 +2220,20 @@ pub fn unregister_streamable_http_listener(
   streamable_http_store.unregister_listener(http_store, session_id, listener_id)
 }
 
+/// A superseded SSE connection must not unregister its replacement.
+pub fn unregister_current_streamable_http_listener(
+  server: Server,
+  session_id: String,
+  listener_id: String,
+) -> Nil {
+  streamable_http_store.unregister_listener_owned(
+    server.http_store,
+    session_id,
+    listener_id,
+    process.self(),
+  )
+}
+
 pub fn handle_server_sent_response(
   server: Server,
   context: RequestContext,
@@ -2014,11 +2268,12 @@ pub fn send_request(
   case session_id(context) {
     Some(value) -> {
       let Server(http_store: http_store, ..) = server
-      streamable_http_store.send_request(
+      streamable_http_store.send_request_with_recorder(
         http_store,
         value,
         request,
         server.options.request_timeout_ms,
+        legacy_event_recorder(server, value),
       )
     }
     None ->
@@ -2051,7 +2306,12 @@ fn send_legacy_notification(
   case session_id(context) {
     Some(value) -> {
       let Server(http_store: http_store, ..) = server
-      streamable_http_store.send_notification(http_store, value, notification)
+      streamable_http_store.send_notification_with_recorder(
+        http_store,
+        value,
+        notification,
+        legacy_event_recorder(server, value),
+      )
       Ok(Nil)
     }
     None ->
@@ -2478,7 +2738,21 @@ fn associate_request(
               meta: associate_meta(params.meta, task),
             ),
           )
-        _ -> action
+        actions.ServerRequestGetTask(params) ->
+          actions.ServerRequestGetTask(actions.TaskIdParamsWithMeta(
+            actions.task_id(params),
+            associate_meta(actions.task_id_meta(params), task),
+          ))
+        actions.ServerRequestGetTaskResult(params) ->
+          actions.ServerRequestGetTaskResult(actions.TaskIdParamsWithMeta(
+            actions.task_id(params),
+            associate_meta(actions.task_id_meta(params), task),
+          ))
+        actions.ServerRequestCancelTask(params) ->
+          actions.ServerRequestCancelTask(actions.TaskIdParamsWithMeta(
+            actions.task_id(params),
+            associate_meta(actions.task_id_meta(params), task),
+          ))
       }
       jsonrpc.Request(id, method, Some(action))
     }
@@ -2534,6 +2808,22 @@ pub fn with_resource_subscriptions(server: Server) -> Server {
   )
 }
 
+/// An application may validate subscriptions itself, including URIs whose
+/// resources are created later. Without this hook only registered URIs qualify.
+pub fn with_resource_subscription_handler(
+  server: Server,
+  handler: fn(RequestContext, String, Bool) -> Result(Nil, jsonrpc.RpcError),
+) -> Server {
+  server
+  |> with_resource_subscriptions
+  |> fn(app) {
+    Server(
+      ..app,
+      options: Options(..app.options, resource_subscription: Some(handler)),
+    )
+  }
+}
+
 fn subscribe_resource(
   server: Server,
   context: RequestContext,
@@ -2542,13 +2832,21 @@ fn subscribe_resource(
 ) -> Result(actions.ClientActionResult, jsonrpc.RpcError) {
   case advertised_capabilities(server).resources {
     Some(resources) if resources.subscribe == Some(True) -> {
-      let known = case
-        find_resource(server.resources, uri),
-        find_resource_template(server.resource_templates, uri)
-      {
-        Error(_), Error(_) -> False
-        _, _ -> True
+      let known = case server.options.resource_subscription {
+        Some(handler) ->
+          handler(context, uri, enabled) |> result.map(fn(_) { True })
+        None ->
+          Ok(
+            case
+              find_resource(server.resources, uri),
+              find_resource_template(server.resource_templates, uri)
+            {
+              Error(_), Error(_) -> False
+              _, _ -> True
+            },
+          )
       }
+      use known <- result.try(known)
       case context.session_id, known {
         Some(id), True -> {
           runtime.subscribe(server.runtime, id, uri, enabled)
@@ -2564,6 +2862,13 @@ fn subscribe_resource(
     }
     _ -> Error(jsonrpc.method_not_found_error(mcp.method_subscribe_resource))
   }
+}
+
+pub fn resource_subscriptions(
+  server: Server,
+  session_id: String,
+) -> List(String) {
+  runtime.subscribed_uris(server.runtime, session_id)
 }
 
 pub fn notify_resource_updated(server: Server, uri: String) -> Nil {
@@ -2788,7 +3093,7 @@ fn dispatch_request(
       call_tool_result(server, context, params)
     actions.ClientRequestComplete(params) -> complete_result(server, params)
     actions.ClientRequestSetLoggingLevel(params) ->
-      set_logging_level_result(server, params)
+      set_logging_level_result(server, context, params)
     actions.ClientRequestListTasks(params) ->
       list_tasks_result(server, context, params)
     actions.ClientRequestGetTask(params) ->
@@ -3080,6 +3385,7 @@ fn call_tool_result(
             Some(actions.TaskMetadata(ttl_ms)), _ -> {
               Ok(create_tool_task_result(
                 server,
+                name,
                 handler,
                 context,
                 arguments,
@@ -3097,18 +3403,33 @@ fn call_tool_result(
   }
 }
 
+fn tool_task_options(
+  server: Server,
+  name: String,
+  requested_ttl: Option(Int),
+) -> #(Option(Int), Int) {
+  case dict.get(server.options.tool_task_options, name) {
+    Ok(options) -> options
+    Error(_) -> #(requested_ttl, 5000)
+  }
+}
+
 fn create_tool_task_result(
   server: Server,
+  name: String,
   handler: RegisteredToolHandler,
   context: RequestContext,
   arguments: Option(dict.Dict(String, jsonrpc.Value)),
   ttl_ms: Option(Int),
 ) -> actions.ClientActionResult {
+  let #(ttl_ms, poll_interval_ms) = tool_task_options(server, name, ttl_ms)
   let created =
-    task_store.create_scoped(
+    task_store.create_scoped_with_lifecycle(
       server.task_store,
       ttl_ms,
       context_task_scope(server, context),
+      poll_interval_ms,
+      dict.get(server.options.tool_task_lifecycles, name) |> option.from_result,
     )
   let task_context = case context {
     RequestContext(_, _) ->
@@ -3292,21 +3613,18 @@ fn cancel_task_result(
 ) -> Result(actions.ClientActionResult, jsonrpc.RpcError) {
   let task_id = actions.task_id(params)
   let cancelled = case context.session_id {
-    None -> task_store.cancel(server.task_store, task_id)
+    None -> task_store.cancel_result(server.task_store, task_id)
     Some(_) ->
-      task_store.cancel_scoped(
+      task_store.cancel_result_scoped(
         server.task_store,
         task_id,
         context_task_scope(server, context),
       )
   }
   cancelled
-  |> result.map(fn(task) {
-    let _ = send_task_status_notification(server, context, task)
-    task
-  })
-  |> result.map(fn(task) {
-    actions.ClientResultCancelTask(actions.CancelTaskResult(task, None))
+  |> result.map(fn(result) {
+    let _ = send_task_status_notification(server, context, result.task)
+    actions.ClientResultCancelTask(result)
   })
 }
 
@@ -3341,9 +3659,17 @@ fn complete_result(
 
 fn set_logging_level_result(
   server: Server,
+  context: RequestContext,
   params: actions.SetLevelRequestParams,
 ) -> Result(actions.ClientActionResult, jsonrpc.RpcError) {
-  case server.logging_handler {
+  let handler = case server.options.context_logging {
+    Some(handler) ->
+      Some(fn(params: actions.SetLevelRequestParams) {
+        handler(context, params.level)
+      })
+    None -> server.logging_handler
+  }
+  case handler {
     Some(handler) ->
       handler(params) |> result.map(fn(_) { actions.ClientResultEmpty(None) })
     None -> Error(jsonrpc.method_not_found_error(mcp.method_set_logging_level))

@@ -1,64 +1,70 @@
 import argv
+import envoy
 import gleam/erlang/process
+import gleam/http/request
+import gleam/http/response
 import gleam/int
 import gleam/io
+import gleam/result
 import gleam/string
-import gleam_mcp/examples/everything/http_logging
+import gleam_mcp/examples/everything/http
 import gleam_mcp/examples/everything/server as everything_server
+import gleam_mcp/examples/everything/session_resources
+import gleam_mcp/examples/everything/sse
 import gleam_mcp/examples/everything/stdio as everything_stdio
-import gleam_mcp/server/streamable_http
 import mist
 
 pub fn main() -> Nil {
   let argv.Argv(arguments: arguments, ..) = argv.load()
-  let _ = case arguments {
-    [] -> {
-      let _ = everything_stdio.serve()
-      Nil
-    }
-    ["stdio"] -> {
-      let _ = everything_stdio.serve()
-      Nil
-    }
-    ["streamableHttp"] -> run_streamable_http(3000)
-    ["streamableHttp", port] ->
-      case int.parse(port) {
-        Ok(parsed) -> run_streamable_http(parsed)
-        Error(_) -> print_usage()
-      }
+  case arguments {
+    [] | ["stdio"] -> everything_stdio.serve()
+    ["streamableHttp"] -> run_http(False, default_port())
+    ["sse"] -> run_http(True, default_port())
+    ["streamableHttp", port] -> parse_port(False, port)
+    ["sse", port] -> parse_port(True, port)
     _ -> print_usage()
   }
-  Nil
 }
 
-fn run_streamable_http(port: Int) -> Nil {
-  let #(app_server, logger) = everything_server.make_http_server()
-  let builder =
-    mist.new(streamable_http.handler_with_middleware(
-      app_server,
-      http_logging.middleware(logger),
-    ))
-    |> mist.bind("127.0.0.1")
-    |> mist.port(port)
+fn default_port() -> Int {
+  envoy.get("PORT") |> result.try(int.parse) |> result.unwrap(3001)
+}
 
+fn parse_port(deprecated_sse: Bool, port: String) -> Nil {
+  case int.parse(port) {
+    Ok(parsed) -> run_http(deprecated_sse, parsed)
+    Error(_) -> print_usage()
+  }
+}
+
+fn run_http(deprecated_sse: Bool, port: Int) -> Nil {
+  let #(app, _) =
+    everything_server.make_application(session_resources.StreamableHttp)
+  let handler: fn(request.Request(mist.Connection)) ->
+    response.Response(mist.ResponseData) = case deprecated_sse {
+    True -> sse.handler(app) |> http.deprecated_cors
+    False -> http.handler(app)
+  }
+  let builder = mist.new(handler) |> mist.bind("127.0.0.1") |> mist.port(port)
   case mist.start(builder) {
     Ok(_) -> {
       io.println(
         "Everything server listening on http://127.0.0.1:"
         <> int.to_string(port)
-        <> "/mcp",
+        <> case deprecated_sse {
+          True -> "/sse"
+          False -> "/mcp"
+        },
       )
       process.sleep_forever()
     }
     Error(error) ->
-      io.println(
-        "Failed to start streamable HTTP server: " <> string.inspect(error),
-      )
+      io.println("Failed to start HTTP server: " <> string.inspect(error))
   }
 }
 
 fn print_usage() -> Nil {
   io.println(
-    "Usage: gleam run -m everything/main -- [stdio|streamableHttp [port]]",
+    "Usage: gleam run -m gleam_mcp/examples/everything/main -- [stdio|sse [port]|streamableHttp [port]]",
   )
 }

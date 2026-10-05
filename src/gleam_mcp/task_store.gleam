@@ -1,7 +1,9 @@
 import gleam/dict.{type Dict}
 import gleam/erlang/process
+import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
+import gleam/result
 import gleam/time/duration
 import gleam/time/timestamp
 import gleam_mcp/actions
@@ -19,6 +21,8 @@ type Entry {
     waiters: List(process.Subject(Result(actions.TaskResult, jsonrpc.RpcError))),
     scope: Option(String),
     worker: Option(TrackedWorker),
+    retention: Option(process.Timer),
+    lifecycle: Option(TaskLifecycle),
     inputs: Dict(String, jsonrpc.Value),
     resume: Option(
       fn(Dict(String, jsonrpc.Value)) -> Result(ModernOutcome, jsonrpc.RpcError),
@@ -28,6 +32,16 @@ type Entry {
 
 type TrackedWorker {
   TrackedWorker(pid: process.Pid, monitor: process.Monitor)
+}
+
+/// Application-specific status text and cancellation metadata. Absent options
+/// retain the store's ordinary creation/cancellation behavior.
+pub type TaskLifecycle {
+  TaskLifecycle(
+    initial_status_message: Option(String),
+    cancellation_status_message: Option(String),
+    cancellation_meta: Option(actions.Meta),
+  )
 }
 
 /// Modern tasks can wait for MRTR input before resuming their monitored worker.
@@ -57,6 +71,8 @@ type Message {
   Create(
     ttl_ms: Option(Int),
     scope: Option(String),
+    poll_interval_ms: Int,
+    lifecycle: Option(TaskLifecycle),
     reply_to: process.Subject(actions.Task),
   )
   UpdateStatus(
@@ -104,6 +120,7 @@ type Message {
   )
   WorkerDown(process.Down)
   Expire(task_id: String)
+  CloseScope(scope: Option(String), reply: process.Subject(Nil))
   List(access: Access, reply_to: process.Subject(List(actions.Task)))
   Get(
     task_id: String,
@@ -118,7 +135,9 @@ type Message {
   Cancel(
     task_id: String,
     access: Access,
-    reply_to: process.Subject(Result(actions.Task, jsonrpc.RpcError)),
+    reply_to: process.Subject(
+      Result(actions.CancelTaskResult, jsonrpc.RpcError),
+    ),
   )
 }
 
@@ -150,7 +169,39 @@ pub fn create_scoped(
   ttl_ms: Option(Int),
   scope: Option(String),
 ) -> actions.Task {
-  call(store, fn(reply_to) { Create(ttl_ms, scope, reply_to) })
+  create_scoped_with_poll_interval(
+    store,
+    ttl_ms,
+    scope,
+    default_poll_interval_ms,
+  )
+}
+
+pub fn create_scoped_with_poll_interval(
+  store: Store,
+  ttl_ms: Option(Int),
+  scope: Option(String),
+  poll_interval_ms: Int,
+) -> actions.Task {
+  create_scoped_with_lifecycle(store, ttl_ms, scope, poll_interval_ms, None)
+}
+
+pub fn create_scoped_with_lifecycle(
+  store: Store,
+  ttl_ms: Option(Int),
+  scope: Option(String),
+  poll_interval_ms: Int,
+  lifecycle: Option(TaskLifecycle),
+) -> actions.Task {
+  call(store, fn(reply_to) {
+    Create(ttl_ms, scope, int.max(poll_interval_ms, 0), lifecycle, reply_to)
+  })
+}
+
+/// Release tasks owned by a closing application/session scope. Other scopes,
+/// including durable authenticated owners, are left to their own lifecycle.
+pub fn close_scope(store: Store, scope: Option(String)) -> Nil {
+  call(store, fn(reply) { CloseScope(scope, reply) })
 }
 
 /// Run a task worker with cancellation managed by the store. The worker is
@@ -262,7 +313,7 @@ pub fn cancel(
   store: Store,
   task_id: String,
 ) -> Result(actions.Task, jsonrpc.RpcError) {
-  call(store, fn(reply_to) { Cancel(task_id, Unscoped, reply_to) })
+  cancel_result(store, task_id) |> result.map(fn(result) { result.task })
 }
 
 pub fn cancel_scoped(
@@ -270,6 +321,22 @@ pub fn cancel_scoped(
   task_id: String,
   scope: Option(String),
 ) -> Result(actions.Task, jsonrpc.RpcError) {
+  cancel_result_scoped(store, task_id, scope)
+  |> result.map(fn(result) { result.task })
+}
+
+pub fn cancel_result(
+  store: Store,
+  task_id: String,
+) -> Result(actions.CancelTaskResult, jsonrpc.RpcError) {
+  call(store, fn(reply_to) { Cancel(task_id, Unscoped, reply_to) })
+}
+
+pub fn cancel_result_scoped(
+  store: Store,
+  task_id: String,
+  scope: Option(String),
+) -> Result(actions.CancelTaskResult, jsonrpc.RpcError) {
   call(store, fn(reply_to) { Cancel(task_id, Scoped(scope), reply_to) })
 }
 
@@ -289,30 +356,39 @@ fn loop(
     |> process.select(subject)
     |> process.select_monitors(WorkerDown)
   case process.selector_receive_forever(selector) {
-    Create(requested_ttl_ms, scope, reply_to) -> {
+    Create(requested_ttl_ms, scope, poll_interval_ms, lifecycle, reply_to) -> {
       let ttl_ms = actual_ttl(requested_ttl_ms)
       let task =
         new_task(
           uuid.v4_string(),
           actions.Working,
-          None,
+          lifecycle
+            |> option.then(fn(options) { options.initial_status_message }),
           ttl_ms,
-          Some(default_poll_interval_ms),
+          Some(poll_interval_ms),
         )
       process.send(reply_to, task)
-      case ttl_ms {
-        Some(ttl) -> {
-          let _ = process.send_after(subject, ttl, Expire(task.task_id))
-          Nil
-        }
-        None -> Nil
+      let retention = case ttl_ms {
+        Some(ttl) ->
+          Some(process.send_after(subject, ttl, Expire(task.task_id)))
+        None -> None
       }
       loop(
         subject,
         dict.insert(
           entries,
           task.task_id,
-          Entry(task, None, [], scope, None, dict.new(), None),
+          Entry(
+            task,
+            None,
+            [],
+            scope,
+            None,
+            retention,
+            lifecycle,
+            dict.new(),
+            None,
+          ),
         ),
       )
     }
@@ -512,11 +588,27 @@ fn loop(
       }
     }
     WorkerDown(process.PortDown(..)) -> loop(subject, entries)
+    CloseScope(scope, reply) -> {
+      let next =
+        dict.filter(entries, fn(_, entry) {
+          case entry.scope == scope {
+            True -> {
+              release_entry(
+                entry,
+                Error(jsonrpc.invalid_params_error("Task scope was closed")),
+              )
+              False
+            }
+            False -> True
+          }
+        })
+      process.send(reply, Nil)
+      loop(subject, next)
+    }
     Expire(task_id) -> {
       case dict.get(entries, task_id) {
         Ok(entry) -> {
-          stop_worker(entry.worker)
-          notify_waiters(entry.waiters, Error(task_expired_error(task_id)))
+          release_entry(entry, Error(task_expired_error(task_id)))
         }
         Error(Nil) -> Nil
       }
@@ -586,7 +678,14 @@ fn start_modern_task(
     fn(entry) {
       Entry(
         ..entry,
-        task: set_task_status(entry.task, actions.Working, None),
+        task: set_task_status(
+          entry.task,
+          actions.Working,
+          case entry.task.status {
+            actions.Working -> entry.task.status_message
+            _ -> None
+          },
+        ),
         inputs: dict.new(),
         resume: None,
       )
@@ -648,7 +747,10 @@ fn update_task_status(
             "A completed or failed task must have a final result",
           )),
         )
-        False, actions.Cancelled -> cancel_task(entries, task_id, Unscoped)
+        False, actions.Cancelled -> {
+          let #(entries, cancelled) = cancel_task(entries, task_id, Unscoped)
+          #(entries, cancelled |> result.map(fn(result) { result.task }))
+        }
         False, _ -> {
           let updated = set_task_status(entry.task, status, status_message)
           #(
@@ -715,7 +817,7 @@ fn cancel_task(
   entries: Dict(String, Entry),
   task_id: String,
   access: Access,
-) -> #(Dict(String, Entry), Result(actions.Task, jsonrpc.RpcError)) {
+) -> #(Dict(String, Entry), Result(actions.CancelTaskResult, jsonrpc.RpcError)) {
   case find_entry(entries, task_id, access) {
     Ok(entry) ->
       case is_terminal(entry.task.status) {
@@ -725,13 +827,24 @@ fn cancel_task(
             set_task_status(
               entry.task,
               actions.Cancelled,
-              Some("The task was cancelled by request."),
+              entry.lifecycle
+                |> option.then(fn(options) {
+                  options.cancellation_status_message
+                })
+                |> option.or(Some("The task was cancelled by request.")),
             )
           let next_entry =
             Entry(..entry, task: cancelled, waiters: [], worker: None)
           stop_worker(entry.worker)
           notify_waiters(entry.waiters, Error(cancelled_task_error(task_id)))
-          #(dict.insert(entries, task_id, next_entry), Ok(cancelled))
+          #(
+            dict.insert(entries, task_id, next_entry),
+            Ok(actions.CancelTaskResult(
+              cancelled,
+              entry.lifecycle
+                |> option.then(fn(options) { options.cancellation_meta }),
+            )),
+          )
         }
       }
     Error(Nil) -> #(entries, Error(task_not_found_error(task_id)))
@@ -789,7 +902,11 @@ fn terminal_task(
     True -> task
     False -> {
       let #(status, status_message) = terminal_status(outcome)
-      set_task_status(task, status, status_message)
+      set_task_status(
+        task,
+        status,
+        status_message |> option.or(task.status_message),
+      )
     }
   }
 }
@@ -1008,4 +1125,19 @@ fn expect_ok(value: Result(a, Nil)) -> a {
     Ok(inner) -> inner
     Error(Nil) -> panic as "Timed out waiting for task store"
   }
+}
+
+fn release_entry(
+  entry: Entry,
+  outcome: Result(actions.TaskResult, jsonrpc.RpcError),
+) -> Nil {
+  stop_worker(entry.worker)
+  case entry.retention {
+    Some(timer) -> {
+      let _ = process.cancel_timer(timer)
+      Nil
+    }
+    None -> Nil
+  }
+  notify_waiters(entry.waiters, outcome)
 }

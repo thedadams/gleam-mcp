@@ -20,6 +20,7 @@ pub type ListenerMessage {
   DeliverRequest(jsonrpc.Request(actions.ServerActionRequest))
   DeliverNotification(jsonrpc.Request(actions.ActionNotification))
   DeliverResponse(String)
+  DeliverReplay(event_id: String, payload: String, close: Bool)
   CloseListener
 }
 
@@ -48,6 +49,7 @@ type Message {
   UnregisterListener(
     session_id: String,
     listener_id: String,
+    owner: Option(process.Pid),
     reply_to: process.Subject(Nil),
   )
   SendRequest(
@@ -57,10 +59,19 @@ type Message {
       Result(jsonrpc.Response(actions.ServerActionResult), jsonrpc.RpcError),
     ),
     timeout_ms: Int,
+    record: Option(fn(String, String) -> String),
   )
   SendNotification(
     session_id: String,
     notification: jsonrpc.Request(actions.ActionNotification),
+    record: Option(fn(String, String) -> String),
+  )
+  SendRecorded(String, String, String)
+  SendStreamResponse(
+    String,
+    String,
+    String,
+    Option(fn(String, String) -> String),
   )
   ResolveResponse(
     session_id: String,
@@ -103,6 +114,7 @@ type PendingRequest {
     caller: process.Pid,
     monitor: process.Monitor,
     timer: process.Timer,
+    record: Option(fn(String, String) -> String),
   )
 }
 
@@ -184,7 +196,24 @@ pub fn unregister_listener(
 ) -> Nil {
   let Store(subject) = store
   let reply_to = process.new_subject()
-  process.send(subject, UnregisterListener(session_id, listener_id, reply_to))
+  process.send(
+    subject,
+    UnregisterListener(session_id, listener_id, None, reply_to),
+  )
+  expect_ok(process.receive(reply_to, 1000))
+}
+
+pub fn unregister_listener_owned(
+  store: Store,
+  session_id: String,
+  listener_id: String,
+  owner: process.Pid,
+) -> Nil {
+  let reply_to = process.new_subject()
+  process.send(
+    store.subject,
+    UnregisterListener(session_id, listener_id, Some(owner), reply_to),
+  )
   expect_ok(process.receive(reply_to, 1000))
 }
 
@@ -194,9 +223,22 @@ pub fn send_request(
   request: jsonrpc.Request(actions.ServerActionRequest),
   timeout_ms: Int,
 ) -> Result(jsonrpc.Response(actions.ServerActionResult), jsonrpc.RpcError) {
+  send_request_with_recorder(store, session_id, request, timeout_ms, None)
+}
+
+pub fn send_request_with_recorder(
+  store: Store,
+  session_id: String,
+  request: jsonrpc.Request(actions.ServerActionRequest),
+  timeout_ms: Int,
+  record: Option(fn(String, String) -> String),
+) -> Result(jsonrpc.Response(actions.ServerActionResult), jsonrpc.RpcError) {
   let Store(subject) = store
   let reply_to = process.new_subject()
-  process.send(subject, SendRequest(session_id, request, reply_to, timeout_ms))
+  process.send(
+    subject,
+    SendRequest(session_id, request, reply_to, timeout_ms, record),
+  )
 
   case process.receive(reply_to, timeout_ms) {
     Ok(response) -> response
@@ -217,8 +259,42 @@ pub fn send_notification(
   session_id: String,
   notification: jsonrpc.Request(actions.ActionNotification),
 ) -> Nil {
+  send_notification_with_recorder(store, session_id, notification, None)
+}
+
+pub fn send_notification_with_recorder(
+  store: Store,
+  session_id: String,
+  notification: jsonrpc.Request(actions.ActionNotification),
+  record: Option(fn(String, String) -> String),
+) -> Nil {
+  process.send(
+    store.subject,
+    SendNotification(session_id, notification, record),
+  )
+}
+
+pub fn send_stream_response(
+  store: Store,
+  session_id: String,
+  stream_id: String,
+  payload: String,
+  record: Option(fn(String, String) -> String),
+) -> Nil {
+  process.send(
+    store.subject,
+    SendStreamResponse(session_id, stream_id, payload, record),
+  )
+}
+
+pub fn send_recorded_event(
+  store: Store,
+  session_id: String,
+  event_id: String,
+  payload: String,
+) -> Nil {
   let Store(subject) = store
-  process.send(subject, SendNotification(session_id, notification))
+  process.send(subject, SendRecorded(session_id, event_id, payload))
 }
 
 pub fn resolve_response(
@@ -310,12 +386,13 @@ fn loop(
       process.send(reply_to, Nil)
       loop(subject, next_sessions, metadata)
     }
-    UnregisterListener(session_id, listener_id, reply_to) -> {
-      let next_sessions = detach_listener(sessions, session_id, listener_id)
+    UnregisterListener(session_id, listener_id, owner, reply_to) -> {
+      let next_sessions =
+        detach_listener_owned(sessions, session_id, listener_id, owner)
       process.send(reply_to, Nil)
       loop(subject, next_sessions, metadata)
     }
-    SendRequest(session_id, request, reply_to, timeout_ms) -> {
+    SendRequest(session_id, request, reply_to, timeout_ms, record) -> {
       let next_sessions = case dict.has_key(sessions, session_id) {
         True ->
           enqueue_request(
@@ -325,6 +402,7 @@ fn loop(
             request,
             reply_to,
             timeout_ms,
+            record,
           )
         False -> {
           process.send(
@@ -338,10 +416,35 @@ fn loop(
       }
       loop(subject, next_sessions, metadata)
     }
-    SendNotification(session_id, notification) -> {
+    SendNotification(session_id, notification, record) -> {
       let next_sessions =
-        deliver_notification(sessions, session_id, notification)
+        deliver_recorded_notification(
+          sessions,
+          session_id,
+          notification,
+          record,
+        )
       loop(subject, next_sessions, metadata)
+    }
+    SendRecorded(session_id, event_id, payload) -> {
+      let next =
+        deliver_message(
+          sessions,
+          session_id,
+          DeliverReplay(event_id, payload, False),
+        )
+      loop(subject, next, metadata)
+    }
+    SendStreamResponse(session_id, stream_id, payload, record) -> {
+      let next =
+        deliver_stream_response(
+          sessions,
+          session_id,
+          stream_id,
+          payload,
+          record,
+        )
+      loop(subject, next, metadata)
     }
     ResolveResponse(session_id, body, reply_to) -> {
       let #(next_sessions, result) =
@@ -386,18 +489,72 @@ fn loop(
   }
 }
 
-fn deliver_notification(
+fn deliver_recorded_notification(
   sessions: Dict(String, Session),
   session_id: String,
   notification: jsonrpc.Request(actions.ActionNotification),
+  record: Option(fn(String, String) -> String),
+) -> Dict(String, Session) {
+  case dict.get(sessions, session_id) {
+    Error(_) -> sessions
+    Ok(session) -> {
+      let listeners = live_listeners(session.listener)
+      let chosen = list.first(listeners)
+      let message = case record {
+        None -> DeliverNotification(notification)
+        Some(record) -> {
+          let stream = case chosen {
+            Ok(listener) -> listener.id
+            Error(_) -> "notifications"
+          }
+          let payload = client_codec.encode_notification(notification)
+          DeliverReplay(record(stream, payload), payload, False)
+        }
+      }
+      case chosen {
+        Ok(listener) -> process.send(listener.subject, message)
+        Error(_) -> Nil
+      }
+      dict.insert(sessions, session_id, Session(..session, listener: listeners))
+    }
+  }
+}
+
+fn deliver_stream_response(
+  sessions: Dict(String, Session),
+  session_id: String,
+  stream_id: String,
+  payload: String,
+  record: Option(fn(String, String) -> String),
+) -> Dict(String, Session) {
+  case dict.get(sessions, session_id) {
+    Error(_) -> sessions
+    Ok(session) -> {
+      let listeners = live_listeners(session.listener)
+      let message = case record {
+        Some(record) -> DeliverReplay(record(stream_id, payload), payload, True)
+        None -> DeliverResponse(payload)
+      }
+      case list.find(listeners, fn(listener) { listener.id == stream_id }) {
+        Ok(listener) -> process.send(listener.subject, message)
+        Error(_) -> Nil
+      }
+      dict.insert(sessions, session_id, Session(..session, listener: listeners))
+    }
+  }
+}
+
+fn deliver_message(
+  sessions: Dict(String, Session),
+  session_id: String,
+  message: ListenerMessage,
 ) -> Dict(String, Session) {
   case dict.get(sessions, session_id) {
     Error(_) -> sessions
     Ok(session) -> {
       let listeners = live_listeners(session.listener)
       case list.first(listeners) {
-        Ok(listener) ->
-          process.send(listener.subject, DeliverNotification(notification))
+        Ok(listener) -> process.send(listener.subject, message)
         Error(_) -> Nil
       }
       dict.insert(sessions, session_id, Session(..session, listener: listeners))
@@ -458,6 +615,13 @@ fn attach_listener(
       case process.is_alive(owner) {
         False -> sessions
         True -> {
+          case dict.get(sessions, session_id) {
+            Ok(session) ->
+              session.listener
+              |> list.filter(fn(old) { old.id == listener_id })
+              |> list.each(fn(old) { process.send(old.subject, CloseListener) })
+            Error(_) -> Nil
+          }
           let sessions = detach_listener(sessions, session_id, listener_id)
           let Session(queued_requests, pending_requests, current_listener) =
             get_session(sessions, session_id)
@@ -466,7 +630,17 @@ fn attach_listener(
 
           queued_requests
           |> list.each(fn(request) {
-            process.send(listener, DeliverRequest(request))
+            let record = case
+              dict.get(pending_requests, request_id_key(request_id(request)))
+            {
+              Ok(pending) -> pending.record
+              Error(_) -> None
+            }
+            deliver_request(
+              Listener(listener_id, listener, owner, monitor),
+              request,
+              record,
+            )
           })
 
           dict.insert(
@@ -487,11 +661,24 @@ fn detach_listener(
   session_id: String,
   listener_id: String,
 ) -> Dict(String, Session) {
+  detach_listener_owned(sessions, session_id, listener_id, None)
+}
+
+fn detach_listener_owned(
+  sessions: Dict(String, Session),
+  session_id: String,
+  listener_id: String,
+  owner: Option(process.Pid),
+) -> Dict(String, Session) {
   case dict.get(sessions, session_id) {
     Ok(Session(queued_requests, pending_requests, current_listener)) -> {
       let next_listener =
         list.filter(current_listener, fn(listener) {
-          case listener.id == listener_id {
+          let owned = case owner {
+            None -> True
+            Some(owner) -> listener.owner == owner
+          }
+          case listener.id == listener_id && owned {
             False -> True
             True -> {
               process.demonitor_process(listener.monitor)
@@ -519,6 +706,7 @@ fn enqueue_request(
     Result(jsonrpc.Response(actions.ServerActionResult), jsonrpc.RpcError),
   ),
   timeout_ms: Int,
+  record: Option(fn(String, String) -> String),
 ) -> Dict(String, Session) {
   let session = get_session(sessions, session_id)
   let Session(queued_requests, pending_requests, current_listener) = session
@@ -550,8 +738,7 @@ fn enqueue_request(
           ExpireRequest(session_id, request_id(request), reply_to),
         )
       case list.first(listener) {
-        Ok(Listener(subject: listener_subject, ..)) ->
-          process.send(listener_subject, DeliverRequest(request))
+        Ok(listener) -> deliver_request(listener, request, record)
         Error(_) -> Nil
       }
 
@@ -566,7 +753,7 @@ fn enqueue_request(
           dict.insert(
             pending_requests,
             request_id_key(request_id(request)),
-            PendingRequest(request, reply_to, caller, monitor, timer),
+            PendingRequest(request, reply_to, caller, monitor, timer, record),
           ),
           listener,
         )
@@ -574,6 +761,21 @@ fn enqueue_request(
       dict.insert(sessions, session_id, next_session)
     }
   }
+}
+
+fn deliver_request(
+  listener: Listener,
+  request: jsonrpc.Request(actions.ServerActionRequest),
+  record: Option(fn(String, String) -> String),
+) -> Nil {
+  let message = case record {
+    None -> DeliverRequest(request)
+    Some(record) -> {
+      let payload = client_codec.encode_server_request(request)
+      DeliverReplay(record(listener.id, payload), payload, False)
+    }
+  }
+  process.send(listener.subject, message)
 }
 
 fn resolve_pending_response(
@@ -676,7 +878,7 @@ fn expire_and_cancel(
             session.listener,
           ),
         )
-      deliver_notification(
+      deliver_recorded_notification(
         next,
         session_id,
         jsonrpc.Notification(
@@ -689,6 +891,7 @@ fn expire_and_cancel(
             )),
           ),
         ),
+        pending.record,
       )
     }
   }

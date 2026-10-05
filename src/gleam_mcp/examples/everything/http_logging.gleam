@@ -1,3 +1,4 @@
+import gleam/crypto
 import gleam/dict
 import gleam/erlang/process
 import gleam/int
@@ -10,28 +11,35 @@ import gleam_mcp/server
 import gleam_mcp/server/streamable_http
 
 pub opaque type Logger {
-  Logger(subject: process.Subject(LoggerMessage))
+  Logger(subject: process.Subject(LoggerMessage), label_sessions: Bool)
 }
 
 type LoggerMessage {
+  Bind(server.Server, process.Subject(Nil))
   Toggle(session_id: String, reply_to: process.Subject(Bool))
   SetLevel(session_id: String, level: actions.LoggingLevel)
+  Send(session_id: String, params: actions.LoggingMessageNotificationParams)
+  Tick(session_id: String, generation: Int)
+  Cleanup(session_id: String, reply_to: process.Subject(Nil))
+  Stop(reply_to: process.Subject(Nil))
 }
 
 type SessionLogger {
-  SessionLogger(enabled: Bool, minimum_level: actions.LoggingLevel, tick: Int)
+  SessionLogger(minimum_level: actions.LoggingLevel, interval: Option(Interval))
+}
+
+type Interval {
+  Interval(generation: Int, timer: process.Timer)
 }
 
 pub fn middleware(logger: Logger) -> streamable_http.ClientActionMiddleware {
   fn(_, _, session_id, message) {
     case message {
-      jsonrpc.Request(_, _, Some(actions.ClientRequestSetLoggingLevel(params))) -> {
-        let actions.SetLevelRequestParams(level, _) = params
-        set_logger_level(logger, session_id, level)
-        streamable_http.Continue
-      }
-      _ -> streamable_http.Continue
+      jsonrpc.Request(_, _, Some(actions.ClientRequestSetLoggingLevel(params))) ->
+        set_level(logger, session_id, params.level)
+      _ -> Nil
     }
+    streamable_http.Continue
   }
 }
 
@@ -43,7 +51,15 @@ pub fn toggle_tool(
 ) -> Result(actions.CallToolResult, jsonrpc.RpcError) {
   case server.session_id(context) {
     Some(session_id) ->
-      Ok(toggle_result(toggle_logger(logger, session_id), session_id))
+      Ok(
+        toggle_result(
+          toggle_logger(logger, session_id),
+          case logger.label_sessions {
+            True -> session_id
+            False -> "undefined"
+          },
+        ),
+      )
     None ->
       Error(jsonrpc.invalid_params_error(
         "toggle-simulated-logging requires a session-based transport",
@@ -56,163 +72,312 @@ fn toggle_result(enabled: Bool, session_id: String) -> actions.CallToolResult {
     True ->
       "Started simulated, random-leveled logging for session "
       <> session_id
-      <> " at a 5 second pace. Client's selected logging level will be respected."
+      <> " at a 5 second pace. Client's selected logging level will be respected. "
+      <> "If an interval elapses and the message to be sent is below the selected level, "
+      <> "it will not be sent. Thus at higher chosen logging levels, messages should arrive further apart. "
     False -> "Stopped simulated logging for session " <> session_id
   }
-
   actions.CallToolResult(
-    content: [actions.TextBlock(actions.TextContent(text, None, None))],
-    structured_content: None,
-    is_error: Some(False),
-    meta: None,
+    [actions.TextBlock(actions.TextContent(text, None, None))],
+    None,
+    None,
+    None,
   )
 }
 
 pub fn new_logger(app_server: server.Server) -> Logger {
-  let reply_to = process.new_subject()
-  let _ = process.spawn(fn() { start_logger(app_server, reply_to) })
-  Logger(expect_ok(process.receive(reply_to, within: 1000)))
+  new_logger_with_config(app_server, 5000, True)
 }
 
-fn start_logger(
+/// Keep a supplied logger attached to the factory's actual transport stores.
+pub fn bind(logger: Logger, app: server.Server) -> Nil {
+  let reply = process.new_subject()
+  process.send(logger.subject, Bind(app, reply))
+  let assert Ok(Nil) = process.receive(reply, 1000)
+  Nil
+}
+
+/// The normal example interval is five seconds. A shorter interval is useful
+/// when demonstrating or verifying the simulation without waiting for it.
+pub fn new_logger_with_interval(
   app_server: server.Server,
-  reply_to: process.Subject(process.Subject(LoggerMessage)),
-) {
-  let subject = process.new_subject()
-  process.send(reply_to, subject)
-  logger_loop(app_server, subject, dict.new())
+  interval_ms: Int,
+) -> Logger {
+  new_logger_with_config(app_server, interval_ms, True)
+}
+
+pub fn new_without_session_labels(app: server.Server) -> Logger {
+  new_logger_with_config(app, 5000, False)
+}
+
+fn new_logger_with_config(
+  app_server: server.Server,
+  interval_ms: Int,
+  label_sessions: Bool,
+) -> Logger {
+  let reply_to = process.new_subject()
+  let _ =
+    process.spawn_unlinked(fn() {
+      let subject = process.new_subject()
+      process.send(reply_to, subject)
+      logger_loop(
+        app_server,
+        label_sessions,
+        subject,
+        int.max(interval_ms, 1),
+        dict.new(),
+        0,
+      )
+    })
+  Logger(expect_ok(process.receive(reply_to, within: 1000)), label_sessions)
 }
 
 fn logger_loop(
-  app_server: server.Server,
+  app: server.Server,
+  label_sessions: Bool,
   subject: process.Subject(LoggerMessage),
+  interval_ms: Int,
   sessions: dict.Dict(String, SessionLogger),
+  generation: Int,
 ) -> Nil {
-  case process.receive(subject, within: 5000) {
-    Ok(Toggle(session_id, reply_to)) -> {
-      let SessionLogger(enabled, minimum_level, tick) =
-        session_logger(sessions, session_id)
-      let next_enabled = !enabled
-      process.send(reply_to, next_enabled)
+  case process.receive_forever(subject) {
+    Bind(next_app, reply) -> {
+      process.send(reply, Nil)
       logger_loop(
-        app_server,
+        next_app,
+        label_sessions,
         subject,
-        dict.insert(
-          sessions,
-          session_id,
-          SessionLogger(next_enabled, minimum_level, tick),
-        ),
+        interval_ms,
+        sessions,
+        generation,
       )
     }
-    Ok(SetLevel(session_id, level)) -> {
-      let SessionLogger(enabled, _, tick) = session_logger(sessions, session_id)
+    Toggle(id, reply_to) -> {
+      let state = session_logger(sessions, id)
+      let next = case state.interval {
+        Some(interval) -> {
+          cancel_interval(Some(interval))
+          SessionLogger(state.minimum_level, None)
+        }
+        None -> {
+          emit_log(app, label_sessions, id, state.minimum_level)
+          SessionLogger(
+            state.minimum_level,
+            Some(Interval(
+              generation,
+              process.send_after(subject, interval_ms, Tick(id, generation)),
+            )),
+          )
+        }
+      }
+      process.send(reply_to, option_is_some(next.interval))
       logger_loop(
-        app_server,
+        app,
+        label_sessions,
         subject,
-        dict.insert(sessions, session_id, SessionLogger(enabled, level, tick)),
+        interval_ms,
+        dict.insert(sessions, id, next),
+        generation + 1,
       )
     }
-    Error(Nil) ->
-      logger_loop(app_server, subject, emit_logs(app_server, sessions))
+    SetLevel(id, level) -> {
+      let state = session_logger(sessions, id)
+      logger_loop(
+        app,
+        label_sessions,
+        subject,
+        interval_ms,
+        dict.insert(sessions, id, SessionLogger(..state, minimum_level: level)),
+        generation,
+      )
+    }
+    Send(id, params) -> {
+      emit_message(app, id, session_logger(sessions, id).minimum_level, params)
+      logger_loop(
+        app,
+        label_sessions,
+        subject,
+        interval_ms,
+        sessions,
+        generation,
+      )
+    }
+    Tick(id, token) -> {
+      let next = case dict.get(sessions, id) {
+        Ok(SessionLogger(level, Some(Interval(current, _))))
+          if current == token
+        -> {
+          case server.has_streamable_http_session(app, id) {
+            True -> {
+              emit_log(app, label_sessions, id, level)
+              dict.insert(
+                sessions,
+                id,
+                SessionLogger(
+                  level,
+                  Some(Interval(
+                    token,
+                    process.send_after(subject, interval_ms, Tick(id, token)),
+                  )),
+                ),
+              )
+            }
+            False -> dict.delete(sessions, id)
+          }
+        }
+        _ -> sessions
+      }
+      logger_loop(app, label_sessions, subject, interval_ms, next, generation)
+    }
+    Cleanup(id, reply_to) -> {
+      cancel_interval(session_logger(sessions, id).interval)
+      process.send(reply_to, Nil)
+      logger_loop(
+        app,
+        label_sessions,
+        subject,
+        interval_ms,
+        dict.delete(sessions, id),
+        generation,
+      )
+    }
+    Stop(reply_to) -> {
+      list.each(dict.values(sessions), fn(state) {
+        cancel_interval(state.interval)
+      })
+      process.send(reply_to, Nil)
+    }
   }
 }
 
-fn emit_logs(
-  app_server: server.Server,
-  sessions: dict.Dict(String, SessionLogger),
-) -> dict.Dict(String, SessionLogger) {
-  list.fold(
-    over: dict.to_list(sessions),
-    from: dict.new(),
-    with: fn(acc, entry) {
-      let #(session_id, SessionLogger(enabled, minimum_level, tick)) = entry
-      case enabled {
-        True -> {
-          let level = logging_level_for_tick(tick)
-          let _ = case
-            logging_level_priority(level)
-            >= logging_level_priority(minimum_level)
-          {
-            True ->
-              server.send_notification(
-                app_server,
-                server.RequestContext(
-                  session_id: Some(session_id),
-                  task_id: None,
-                ),
-                jsonrpc.Notification(
-                  mcp.method_notify_logging_message,
-                  Some(
-                    actions.NotifyLoggingMessage(
-                      actions.LoggingMessageNotificationParams(
-                        level,
-                        Some("gleam-mcp/everything"),
-                        jsonrpc.VString(logging_message_for_tick(tick)),
-                        None,
-                      ),
-                    ),
-                  ),
-                ),
-              )
-            False -> Ok(Nil)
-          }
-          dict.insert(
-            acc,
-            session_id,
-            SessionLogger(True, minimum_level, tick + 1),
-          )
-        }
-        False ->
-          dict.insert(
-            acc,
-            session_id,
-            SessionLogger(False, minimum_level, tick),
-          )
-      }
-    },
+fn emit_log(
+  app: server.Server,
+  label_sessions: Bool,
+  id: String,
+  minimum: actions.LoggingLevel,
+) -> Nil {
+  let assert <<random:8>> = crypto.strong_random_bytes(1)
+  let level = level_at(random % 8)
+  emit_message(
+    app,
+    id,
+    minimum,
+    actions.LoggingMessageNotificationParams(
+      level,
+      None,
+      jsonrpc.VString(
+        level_message(level)
+        <> case label_sessions {
+          True -> " - SessionId " <> id
+          False -> ""
+        },
+      ),
+      None,
+    ),
   )
 }
 
-fn toggle_logger(logger: Logger, session_id: String) -> Bool {
-  let Logger(subject) = logger
-  let reply_to = process.new_subject()
-  process.send(subject, Toggle(session_id, reply_to))
-  expect_ok(process.receive(reply_to, within: 1000))
+fn emit_message(
+  app: server.Server,
+  id: String,
+  minimum: actions.LoggingLevel,
+  params: actions.LoggingMessageNotificationParams,
+) -> Nil {
+  case level_priority(params.level) >= level_priority(minimum) {
+    True -> {
+      let _ =
+        server.send_notification(
+          app,
+          server.RequestContext(Some(id), None),
+          jsonrpc.Notification(
+            mcp.method_notify_logging_message,
+            Some(actions.NotifyLoggingMessage(params)),
+          ),
+        )
+      Nil
+    }
+    False -> Nil
+  }
 }
 
-fn set_logger_level(
+/// Send a regular example log through the client's selected minimum level.
+pub fn send(
+  logger: Logger,
+  session_id: String,
+  params: actions.LoggingMessageNotificationParams,
+) -> Nil {
+  process.send(logger.subject, Send(session_id, params))
+}
+
+pub fn set_level(
   logger: Logger,
   session_id: String,
   level: actions.LoggingLevel,
 ) -> Nil {
-  let Logger(subject) = logger
-  process.send(subject, SetLevel(session_id, level))
+  process.send(logger.subject, SetLevel(session_id, level))
+}
+
+pub fn cleanup_session(logger: Logger, session_id: String) -> Nil {
+  let reply_to = process.new_subject()
+  process.send(logger.subject, Cleanup(session_id, reply_to))
+  let _ = process.receive(reply_to, 1000)
+  Nil
+}
+
+pub fn stop(logger: Logger) -> Nil {
+  let reply_to = process.new_subject()
+  process.send(logger.subject, Stop(reply_to))
+  let _ = process.receive(reply_to, 1000)
+  Nil
+}
+
+fn toggle_logger(logger: Logger, session_id: String) -> Bool {
+  let reply_to = process.new_subject()
+  process.send(logger.subject, Toggle(session_id, reply_to))
+  expect_ok(process.receive(reply_to, within: 1000))
 }
 
 fn session_logger(
   sessions: dict.Dict(String, SessionLogger),
-  session_id: String,
+  id: String,
 ) -> SessionLogger {
-  case dict.get(sessions, session_id) {
+  case dict.get(sessions, id) {
     Ok(state) -> state
-    Error(Nil) -> SessionLogger(False, actions.Debug, 0)
+    Error(_) -> SessionLogger(actions.Debug, None)
   }
 }
 
-fn logging_level_for_tick(tick: Int) -> actions.LoggingLevel {
-  case int.remainder(tick, 8) {
-    Ok(0) -> actions.Debug
-    Ok(1) -> actions.Info
-    Ok(2) -> actions.Notice
-    Ok(3) -> actions.Warning
-    Ok(4) -> actions.Error
-    Ok(5) -> actions.Critical
-    Ok(6) -> actions.Alert
+fn cancel_interval(interval: Option(Interval)) -> Nil {
+  case interval {
+    Some(Interval(_, timer)) -> {
+      let _ = process.cancel_timer(timer)
+      Nil
+    }
+    None -> Nil
+  }
+}
+
+fn option_is_some(value: Option(a)) -> Bool {
+  case value {
+    Some(_) -> True
+    None -> False
+  }
+}
+
+fn level_at(index: Int) -> actions.LoggingLevel {
+  case index {
+    0 -> actions.Debug
+    1 -> actions.Info
+    2 -> actions.Notice
+    3 -> actions.Warning
+    4 -> actions.Error
+    5 -> actions.Critical
+    6 -> actions.Alert
     _ -> actions.Emergency
   }
 }
 
-fn logging_level_priority(level: actions.LoggingLevel) -> Int {
+fn level_priority(level: actions.LoggingLevel) -> Int {
   case level {
     actions.Debug -> 0
     actions.Info -> 1
@@ -225,18 +390,22 @@ fn logging_level_priority(level: actions.LoggingLevel) -> Int {
   }
 }
 
-fn logging_message_for_tick(tick: Int) -> String {
-  case int.remainder(tick, 4) {
-    Ok(0) -> "Simulated Everything log: resource poll complete"
-    Ok(1) -> "Simulated Everything log: prompt registry healthy"
-    Ok(2) -> "Simulated Everything log: tool execution heartbeat"
-    _ -> "Simulated Everything log: session idle"
+fn level_message(level: actions.LoggingLevel) -> String {
+  case level {
+    actions.Debug -> "Debug-level message"
+    actions.Info -> "Info-level message"
+    actions.Notice -> "Notice-level message"
+    actions.Warning -> "Warning-level message"
+    actions.Error -> "Error-level message"
+    actions.Critical -> "Critical-level message"
+    actions.Alert -> "Alert level-message"
+    actions.Emergency -> "Emergency-level message"
   }
 }
 
 fn expect_ok(value: Result(a, Nil)) -> a {
   case value {
     Ok(inner) -> inner
-    Error(Nil) -> panic as "Timed out waiting for Everything HTTP logger"
+    Error(Nil) -> panic as "Timed out waiting for Everything logger"
   }
 }

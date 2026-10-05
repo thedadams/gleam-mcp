@@ -1176,7 +1176,9 @@ fn initialize_request_params_decoder() -> decode.Decoder(
   }
 }
 
-fn client_capabilities_decoder() -> decode.Decoder(actions.ClientCapabilities) {
+pub fn client_capabilities_decoder() -> decode.Decoder(
+  actions.ClientCapabilities,
+) {
   {
     use experimental <- decode.optional_field(
       "experimental",

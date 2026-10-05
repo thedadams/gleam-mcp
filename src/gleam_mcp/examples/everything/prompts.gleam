@@ -8,210 +8,180 @@ import gleam_mcp/examples/everything/resources
 import gleam_mcp/jsonrpc
 import gleam_mcp/server
 
-pub fn register_prompts(app_server: server.Server) -> server.Server {
-  app_server
-  |> server.add_prompt(
+pub fn register_prompts(app: server.Server) -> server.Server {
+  app
+  |> register(
     "simple-prompt",
-    "A simple Everything prompt",
+    "Simple Prompt",
+    "A prompt with no arguments",
     [],
     simple_prompt,
   )
-  |> server.add_prompt(
+  |> register(
     "args-prompt",
-    "A prompt with required and optional arguments",
+    "Arguments Prompt",
+    "A prompt with two arguments, one required and one optional",
     [
-      actions.PromptArgument(
-        name: "city",
-        title: None,
-        description: Some("City to ask about"),
-        required: Some(True),
-      ),
-      actions.PromptArgument(
-        name: "state",
-        title: None,
-        description: Some("Optional state or region"),
-        required: Some(False),
-      ),
+      argument("city", "Name of the city", True),
+      actions.PromptArgument("state", None, None, Some(False)),
     ],
     args_prompt,
   )
-  |> server.add_prompt(
+  |> register(
     "resource-prompt",
-    "A prompt that embeds a dynamic resource",
+    "Resource Prompt",
+    "A prompt that includes an embedded resource reference",
     [
-      actions.PromptArgument(
-        name: "resourceType",
-        title: None,
-        description: Some("Text or Blob"),
-        required: Some(True),
-      ),
-      actions.PromptArgument(
-        name: "resourceId",
-        title: None,
-        description: Some("A positive integer resource id"),
-        required: Some(True),
-      ),
+      argument("resourceType", "Type of resource to fetch", True),
+      argument("resourceId", "ID of the text resource to fetch", True),
     ],
     resource_prompt,
   )
-  |> server.add_prompt(
+  |> register(
     "completable-prompt",
-    "A prompt intended to exercise argument completions",
+    "Team Management",
+    "First argument choice narrows values for second argument.",
     [
-      actions.PromptArgument(
-        name: "department",
-        title: None,
-        description: Some("Engineering, Support, or Research"),
-        required: Some(True),
-      ),
-      actions.PromptArgument(
-        name: "name",
-        title: None,
-        description: Some("A suggested teammate name for the chosen department"),
-        required: Some(True),
+      argument("department", "Choose the department.", True),
+      argument(
+        "name",
+        "Choose a team member to lead the selected department.",
+        True,
       ),
     ],
     completable_prompt,
   )
 }
 
+fn register(
+  app: server.Server,
+  name: String,
+  title: String,
+  description: String,
+  arguments: List(actions.PromptArgument),
+  handler: server.PromptHandler,
+) -> server.Server {
+  server.register_prompt_descriptor(
+    app,
+    actions.Prompt(name, Some(title), Some(description), arguments, [], None),
+    handler,
+  )
+}
+
+fn argument(
+  name: String,
+  description: String,
+  required: Bool,
+) -> actions.PromptArgument {
+  actions.PromptArgument(name, None, Some(description), Some(required))
+}
+
 pub fn completion_handler(
   params: actions.CompleteRequestParams,
 ) -> Result(actions.CompleteResult, jsonrpc.RpcError) {
-  let actions.CompleteRequestParams(ref, argument, context, _) = params
+  let actions.CompleteRequestParams(reference, argument, context, _) = params
   let actions.CompleteArgument(name, value) = argument
-
-  let values = case ref, name {
+  let values = case reference, name {
     actions.PromptRef("completable-prompt", _), "department" ->
-      filter_matches(["Engineering", "Support", "Research"], value)
+      filter_matches(["Engineering", "Sales", "Marketing", "Support"], value)
     actions.PromptRef("completable-prompt", _), "name" ->
-      filter_matches(prompt_name_suggestions(context), value)
+      filter_matches(team_members(context), value)
     actions.PromptRef("resource-prompt", _), "resourceType" ->
       filter_matches(["Text", "Blob"], value)
     actions.PromptRef("resource-prompt", _), "resourceId" ->
-      filter_matches(["1", "2", "3", "4"], value)
-    actions.ResourceTemplateRef(uri), _
+      complete_resource_id(value)
+    actions.ResourceTemplateRef(uri), "resourceId"
       if uri == resources.dynamic_text_template
-    -> filter_matches(["1", "2", "3", "4"], value)
-    actions.ResourceTemplateRef(uri), _
-      if uri == resources.dynamic_blob_template
-    -> filter_matches(["1", "2", "3", "4"], value)
+      || uri == resources.dynamic_blob_template
+    -> complete_resource_id(value)
     _, _ -> []
   }
-
   Ok(actions.CompleteResult(
-    completion: actions.CompletionValues(
-      values,
-      Some(list.length(values)),
-      Some(False),
-    ),
-    meta: None,
+    actions.CompletionValues(values, Some(list.length(values)), Some(False)),
+    None,
   ))
+}
+
+fn complete_resource_id(value: String) -> List(String) {
+  case resources.positive_resource_id(value) {
+    Ok(_) -> [value]
+    Error(_) -> []
+  }
 }
 
 fn simple_prompt(
   _arguments: Option(dict.Dict(String, String)),
 ) -> Result(actions.GetPromptResult, jsonrpc.RpcError) {
-  Ok(actions.GetPromptResult(
-    description: Some("A basic prompt from the Gleam Everything server"),
-    messages: [
-      actions.PromptMessage(
-        actions.User,
-        actions.TextBlock(actions.TextContent(
-          "Please describe what the Gleam Everything server demonstrates.",
-          None,
-          None,
-        )),
-      ),
-    ],
-    meta: None,
-  ))
+  Ok(
+    prompt_result([text_message("This is a simple prompt without arguments.")]),
+  )
 }
 
 fn args_prompt(
   arguments: Option(dict.Dict(String, String)),
 ) -> Result(actions.GetPromptResult, jsonrpc.RpcError) {
-  case require_prompt_argument(arguments, "city") {
-    Ok(city) -> {
-      let location = case optional_prompt_argument(arguments, "state") {
-        Some(state) -> city <> ", " <> state
-        None -> city
-      }
-
-      Ok(actions.GetPromptResult(
-        description: Some("A prompt assembled from supplied arguments"),
-        messages: [
-          actions.PromptMessage(
-            actions.User,
-            actions.TextBlock(actions.TextContent(
-              "What should a visitor know about the tech scene in "
-                <> location
-                <> "?",
-              None,
-              None,
-            )),
-          ),
-        ],
-        meta: None,
-      ))
-    }
+  case required_argument(arguments, "city") {
     Error(error) -> Error(error)
+    Ok(city) -> {
+      let location = case optional_argument(arguments, "state") {
+        Some(state) if state != "" -> city <> ", " <> state
+        _ -> city
+      }
+      Ok(prompt_result([text_message("What's weather in " <> location <> "?")]))
+    }
   }
 }
 
 fn resource_prompt(
   arguments: Option(dict.Dict(String, String)),
 ) -> Result(actions.GetPromptResult, jsonrpc.RpcError) {
-  case resource_choice(arguments) {
-    Ok(#("Text", id)) ->
-      Ok(actions.GetPromptResult(
-        description: Some("A prompt that includes an embedded text resource"),
-        messages: [
-          actions.PromptMessage(
-            actions.User,
-            actions.TextBlock(actions.TextContent(
-              "Review the embedded text resource and summarize its contents.",
-              None,
-              None,
-            )),
-          ),
-          actions.PromptMessage(
-            actions.Assistant,
-            actions.EmbeddedResourceBlock(actions.EmbeddedResource(
-              resources.text_resource_contents(id),
-              None,
-              None,
-            )),
-          ),
-        ],
-        meta: None,
-      ))
-    Ok(#("Blob", id)) ->
-      Ok(actions.GetPromptResult(
-        description: Some("A prompt that includes an embedded blob resource"),
-        messages: [
-          actions.PromptMessage(
-            actions.User,
-            actions.TextBlock(actions.TextContent(
-              "Inspect the embedded blob resource metadata and describe what it represents.",
-              None,
-              None,
-            )),
-          ),
-          actions.PromptMessage(
-            actions.Assistant,
-            actions.EmbeddedResourceBlock(actions.EmbeddedResource(
-              resources.blob_resource_contents(id),
-              None,
-              None,
-            )),
-          ),
-        ],
-        meta: None,
-      ))
-    Ok(#(_, _)) ->
-      Error(jsonrpc.invalid_params_error("resourceType must be Text or Blob"))
-    Error(error) -> Error(error)
+  case
+    required_argument(arguments, "resourceType"),
+    required_argument(arguments, "resourceId")
+  {
+    Error(error), _ | _, Error(error) -> Error(error)
+    Ok(kind), Ok(value) -> {
+      case
+        kind == "Text" || kind == "Blob",
+        resources.positive_resource_id(value)
+      {
+        False, _ ->
+          Error(jsonrpc.invalid_params_error(
+            "Invalid resourceType: " <> kind <> ". Must be Text or Blob.",
+          ))
+        _, Error(_) ->
+          Error(jsonrpc.invalid_params_error(
+            "Invalid resourceId: "
+            <> value
+            <> ". Must be a finite positive integer.",
+          ))
+        True, Ok(id) -> {
+          let content = case kind {
+            "Text" -> resources.text_resource_contents(id)
+            _ -> resources.blob_resource_contents(id)
+          }
+          Ok(
+            prompt_result([
+              text_message(
+                "This prompt includes the "
+                <> kind
+                <> " resource with id: "
+                <> int.to_string(id)
+                <> ". Please analyze the following resource:",
+              ),
+              actions.PromptMessage(
+                actions.User,
+                actions.EmbeddedResourceBlock(actions.EmbeddedResource(
+                  content,
+                  None,
+                  None,
+                )),
+              ),
+            ]),
+          )
+        }
+      }
+    }
   }
 }
 
@@ -219,102 +189,70 @@ fn completable_prompt(
   arguments: Option(dict.Dict(String, String)),
 ) -> Result(actions.GetPromptResult, jsonrpc.RpcError) {
   case
-    require_prompt_argument(arguments, "department"),
-    require_prompt_argument(arguments, "name")
+    required_argument(arguments, "department"),
+    required_argument(arguments, "name")
   {
     Ok(department), Ok(name) ->
-      Ok(actions.GetPromptResult(
-        description: Some(
-          "A prompt that pairs a department with a suggested name",
-        ),
-        messages: [
-          actions.PromptMessage(
-            actions.User,
-            actions.TextBlock(actions.TextContent(
-              name
-                <> " from "
-                <> department
-                <> " needs a concise onboarding note.",
-              None,
-              None,
-            )),
+      Ok(
+        prompt_result([
+          text_message(
+            "Please promote "
+            <> name
+            <> " to the head of the "
+            <> department
+            <> " team.",
           ),
-        ],
-        meta: None,
-      ))
-    Error(error), _ -> Error(error)
-    _, Error(error) -> Error(error)
+        ]),
+      )
+    Error(error), _ | _, Error(error) -> Error(error)
   }
 }
 
-fn require_prompt_argument(
+fn required_argument(
   arguments: Option(dict.Dict(String, String)),
-  key: String,
+  name: String,
 ) -> Result(String, jsonrpc.RpcError) {
-  case optional_prompt_argument(arguments, key) {
-    Some(value) -> Ok(value)
-    None -> Error(jsonrpc.invalid_params_error(key <> " is required"))
-  }
+  optional_argument(arguments, name)
+  |> option.to_result(jsonrpc.invalid_params_error(name <> " is required"))
 }
 
-fn optional_prompt_argument(
+fn optional_argument(
   arguments: Option(dict.Dict(String, String)),
-  key: String,
+  name: String,
 ) -> Option(String) {
-  case arguments {
-    Some(values) ->
-      case dict.get(values, key) {
-        Ok(value) -> Some(value)
-        Error(Nil) -> None
-      }
-    None -> None
-  }
-}
-
-fn resource_choice(
-  arguments: Option(dict.Dict(String, String)),
-) -> Result(#(String, Int), jsonrpc.RpcError) {
-  case
-    require_prompt_argument(arguments, "resourceType"),
-    require_prompt_argument(arguments, "resourceId")
-  {
-    Ok(resource_type), Ok(id_text) ->
-      case string.uppercase(resource_type), int.parse(id_text) {
-        "TEXT", Ok(id) if id > 0 -> Ok(#("Text", id))
-        "BLOB", Ok(id) if id > 0 -> Ok(#("Blob", id))
-        _, Ok(_) ->
-          Error(jsonrpc.invalid_params_error(
-            "resourceId must be a positive integer",
-          ))
-        _, Error(_) ->
-          Error(jsonrpc.invalid_params_error(
-            "resourceId must be a positive integer",
-          ))
-      }
-    Error(error), _ -> Error(error)
-    _, Error(error) -> Error(error)
-  }
-}
-
-fn prompt_name_suggestions(
-  context: Option(actions.CompleteContext),
-) -> List(String) {
-  case context {
-    Some(actions.CompleteContext(arguments: Some(arguments))) ->
-      case dict.get(arguments, "department") {
-        Ok("Engineering") -> ["Ada", "Linus", "Grace"]
-        Ok("Support") -> ["Jordan", "Casey", "Mina"]
-        Ok("Research") -> ["Noor", "Iris", "Theo"]
-        _ -> ["Ada", "Jordan", "Noor"]
-      }
-    _ -> ["Ada", "Jordan", "Noor"]
-  }
-}
-
-fn filter_matches(options: List(String), prefix: String) -> List(String) {
-  let lowered_prefix = string.lowercase(prefix)
-  options
-  |> list.filter(fn(option) {
-    string.starts_with(string.lowercase(option), lowered_prefix)
+  arguments
+  |> option.then(fn(arguments) {
+    dict.get(arguments, name) |> option.from_result
   })
+}
+
+fn team_members(context: Option(actions.CompleteContext)) -> List(String) {
+  let department =
+    context
+    |> option.then(fn(context) { context.arguments })
+    |> optional_argument("department")
+  case department {
+    Some("Engineering") -> ["Alice", "Bob", "Charlie"]
+    Some("Sales") -> ["David", "Eve", "Frank"]
+    Some("Marketing") -> ["Grace", "Henry", "Iris"]
+    Some("Support") -> ["John", "Kim", "Lee"]
+    _ -> []
+  }
+}
+
+fn filter_matches(values: List(String), prefix: String) -> List(String) {
+  list.filter(values, fn(value) { string.starts_with(value, prefix) })
+}
+
+fn prompt_result(
+  messages: List(actions.PromptMessage),
+) -> actions.GetPromptResult {
+  actions.GetPromptResult(None, messages, None)
+}
+
+fn text_message(text: String) -> actions.PromptMessage {
+  actions.PromptMessage(
+    actions.User,
+    actions.TextBlock(actions.TextContent(text, None, None)),
+  )
 }

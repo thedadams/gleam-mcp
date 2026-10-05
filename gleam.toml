@@ -23,6 +23,7 @@ child_process = ">= 2.1.4 and < 3.0.0"
 gleam_crypto = ">= 1.5.1 and < 2.0.0"
 flwr_oauth2 = ">= 3.1.0 and < 4.0.0"
 httpp = ">= 1.8.0 and < 2.0.0"
+gzlib = ">= 2.0.0 and < 3.0.0"
 
 [dev-dependencies]
 gleeunit = ">= 1.0.0 and < 2.0.0"

@@ -2,6 +2,8 @@ import gleam/erlang/process
 import gleam/option.{None, Some}
 import gleam/string
 import gleam_mcp/actions
+import gleam_mcp/client/codec
+import gleam_mcp/examples/everything/http_logging
 import gleam_mcp/examples/everything/server as everything_server
 import gleam_mcp/jsonrpc
 import gleam_mcp/mcp
@@ -11,7 +13,7 @@ import gleeunit/should
 import server_test_support
 
 pub fn http_logger_delivers_to_the_handler_session_test() {
-  let #(app, _) = everything_server.make_http_server()
+  let #(app, logger) = everything_server.make_http_server()
   let session = ready_session(app)
   let unrelated = ready_session(app)
   let listener = process.new_subject()
@@ -22,15 +24,17 @@ pub fn http_logger_delivers_to_the_handler_session_test() {
   toggle(app, session)
   |> string.contains("Started simulated")
   |> should.be_true
-  let assert Ok(streamable_http_store.DeliverNotification(jsonrpc.Notification(
+  let assert Ok(streamable_http_store.DeliverReplay(_, payload, False)) =
+    process.receive(listener, within: 1000)
+  let assert Ok(codec.ActionNotification(jsonrpc.Notification(
     method,
     Some(actions.NotifyLoggingMessage(actions.LoggingMessageNotificationParams(
-      actions.Debug,
-      Some("gleam-mcp/everything"),
+      _,
+      None,
       jsonrpc.VString(message),
       None,
     ))),
-  ))) = process.receive(listener, within: 6500)
+  ))) = codec.decode_server_message(payload)
   should.equal(method, mcp.method_notify_logging_message)
   string.is_empty(message) |> should.be_false
   process.receive(unrelated_listener, within: 0) |> should.be_error
@@ -39,6 +43,24 @@ pub fn http_logger_delivers_to_the_handler_session_test() {
   |> should.be_true
   server.close_session(app, session)
   server.close_session(app, unrelated)
+  http_logging.stop(logger)
+}
+
+pub fn supplied_logger_is_bound_to_the_factory_server_test() {
+  let logger =
+    http_logging.new_logger(server.new(everything_server.implementation()))
+  let app = everything_server.make_server_with_http_logger(Some(logger))
+  let session = ready_session(app)
+  let listener = process.new_subject()
+  listen(app, session, listener)
+  toggle(app, session) |> string.contains("Started simulated") |> should.be_true
+  let assert Ok(streamable_http_store.DeliverReplay(_, payload, False)) =
+    process.receive(listener, 1000)
+  let assert Ok(codec.ActionNotification(jsonrpc.Notification(method, _))) =
+    codec.decode_server_message(payload)
+  should.equal(method, mcp.method_notify_logging_message)
+  server.close_session(app, session)
+  http_logging.stop(logger)
 }
 
 fn toggle(app: server.Server, session: String) -> String {
@@ -64,7 +86,7 @@ fn toggle(app: server.Server, session: String) -> String {
     actions.ClientResultCallTool(actions.CallToolResult(
       [actions.TextBlock(actions.TextContent(text, _, _))],
       _,
-      Some(False),
+      None,
       _,
     )),
   ) = response
