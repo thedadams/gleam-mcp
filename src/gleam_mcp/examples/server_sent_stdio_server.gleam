@@ -146,7 +146,9 @@ fn extract_json_string(body: String, field: String) -> Result(String, Nil) {
   }
 }
 
-fn extract_elicitation_text(result: actions.ElicitResult) -> Result(String, Nil) {
+fn extract_elicitation_text(
+  result: actions.ElicitResult,
+) -> Result(String, Nil) {
   let actions.ElicitResult(_, content, _) = result
   case content {
     Some(fields) ->

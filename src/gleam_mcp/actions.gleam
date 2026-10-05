@@ -732,6 +732,25 @@ pub type ElicitRequestUrlParams {
 
 pub type ElicitationCompleteNotificationParams {
   ElicitationCompleteNotificationParams(elicitation_id: String)
+  ElicitationCompleteNotificationParamsWithMeta(
+    elicitation_id: String,
+    meta: Option(NotificationMeta),
+  )
+}
+
+pub fn elicitation_complete_notification_id(
+  params: ElicitationCompleteNotificationParams,
+) -> String {
+  params.elicitation_id
+}
+
+pub fn elicitation_complete_notification_meta(
+  params: ElicitationCompleteNotificationParams,
+) -> Option(NotificationMeta) {
+  case params {
+    ElicitationCompleteNotificationParams(_) -> option.None
+    ElicitationCompleteNotificationParamsWithMeta(_, meta) -> meta
+  }
 }
 
 pub type ElicitResult {

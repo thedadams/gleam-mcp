@@ -113,6 +113,7 @@ pub fn decode_server_sent_sampling_response_test() {
 pub fn handle_server_sent_roots_request_test() {
   let config =
     capabilities.Config(
+      ..capabilities.none(),
       list_roots: Some(fn(_) {
         Ok([
           capabilities.Root("file:///workspace", Some("workspace"), None),
@@ -162,6 +163,7 @@ pub fn handle_server_sent_roots_request_test() {
 pub fn handle_server_sent_sampling_request_test() {
   let config =
     capabilities.Config(
+      ..capabilities.none(),
       list_roots: None,
       notify_cancelled: None,
       notify_progress: None,
@@ -353,6 +355,7 @@ pub fn handle_server_sent_sampling_task_request_test() {
 pub fn handle_server_sent_roots_notification_test() {
   let config =
     capabilities.Config(
+      ..capabilities.none(),
       list_roots: None,
       notify_cancelled: None,
       notify_progress: None,
@@ -407,6 +410,7 @@ pub fn decode_server_sent_logging_notification_test() {
 pub fn handle_server_sent_logging_notification_test() {
   let config =
     capabilities.Config(
+      ..capabilities.none(),
       list_roots: None,
       notify_cancelled: None,
       notify_progress: None,
@@ -465,6 +469,7 @@ pub fn handle_server_sent_task_status_notification_test() {
 
   let config =
     capabilities.Config(
+      ..capabilities.none(),
       list_roots: None,
       notify_cancelled: None,
       notify_progress: None,

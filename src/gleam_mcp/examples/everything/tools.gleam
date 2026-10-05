@@ -852,11 +852,9 @@ fn number_pair_schema() -> jsonrpc.Value {
 }
 
 fn float_to_string(value: Float) -> String {
-  case value == int.to_float(float_to_int(value)) {
-    True -> int.to_string(float_to_int(value))
+  let integer = float.truncate(value)
+  case value == int.to_float(integer) {
+    True -> int.to_string(integer)
     False -> float.to_string(value)
   }
 }
-
-@external(erlang, "erlang", "trunc")
-fn float_to_int(value: Float) -> Int

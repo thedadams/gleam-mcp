@@ -1,18 +1,24 @@
 import gleam/bit_array
 import gleam/bytes_tree
+import gleam/crypto
 import gleam/erlang/process
 import gleam/http
 import gleam/http/request
 import gleam/http/response
+import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
+import gleam/result
 import gleam/string
 import gleam/string_tree
+import gleam/uri
 import gleam_mcp/actions
 import gleam_mcp/client/codec as client_codec
+import gleam_mcp/codec_common
 import gleam_mcp/jsonrpc
 import gleam_mcp/server
 import gleam_mcp/server/codec
+import gleam_mcp/server/oauth
 import gleam_mcp/server/streamable_http_store
 import mist
 
@@ -25,8 +31,7 @@ pub type ClientActionMiddleware =
     server.RequestContext,
     String,
     jsonrpc.Request(actions.ClientActionRequest),
-  ) ->
-    MiddlewareDecision
+  ) -> MiddlewareDecision
 
 pub type MiddlewareDecision {
   Continue
@@ -79,39 +84,182 @@ fn handle(
   max_body_bytes: Int,
   middleware: ClientActionMiddleware,
 ) -> response.Response(mist.ResponseData) {
-  case authorize_request(server, req) {
-    False -> plain_response(401, "Unauthorized")
-    True -> {
-      let request.Request(method: method, ..) = req
-
-      case method {
-        http.Get -> handle_get(server, req)
-        http.Post -> handle_post(server, req, max_body_bytes, middleware)
-        _ -> plain_response(405, "Method Not Allowed")
+  case valid_origin(server, req) {
+    False -> plain_response(403, "Forbidden Origin")
+    True ->
+      case protected_metadata_response(server, req) {
+        Some(metadata) -> metadata
+        None -> handle_authorized(server, req, max_body_bytes, middleware)
       }
+  }
+}
+
+fn handle_authorized(
+  server: server.Server,
+  req: request.Request(mist.Connection),
+  max_body_bytes: Int,
+  middleware: ClientActionMiddleware,
+) -> response.Response(mist.ResponseData) {
+  case authorize_request(server, req) {
+    Error(error) -> authorization_error_response(server, error)
+    Ok(principal) ->
+      case valid_protocol_header(req) {
+        False -> plain_response(400, "Unsupported MCP protocol version")
+        True ->
+          case req.method {
+            http.Get -> handle_get(server, req, principal)
+            http.Post ->
+              handle_post(server, req, max_body_bytes, middleware, principal)
+            http.Delete ->
+              case
+                require_existing_session(
+                  server,
+                  request_session_id(req),
+                  principal,
+                )
+              {
+                Ok(id) -> {
+                  server.close_session(server, id)
+                  response.new(204)
+                  |> response.set_body(mist.Bytes(bytes_tree.new()))
+                }
+                Error(error) -> plain_response(error.0, error.1)
+              }
+            _ -> plain_response(405, "Method Not Allowed")
+          }
+      }
+  }
+}
+
+fn protected_metadata_response(
+  app: server.Server,
+  req: request.Request(mist.Connection),
+) -> Option(response.Response(mist.ResponseData)) {
+  case server.header_authorization(app) {
+    Some(server.OAuthAuthorization(config)) ->
+      case req.method == http.Get && oauth.is_metadata_path(config, req.path) {
+        True ->
+          Some(
+            response.new(200)
+            |> response.set_header("content-type", "application/json")
+            |> response.set_body(
+              mist.Bytes(bytes_tree.from_string(oauth.metadata(config))),
+            ),
+          )
+        False -> None
+      }
+    _ -> None
+  }
+}
+
+fn authorization_error_response(
+  app: server.Server,
+  error: oauth.AuthorizationError,
+) -> response.Response(mist.ResponseData) {
+  case server.header_authorization(app) {
+    Some(server.OAuthAuthorization(config)) ->
+      plain_response(oauth.error_status(error), "OAuth authorization failed")
+      |> response.set_header("www-authenticate", oauth.challenge(config, error))
+    _ -> plain_response(401, "Unauthorized")
+  }
+}
+
+fn valid_origin(server: server.Server, req: request.Request(body)) -> Bool {
+  case request.get_header(req, "origin") {
+    Error(_) -> True
+    Ok(origin) -> {
+      let same = case uri.parse(origin) {
+        Ok(parsed) if parsed.path == "" || parsed.path == "/" -> {
+          let loopback =
+            parsed.host == Some("127.0.0.1")
+            || parsed.host == Some("localhost")
+            || parsed.host == Some("[::1]")
+            || parsed.host == Some("::1")
+          parsed.userinfo == None
+          && loopback
+          && parsed.query == None
+          && parsed.fragment == None
+          && uri.origin(parsed) == uri.origin(request.to_uri(req))
+        }
+        _ -> False
+      }
+      same || list.contains(server.allowed_origins(server), origin)
     }
+  }
+}
+
+fn valid_protocol_header(req: request.Request(body)) -> Bool {
+  case request.get_header(req, "mcp-protocol-version") {
+    Ok(version) -> version == jsonrpc.latest_protocol_version
+    // The specification's legacy default is unsupported by this SDK. Allow
+    // initial handshakes without the header; sessions always require it.
+    Error(_) -> request_session_id(req) == None
   }
 }
 
 fn authorize_request(
   server: server.Server,
   req: request.Request(mist.Connection),
-) -> Bool {
+) -> Result(Option(String), oauth.AuthorizationError) {
   case server.header_authorization(server) {
-    None -> True
-    Some(server.HeaderAuthorization(header, validate)) ->
-      case request.get_header(req, header) {
-        Ok(value) -> validate(value)
-        Error(_) -> False
+    None -> Ok(None)
+    Some(server.HeaderAuthorization(header, validate)) -> {
+      use value <- result.try(
+        request.get_header(req, header)
+        |> result.map_error(fn(_) { oauth.MissingToken }),
+      )
+      case validate(value) {
+        True -> {
+          let fingerprint =
+            crypto.hash(crypto.Sha256, <<value:utf8>>)
+            |> bit_array.base16_encode
+          Ok(Some("credential:" <> fingerprint))
+        }
+        False -> Error(oauth.InvalidToken)
       }
+    }
+    Some(server.IdentityAuthorization(header, validate)) -> {
+      use value <- result.try(
+        request.get_header(req, header)
+        |> result.map_error(fn(_) { oauth.MissingToken }),
+      )
+      case validate(value) {
+        Some(principal) -> Ok(Some(principal))
+        None -> Error(oauth.InvalidToken)
+      }
+    }
+    Some(server.OAuthAuthorization(config)) -> {
+      let headers =
+        list.filter(req.headers, fn(header) {
+          string.lowercase(header.0) == "authorization"
+        })
+      let query_token =
+        req.query
+        |> option.map(fn(query) {
+          uri.parse_query(query)
+          |> result.unwrap([])
+          |> list.any(fn(parameter) { parameter.0 == "access_token" })
+        })
+        |> option.unwrap(False)
+      case list.length(headers) > 1 || query_token {
+        True -> Error(oauth.MalformedAuthorization)
+        False ->
+          oauth.authorize(
+            config,
+            request.get_header(req, "authorization") |> option.from_result,
+          )
+          |> result.map(Some)
+      }
+    }
   }
 }
 
 fn handle_get(
   server: server.Server,
   req: request.Request(mist.Connection),
+  principal: Option(String),
 ) -> response.Response(mist.ResponseData) {
-  case require_existing_session(server, request_session_id(req)) {
+  case require_existing_session(server, request_session_id(req), principal) {
     Ok(session_id) -> {
       let listener_id = server.new_streamable_http_listener_id()
 
@@ -135,7 +283,7 @@ fn handle_get(
         loop: handle_sse_message,
       )
     }
-    Error(Nil) -> plain_response(404, "Unknown MCP session")
+    Error(error) -> plain_response(error.0, error.1)
   }
 }
 
@@ -144,6 +292,32 @@ fn handle_post(
   req: request.Request(mist.Connection),
   max_body_bytes: Int,
   middleware: ClientActionMiddleware,
+  principal: Option(String),
+) -> response.Response(mist.ResponseData) {
+  case request_session_id(req) {
+    Some(id) ->
+      case require_existing_session(server, Some(id), principal) {
+        Error(error) -> plain_response(error.0, error.1)
+        Ok(_) ->
+          handle_post_checked(
+            server,
+            req,
+            max_body_bytes,
+            middleware,
+            principal,
+          )
+      }
+    None ->
+      handle_post_checked(server, req, max_body_bytes, middleware, principal)
+  }
+}
+
+fn handle_post_checked(
+  server: server.Server,
+  req: request.Request(mist.Connection),
+  max_body_bytes: Int,
+  middleware: ClientActionMiddleware,
+  principal: Option(String),
 ) -> response.Response(mist.ResponseData) {
   case has_json_content_type(req) {
     False -> plain_response(415, "Expected application/json request body")
@@ -159,6 +333,7 @@ fn handle_post(
                 request_session_id(req),
                 accepts_sse(req),
                 middleware,
+                principal,
               )
             Error(_) -> plain_response(400, "Request body was not valid UTF-8")
           }
@@ -174,110 +349,149 @@ fn handle_post_body(
   requested_session_id: Option(String),
   accepts_sse_response: Bool,
   middleware: ClientActionMiddleware,
+  principal: Option(String),
 ) -> response.Response(mist.ResponseData) {
-  case codec.decode_message(body) {
-    Ok(message) ->
-      case session_id_for_message(server, requested_session_id, message) {
-        Ok(session_id) ->
+  case codec.decode_message_with_error(body) {
+    Ok(message) -> {
+      let session = case requested_session_id, is_initialize_message(message) {
+        None, True -> {
+          let id = server.ensure_streamable_http_session(server, None)
+          let _ = server.bind_session(server, id, principal)
+          Ok(id)
+        }
+        _, _ ->
+          require_existing_session(server, requested_session_id, principal)
+      }
+      case session {
+        Ok(id) ->
           handle_decoded_message(
             server,
             req,
-            body,
-            session_id,
+            id,
             message,
             accepts_sse_response,
             middleware,
           )
-        Error(Nil) -> plain_response(404, "Unknown MCP session")
+        Error(error) -> plain_response(error.0, error.1)
       }
-    Error(_) ->
-      case require_existing_session(server, requested_session_id) {
-        Ok(session_id) ->
-          handle_message(
-            server,
-            req,
-            body,
-            session_id,
-            accepts_sse_response,
-            middleware,
-          )
-        Error(Nil) -> plain_response(404, "Unknown MCP session")
+    }
+    Error(diagnostic) -> {
+      case codec_common.is_response(body) {
+        True ->
+          case
+            require_existing_session(server, requested_session_id, principal)
+          {
+            Ok(id) ->
+              case
+                server.handle_server_sent_response(
+                  server,
+                  server.RequestContext(Some(id), None),
+                  body,
+                )
+              {
+                Ok(Nil) -> accepted_response(Some(id))
+                Error(error) -> plain_response(400, error.message)
+              }
+            Error(error) -> plain_response(error.0, error.1)
+          }
+        False ->
+          case codec_common.is_notification(body) {
+            True ->
+              case
+                require_existing_session(
+                  server,
+                  requested_session_id,
+                  principal,
+                )
+              {
+                Ok(_) -> plain_response(400, "Invalid MCP notification")
+                Error(error) -> plain_response(error.0, error.1)
+              }
+            False ->
+              json_response(
+                400,
+                codec.encode_response(jsonrpc.ErrorResponse(
+                  diagnostic.id,
+                  diagnostic.error,
+                )),
+                requested_session_id,
+              )
+          }
       }
+    }
   }
 }
 
 fn handle_decoded_message(
   server: server.Server,
   req: request.Request(mist.Connection),
-  body: String,
   session_id: String,
   message: codec.Message,
   accepts_sse_response: Bool,
   middleware: ClientActionMiddleware,
 ) -> response.Response(mist.ResponseData) {
+  let context = server.RequestContext(Some(session_id), None)
   case message {
-    codec.ClientActionRequest(request) ->
-      case accepts_sse_response && should_stream_request_response(request) {
-        True ->
-          handle_streamed_request(server, req, session_id, request, middleware)
-        False ->
-          handle_message(
-            server,
-            req,
-            body,
-            session_id,
-            accepts_sse_response,
-            middleware,
+    codec.ClientActionRequest(message) ->
+      case middleware(server, context, session_id, message) {
+        Continue ->
+          case accepts_sse_response && should_stream_request_response(message) {
+            True -> handle_streamed_request(server, req, session_id, message)
+            False -> {
+              let #(_, rpc_response) =
+                server.handle_request_with_context(server, context, message)
+              json_response(
+                200,
+                codec.encode_response(rpc_response),
+                Some(session_id),
+              )
+            }
+          }
+        RespondRpc(rpc_response) ->
+          json_response(
+            200,
+            codec.encode_response(rpc_response),
+            Some(session_id),
           )
+        RespondAccepted -> accepted_response(Some(session_id))
+        RespondPlain(status, body) -> plain_response(status, body)
       }
-    _ ->
-      handle_message(
-        server,
-        req,
-        body,
-        session_id,
-        accepts_sse_response,
-        middleware,
+    codec.ActionNotification(notification) ->
+      case
+        server.handle_notification_with_context(server, context, notification)
+      {
+        Ok(_) -> accepted_response(Some(session_id))
+        Error(error) -> plain_response(400, error.message)
+      }
+    codec.UnknownRequest(id, method) ->
+      json_response(
+        200,
+        codec.encode_response(jsonrpc.ErrorResponse(
+          Some(id),
+          jsonrpc.method_not_found_error(method),
+        )),
+        Some(session_id),
       )
-  }
-}
-
-fn session_id_for_message(
-  server: server.Server,
-  requested_session_id: Option(String),
-  message: codec.Message,
-) -> Result(String, Nil) {
-  case require_existing_session(server, requested_session_id) {
-    Ok(session_id) -> Ok(session_id)
-    Error(Nil) ->
-      case is_initialize_message(message) {
-        True -> Ok(initialize_session(server, requested_session_id))
-        False -> Error(Nil)
-      }
+    codec.UnknownNotification(_) -> accepted_response(Some(session_id))
   }
 }
 
 fn require_existing_session(
   server: server.Server,
   requested_session_id: Option(String),
-) -> Result(String, Nil) {
+  principal: Option(String),
+) -> Result(String, #(Int, String)) {
   case requested_session_id {
-    Some(session_id) ->
-      case server.has_streamable_http_session(server, session_id) {
-        True -> Ok(session_id)
-        False -> Error(Nil)
+    None -> Error(#(400, "Missing MCP session id"))
+    Some(id) ->
+      case server.has_streamable_http_session(server, id) {
+        False -> Error(#(404, "Unknown MCP session"))
+        True ->
+          case server.bind_session(server, id, principal) {
+            True -> Ok(id)
+            False -> Error(#(404, "Unknown MCP session"))
+          }
       }
-    None -> Error(Nil)
-  }
-}
-
-fn initialize_session(
-  server: server.Server,
-  requested_session_id: Option(String),
-) -> String {
-  case require_existing_session(server, requested_session_id) {
-    Ok(session_id) -> session_id
-    Error(Nil) -> server.ensure_streamable_http_session(server, None)
   }
 }
 
@@ -292,129 +506,53 @@ fn is_initialize_message(message: codec.Message) -> Bool {
   }
 }
 
-fn handle_message(
-  server: server.Server,
-  req: request.Request(mist.Connection),
-  body: String,
-  session_id: String,
-  accepts_sse_response: Bool,
-  middleware: ClientActionMiddleware,
-) -> response.Response(mist.ResponseData) {
-  let context =
-    server.RequestContext(session_id: Some(session_id), task_id: None)
-
-  case codec.decode_message(body) {
-    Ok(codec.ClientActionRequest(message)) ->
-      case middleware(server, context, session_id, message) {
-        Continue -> {
-          case accepts_sse_response && should_stream_request_response(message) {
-            True ->
-              handle_streamed_request(
-                server,
-                req,
-                session_id,
-                message,
-                middleware,
-              )
-            False -> {
-              let #(_, rpc_response) =
-                server.handle_request_with_context(server, context, message)
-              json_response(
-                200,
-                codec.encode_response(rpc_response),
-                Some(session_id),
-              )
-            }
-          }
-        }
-        RespondRpc(rpc_response) ->
-          json_response(
-            200,
-            codec.encode_response(rpc_response),
-            Some(session_id),
-          )
-        RespondAccepted -> accepted_response(Some(session_id))
-        RespondPlain(status, response_body) ->
-          plain_response(status, response_body)
-      }
-    Ok(codec.ActionNotification(notification)) -> {
-      let #(_, _) = server.handle_notification(server, notification)
-      accepted_response(Some(session_id))
-    }
-    Ok(codec.UnknownRequest(id, method)) -> {
-      let payload =
-        codec.encode_response(jsonrpc.ErrorResponse(
-          Some(id),
-          jsonrpc.method_not_found_error(method),
-        ))
-      json_response(200, payload, Some(session_id))
-    }
-    Ok(codec.UnknownNotification(_)) -> accepted_response(Some(session_id))
-    Error(_message) ->
-      case server.handle_server_sent_response(server, context, body) {
-        Ok(Nil) -> accepted_response(Some(session_id))
-        Error(jsonrpc.RpcError(message: response_error, ..)) ->
-          plain_response(400, response_error)
-      }
-  }
-}
-
 fn handle_streamed_request(
   server: server.Server,
   req: request.Request(mist.Connection),
   session_id: String,
   message: jsonrpc.Request(actions.ClientActionRequest),
-  middleware: ClientActionMiddleware,
 ) -> response.Response(mist.ResponseData) {
   let listener_id = server.new_streamable_http_listener_id()
-  let context =
-    server.RequestContext(session_id: Some(session_id), task_id: None)
-
-  case middleware(server, context, session_id, message) {
-    Continue ->
-      mist.server_sent_events(
-        request: req,
-        initial_response: response.new(200)
-          |> response.set_header(
-            "mcp-protocol-version",
-            jsonrpc.latest_protocol_version,
-          )
-          |> response.set_header("mcp-session-id", session_id),
-        init: fn(listener) {
-          server.register_streamable_http_listener(
-            server,
-            session_id,
-            listener_id,
-            listener,
-          )
-          let _ =
-            process.spawn(fn() {
-              let #(_, rpc_response) =
-                server.handle_request_with_context(server, context, message)
-              process.send(
-                listener,
-                streamable_http_store.DeliverResponse(codec.encode_response(
-                  rpc_response,
-                )),
-              )
-              Nil
-            })
-          SseState(server, session_id, listener_id)
-        },
-        loop: handle_sse_message,
+  let context = server.RequestContext(Some(session_id), None)
+  mist.server_sent_events(
+    request: req,
+    initial_response: response.new(200)
+      |> response.set_header(
+        "mcp-protocol-version",
+        jsonrpc.latest_protocol_version,
       )
-    RespondRpc(rpc_response) ->
-      json_response(200, codec.encode_response(rpc_response), Some(session_id))
-    RespondAccepted -> accepted_response(Some(session_id))
-    RespondPlain(status, response_body) -> plain_response(status, response_body)
-  }
+      |> response.set_header("mcp-session-id", session_id),
+    init: fn(listener) {
+      server.register_streamable_http_listener(
+        server,
+        session_id,
+        listener_id,
+        listener,
+      )
+      let _ =
+        process.spawn_unlinked(fn() {
+          let #(_, rpc_response) =
+            server.handle_request_with_context(server, context, message)
+          process.send(
+            listener,
+            streamable_http_store.DeliverResponse(codec.encode_response(
+              rpc_response,
+            )),
+          )
+          Nil
+        })
+      SseState(server, session_id, listener_id)
+    },
+    loop: handle_sse_message,
+  )
 }
 
 fn should_stream_request_response(
   request: jsonrpc.Request(actions.ClientActionRequest),
 ) -> Bool {
   case request {
-    jsonrpc.Request(_, _, Some(actions.ClientRequestGetTaskResult(_))) -> True
+    jsonrpc.Request(_, _, Some(actions.ClientRequestGetTaskResult(_)))
+    | jsonrpc.Request(_, _, Some(actions.ClientRequestCallTool(_))) -> True
     _ -> False
   }
 }
@@ -498,7 +636,7 @@ fn handle_sse_message(
   let SseState(server: app_server, session_id:, listener_id:) = state
 
   case message {
-    streamable_http_store.DeliverRequest(request) ->
+    streamable_http_store.DeliverRequest(request) -> {
       case
         mist.send_event(
           connection,
@@ -518,6 +656,7 @@ fn handle_sse_message(
           actor.stop()
         }
       }
+    }
     streamable_http_store.DeliverNotification(notification) ->
       case
         mist.send_event(

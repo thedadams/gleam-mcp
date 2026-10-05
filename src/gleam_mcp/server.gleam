@@ -1,5 +1,6 @@
 import gleam/dict
 import gleam/erlang/process
+import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
@@ -8,6 +9,8 @@ import gleam_mcp/actions
 import gleam_mcp/jsonrpc
 import gleam_mcp/mcp
 import gleam_mcp/server/capabilities
+import gleam_mcp/server/oauth
+import gleam_mcp/server/runtime
 import gleam_mcp/server/streamable_http_store
 import gleam_mcp/task_store
 import youid/uuid
@@ -44,10 +47,32 @@ pub type TaskResultRequestHandler =
 
 pub type HeaderAuthorization {
   HeaderAuthorization(header: String, validate: fn(String) -> Bool)
+  IdentityAuthorization(header: String, validate: fn(String) -> Option(String))
+  OAuthAuthorization(config: oauth.Config)
 }
 
 pub type RequestContext {
   RequestContext(session_id: Option(String), task_id: Option(String))
+  RequestContextWithMeta(
+    session_id: Option(String),
+    task_id: Option(String),
+    request_id: jsonrpc.RequestId,
+    meta: Option(actions.RequestMeta),
+  )
+}
+
+pub type NotificationHandler =
+  fn(Server, RequestContext, actions.ActionNotification) ->
+    Result(Nil, jsonrpc.RpcError)
+
+type Options {
+  Options(
+    allowed_origins: List(String),
+    notifications: Option(NotificationHandler),
+    capabilities: Option(actions.ServerCapabilities),
+    request_timeout_ms: Int,
+    page_size: Int,
+  )
 }
 
 pub opaque type Server {
@@ -57,6 +82,7 @@ pub opaque type Server {
     authorization: Option(HeaderAuthorization),
     task_store: task_store.Store,
     http_store: streamable_http_store.Store,
+    runtime: runtime.Store(actions.ClientActionResult),
     tools: List(RegisteredTool),
     resources: List(RegisteredResource),
     resource_templates: List(RegisteredResourceTemplate),
@@ -64,6 +90,7 @@ pub opaque type Server {
     completion_handler: Option(CompletionHandler),
     logging_handler: Option(LoggingHandler),
     task_result_request_handler: Option(TaskResultRequestHandler),
+    options: Options,
   )
 }
 
@@ -98,6 +125,7 @@ pub fn new(implementation: actions.Implementation) -> Server {
     None,
     task_store.new(),
     streamable_http_store.new(),
+    runtime.new(),
     [],
     [],
     [],
@@ -105,6 +133,7 @@ pub fn new(implementation: actions.Implementation) -> Server {
     None,
     None,
     None,
+    Options([], None, None, server_sent_request_timeout_ms, 100),
   )
 }
 
@@ -132,6 +161,140 @@ pub fn with_header_authorization(
 pub fn header_authorization(server: Server) -> Option(HeaderAuthorization) {
   let Server(authorization: authorization, ..) = server
   authorization
+}
+
+/// Authenticate each request to a stable application user identity.
+pub fn with_identity_authorization(
+  server: Server,
+  header: String,
+  validate: fn(String) -> Option(String),
+) -> Server {
+  Server(..server, authorization: Some(IdentityAuthorization(header, validate)))
+}
+
+/// Serve protected-resource metadata and enforce verified token claims on
+/// every HTTP request. The issuer's token verifier is supplied in `config`.
+pub fn with_oauth_authorization(
+  server: Server,
+  config: oauth.Config,
+) -> Server {
+  Server(..server, authorization: Some(OAuthAuthorization(config)))
+}
+
+/// Browser origins allowed to connect. Loopback same-origin requests are
+/// accepted by default; connections without Origin are also allowed.
+pub fn with_allowed_origins(server: Server, origins: List(String)) -> Server {
+  Server(..server, options: Options(..server.options, allowed_origins: origins))
+}
+
+pub fn allowed_origins(server: Server) -> List(String) {
+  server.options.allowed_origins
+}
+
+pub fn with_notification_handler(
+  server: Server,
+  handler: NotificationHandler,
+) -> Server {
+  Server(
+    ..server,
+    options: Options(..server.options, notifications: Some(handler)),
+  )
+}
+
+pub fn with_capabilities(
+  server: Server,
+  capabilities: actions.ServerCapabilities,
+) -> Server {
+  Server(
+    ..server,
+    options: Options(..server.options, capabilities: Some(capabilities)),
+  )
+}
+
+pub fn with_request_timeout(server: Server, timeout_ms: Int) -> Server {
+  Server(
+    ..server,
+    options: Options(..server.options, request_timeout_ms: case timeout_ms > 0 {
+      True -> timeout_ms
+      False -> 1
+    }),
+  )
+}
+
+pub fn with_page_size(server: Server, page_size: Int) -> Server {
+  Server(
+    ..server,
+    options: Options(..server.options, page_size: case page_size > 0 {
+      True -> page_size
+      False -> 1
+    }),
+  )
+}
+
+pub fn register_tool_descriptor(
+  server: Server,
+  tool: actions.Tool,
+  handler: ToolHandler,
+) -> Server {
+  Server(..server, tools: [
+    RegisteredTool(tool, PlainToolHandler(handler)),
+    ..server.tools
+  ])
+}
+
+pub fn register_context_tool_descriptor(
+  server: Server,
+  tool: actions.Tool,
+  handler: ContextToolHandler,
+) -> Server {
+  Server(..server, tools: [
+    RegisteredTool(tool, ContextualToolHandler(handler)),
+    ..server.tools
+  ])
+}
+
+pub fn register_resource_descriptor(
+  server: Server,
+  resource: actions.Resource,
+  handler: ResourceHandler,
+) -> Server {
+  Server(..server, resources: [
+    RegisteredResource(resource, handler),
+    ..server.resources
+  ])
+}
+
+pub fn register_resource_template_descriptor(
+  server: Server,
+  template: actions.ResourceTemplate,
+  handler: ResourceTemplateHandler,
+) -> Server {
+  Server(..server, resource_templates: [
+    RegisteredResourceTemplate(template, handler),
+    ..server.resource_templates
+  ])
+}
+
+pub fn register_prompt_descriptor(
+  server: Server,
+  prompt: actions.Prompt,
+  handler: PromptHandler,
+) -> Server {
+  Server(..server, prompts: [
+    RegisteredPrompt(prompt, handler),
+    ..server.prompts
+  ])
+}
+
+pub fn request_meta(context: RequestContext) -> Option(actions.RequestMeta) {
+  case context {
+    RequestContext(_, _) -> None
+    RequestContextWithMeta(meta: meta, ..) -> meta
+  }
+}
+
+pub fn progress_token(context: RequestContext) -> Option(jsonrpc.RequestId) {
+  request_meta(context) |> option.then(fn(meta) { meta.progress_token })
 }
 
 pub fn add_tool(
@@ -225,35 +388,7 @@ fn register_tool(
       meta: None,
     )
 
-  let Server(
-    implementation: server_info,
-    instructions: instructions,
-    authorization: authorization,
-    task_store: tasks,
-    http_store: http_store,
-    tools: tools,
-    resources: resources,
-    resource_templates: resource_templates,
-    prompts: prompts,
-    completion_handler: completion_handler,
-    logging_handler: logging_handler,
-    task_result_request_handler: task_result_request_handler,
-  ) = server
-
-  Server(
-    server_info,
-    instructions,
-    authorization,
-    tasks,
-    http_store,
-    [RegisteredTool(tool, handler), ..tools],
-    resources,
-    resource_templates,
-    prompts,
-    completion_handler,
-    logging_handler,
-    task_result_request_handler,
-  )
+  Server(..server, tools: [RegisteredTool(tool, handler), ..server.tools])
 }
 
 pub fn add_resource(
@@ -397,11 +532,14 @@ pub fn handle_request_with_context(
   request: jsonrpc.Request(actions.ClientActionRequest),
 ) -> #(Server, jsonrpc.Response(actions.ClientActionResult)) {
   case request {
-    jsonrpc.Request(id, _method, Some(action)) ->
-      case dispatch_request(server, context, action) {
+    jsonrpc.Request(id, _, Some(_)) -> {
+      let reply = process.new_subject()
+      start_request_with_context(server, context, request, reply)
+      case process.receive_forever(reply) {
         Ok(result) -> #(server, jsonrpc.ResultResponse(id, result))
         Error(error) -> #(server, jsonrpc.ErrorResponse(Some(id), error))
       }
+    }
     jsonrpc.Request(id, method, None) -> #(
       server,
       jsonrpc.ErrorResponse(
@@ -421,31 +559,121 @@ pub fn handle_request_with_context(
   }
 }
 
+/// Register a request before returning, with its result delivered to an
+/// explicitly supplied subject. Transports use this to keep reading messages
+/// while a handler runs, without racing an immediately following cancellation.
+pub fn start_request_with_context(
+  server: Server,
+  context: RequestContext,
+  request: jsonrpc.Request(actions.ClientActionRequest),
+  reply_to: process.Subject(
+    Result(actions.ClientActionResult, jsonrpc.RpcError),
+  ),
+) -> Nil {
+  case request {
+    jsonrpc.Request(id, _, Some(action)) -> {
+      let context =
+        RequestContextWithMeta(
+          context.session_id,
+          context.task_id,
+          id,
+          action_meta(action),
+        )
+      case check_request_lifecycle(server, context, action) {
+        Ok(_) ->
+          runtime.start_with_reply(
+            server.runtime,
+            context.session_id,
+            id,
+            server.options.request_timeout_ms,
+            fn() { dispatch_request(server, context, action) },
+            reply_to,
+          )
+        Error(error) -> process.send(reply_to, Error(error))
+      }
+    }
+    _ ->
+      process.send(
+        reply_to,
+        Error(jsonrpc.invalid_params_error("Expected request parameters")),
+      )
+  }
+}
+
 pub fn handle_notification(
   server: Server,
   notification: jsonrpc.Request(actions.ActionNotification),
 ) -> #(Server, Result(Nil, jsonrpc.RpcError)) {
-  case notification {
-    jsonrpc.Notification(method, _) ->
-      case method == mcp.method_initialized {
-        True -> #(server, Ok(Nil))
-        False -> #(server, Error(jsonrpc.method_not_found_error(method)))
-      }
-    jsonrpc.Request(_, method, _) -> #(
+  #(
+    server,
+    handle_notification_with_context(
       server,
-      Error(jsonrpc.method_not_found_error(method)),
-    )
+      RequestContext(None, None),
+      notification,
+    ),
+  )
+}
+
+pub fn handle_notification_with_context(
+  server: Server,
+  context: RequestContext,
+  notification: jsonrpc.Request(actions.ActionNotification),
+) -> Result(Nil, jsonrpc.RpcError) {
+  case notification {
+    jsonrpc.Notification(_, Some(action)) -> {
+      case action {
+        actions.NotifyInitialized(_) -> {
+          case context.session_id |> option.then(session_metadata(server, _)) {
+            Some(metadata) ->
+              case metadata.initialized {
+                True -> {
+                  let assert Some(id) = context.session_id
+                  streamable_http_store.set_metadata(
+                    server.http_store,
+                    id,
+                    streamable_http_store.SessionMetadata(
+                      ..metadata,
+                      ready: True,
+                    ),
+                  )
+                  Ok(Nil)
+                }
+                False ->
+                  Error(jsonrpc.invalid_params_error(
+                    "Session has not been initialized",
+                  ))
+              }
+            None -> Ok(Nil)
+          }
+        }
+        actions.NotifyCancelled(params) -> {
+          case params.request_id {
+            Some(id) -> runtime.cancel(server.runtime, context.session_id, id)
+            None -> Nil
+          }
+          Ok(Nil)
+        }
+        _ -> Ok(Nil)
+      }
+      |> result.try(fn(_) {
+        case server.options.notifications {
+          Some(handler) -> handler(server, context, action)
+          None -> Ok(Nil)
+        }
+      })
+    }
+    jsonrpc.Notification(_, None) -> Ok(Nil)
+    jsonrpc.Request(_, method, _) ->
+      Error(jsonrpc.method_not_found_error(method))
   }
 }
 
 pub fn session_id(context: RequestContext) -> Option(String) {
-  let RequestContext(session_id: session_id, ..) = context
-  session_id
+  context.session_id
 }
 
 pub fn task_id(context: RequestContext) -> Option(String) {
-  let RequestContext(task_id: task_id, ..) = context
-  task_id
+  context.task_id
 }
 
 pub fn ensure_streamable_http_session(
@@ -459,6 +687,68 @@ pub fn ensure_streamable_http_session(
 pub fn has_streamable_http_session(server: Server, session_id: String) -> Bool {
   let Server(http_store: http_store, ..) = server
   streamable_http_store.has_session(http_store, session_id)
+}
+
+pub fn session_metadata(
+  server: Server,
+  session_id: String,
+) -> Option(streamable_http_store.SessionMetadata) {
+  streamable_http_store.metadata(server.http_store, session_id)
+}
+
+pub fn close_session(server: Server, session_id: String) -> Nil {
+  runtime.close(server.runtime, session_id)
+  streamable_http_store.delete_session(server.http_store, session_id)
+}
+
+/// Bind a newly allocated transport session to its authenticated user.
+pub fn bind_session(
+  server: Server,
+  session_id: String,
+  principal: Option(String),
+) -> Bool {
+  case session_metadata(server, session_id) {
+    Some(metadata) -> metadata.principal == principal
+    None -> {
+      streamable_http_store.set_metadata(
+        server.http_store,
+        session_id,
+        streamable_http_store.SessionMetadata(
+          protocol_version: jsonrpc.latest_protocol_version,
+          client_capabilities: actions.ClientCapabilities(
+            None,
+            None,
+            None,
+            None,
+            None,
+          ),
+          initialized: False,
+          ready: False,
+          principal: principal,
+        ),
+      )
+      True
+    }
+  }
+}
+
+fn context_task_scope(
+  server: Server,
+  context: RequestContext,
+) -> Option(String) {
+  case context.session_id {
+    Some(id) -> {
+      case session_metadata(server, id) {
+        Some(metadata) ->
+          case metadata.principal {
+            Some(principal) -> Some("principal:" <> principal)
+            None -> Some("session:" <> id)
+          }
+        None -> Some("session:" <> id)
+      }
+    }
+    None -> None
+  }
 }
 
 pub fn new_streamable_http_listener_id() -> String {
@@ -511,6 +801,8 @@ pub fn send_request(
   context: RequestContext,
   request: jsonrpc.Request(actions.ServerActionRequest),
 ) -> Result(jsonrpc.Response(actions.ServerActionResult), jsonrpc.RpcError) {
+  use _ <- result.try(check_server_request_capability(server, context, request))
+  let request = associate_request(request, context.task_id)
   case session_id(context) {
     Some(value) -> {
       let Server(http_store: http_store, ..) = server
@@ -518,7 +810,7 @@ pub fn send_request(
         http_store,
         value,
         request,
-        server_sent_request_timeout_ms,
+        server.options.request_timeout_ms,
       )
     }
     None ->
@@ -533,6 +825,9 @@ pub fn send_notification(
   context: RequestContext,
   notification: jsonrpc.Request(actions.ActionNotification),
 ) -> Result(Nil, jsonrpc.RpcError) {
+  use _ <- result.try(check_outgoing_ready(server, context))
+  use _ <- result.try(check_notification_capability(server, notification))
+  let notification = associate_notification(notification, context.task_id)
   case session_id(context) {
     Some(value) -> {
       let Server(http_store: http_store, ..) = server
@@ -546,6 +841,457 @@ pub fn send_notification(
   }
 }
 
+fn check_notification_capability(
+  server: Server,
+  notification: jsonrpc.Request(actions.ActionNotification),
+) -> Result(Nil, jsonrpc.RpcError) {
+  let caps = advertised_capabilities(server)
+  let allowed = case notification {
+    jsonrpc.Notification(_, Some(actions.NotifyToolListChanged(_))) ->
+      case caps.tools {
+        Some(tools) -> tools.list_changed == Some(True)
+        None -> False
+      }
+    jsonrpc.Notification(_, Some(actions.NotifyPromptListChanged(_))) ->
+      case caps.prompts {
+        Some(prompts) -> prompts.list_changed == Some(True)
+        None -> False
+      }
+    jsonrpc.Notification(_, Some(actions.NotifyResourceListChanged(_))) ->
+      case caps.resources {
+        Some(resources) -> resources.list_changed == Some(True)
+        None -> False
+      }
+    jsonrpc.Notification(_, Some(actions.NotifyResourceUpdated(_))) ->
+      case caps.resources {
+        Some(resources) -> resources.subscribe == Some(True)
+        None -> False
+      }
+    jsonrpc.Notification(_, Some(actions.NotifyLoggingMessage(_))) ->
+      option.is_some(caps.logging)
+    jsonrpc.Notification(_, Some(actions.NotifyTaskStatus(_))) ->
+      option.is_some(caps.tasks)
+    jsonrpc.Notification(_, Some(actions.NotifyCancelled(_)))
+    | jsonrpc.Notification(_, Some(actions.NotifyProgress(_)))
+    | jsonrpc.Notification(_, Some(actions.NotifyElicitationComplete(_))) ->
+      True
+    _ -> False
+  }
+  case allowed {
+    True -> Ok(Nil)
+    False ->
+      Error(jsonrpc.method_not_found_error(
+        "Notification capability was not advertised",
+      ))
+  }
+}
+
+pub fn cancel_request(
+  server: Server,
+  context: RequestContext,
+  request_id: jsonrpc.RequestId,
+  reason: Option(String),
+) -> Result(Nil, jsonrpc.RpcError) {
+  send_notification(
+    server,
+    context,
+    jsonrpc.Notification(
+      mcp.method_notify_cancelled,
+      Some(
+        actions.NotifyCancelled(actions.CancelledNotificationParams(
+          Some(request_id),
+          reason,
+          None,
+        )),
+      ),
+    ),
+  )
+}
+
+fn check_outgoing_ready(
+  server: Server,
+  context: RequestContext,
+) -> Result(Nil, jsonrpc.RpcError) {
+  use _ <- result.try(case context.session_id {
+    Some(id) ->
+      case has_streamable_http_session(server, id) {
+        True -> Ok(Nil)
+        False ->
+          Error(jsonrpc.invalid_params_error("MCP session is closed or unknown"))
+      }
+    None -> Ok(Nil)
+  })
+  case context.session_id |> option.then(session_metadata(server, _)) {
+    Some(metadata) if !metadata.ready ->
+      Error(jsonrpc.invalid_params_error("Client is not ready"))
+    _ -> Ok(Nil)
+  }
+}
+
+fn check_server_request_capability(
+  server: Server,
+  context: RequestContext,
+  request: jsonrpc.Request(actions.ServerActionRequest),
+) -> Result(Nil, jsonrpc.RpcError) {
+  use _ <- result.try(check_outgoing_ready(server, context))
+  case context.session_id |> option.then(session_metadata(server, _)) {
+    None -> Ok(Nil)
+    Some(metadata) -> {
+      let caps = metadata.client_capabilities
+      let allowed = case request {
+        jsonrpc.Request(_, _, Some(actions.ServerRequestPing(_))) -> True
+        jsonrpc.Request(_, _, Some(actions.ServerRequestListRoots(_))) ->
+          option.is_some(caps.roots)
+        jsonrpc.Request(_, _, Some(actions.ServerRequestCreateMessage(params))) -> {
+          case caps.sampling {
+            None -> False
+            Some(sampling) -> {
+              let context_ok = case params.include_context {
+                Some(actions.ThisServerContext)
+                | Some(actions.AllServersContext) ->
+                  option.is_some(sampling.context)
+                _ -> True
+              }
+              let tools_ok = case
+                params.tools != []
+                || option.is_some(params.tool_choice)
+                || sampling_messages_use_tools(params.messages)
+              {
+                True -> option.is_some(sampling.tools)
+                False -> True
+              }
+              let task_ok = case params.task {
+                None -> True
+                Some(_) ->
+                  option.is_some(
+                    caps.tasks
+                    |> option.then(fn(tasks) { tasks.requests })
+                    |> option.then(fn(requests) {
+                      requests.sampling_create_message
+                    }),
+                  )
+              }
+              context_ok && tools_ok && task_ok
+            }
+          }
+        }
+        jsonrpc.Request(_, _, Some(actions.ServerRequestElicit(params))) -> {
+          let mode_ok = case caps.elicitation {
+            None -> False
+            Some(elicitation) ->
+              case params {
+                actions.ElicitRequestForm(_) ->
+                  option.is_some(elicitation.form) || elicitation.url == None
+                actions.ElicitRequestUrl(_) -> option.is_some(elicitation.url)
+              }
+          }
+          let task = case params {
+            actions.ElicitRequestForm(params) -> params.task
+            actions.ElicitRequestUrl(params) -> params.task
+          }
+          let task_ok = case task {
+            None -> True
+            Some(_) ->
+              option.is_some(
+                caps.tasks
+                |> option.then(fn(tasks) { tasks.requests })
+                |> option.then(fn(requests) { requests.elicitation_create }),
+              )
+          }
+          mode_ok && task_ok
+        }
+        jsonrpc.Request(_, _, Some(actions.ServerRequestListTasks(_))) ->
+          option.is_some(caps.tasks |> option.then(fn(tasks) { tasks.list }))
+        jsonrpc.Request(_, _, Some(actions.ServerRequestCancelTask(_))) ->
+          option.is_some(caps.tasks |> option.then(fn(tasks) { tasks.cancel }))
+        jsonrpc.Request(_, _, Some(actions.ServerRequestGetTask(_)))
+        | jsonrpc.Request(_, _, Some(actions.ServerRequestGetTaskResult(_))) ->
+          option.is_some(caps.tasks)
+        _ -> False
+      }
+      case allowed {
+        True -> Ok(Nil)
+        False ->
+          Error(jsonrpc.method_not_found_error(
+            "Client capability was not negotiated",
+          ))
+      }
+    }
+  }
+}
+
+fn sampling_messages_use_tools(
+  messages: List(actions.SamplingMessage),
+) -> Bool {
+  list.any(messages, fn(message) {
+    let content = case message.content {
+      actions.SingleSamplingContent(block) -> [block]
+      actions.MultipleSamplingContent(blocks) -> blocks
+    }
+    list.any(content, fn(block) {
+      case block {
+        actions.SamplingToolUse(_) | actions.SamplingToolResult(_) -> True
+        _ -> False
+      }
+    })
+  })
+}
+
+fn associate_meta(
+  meta: Option(actions.RequestMeta),
+  task: Option(String),
+) -> Option(actions.RequestMeta) {
+  case task {
+    None -> meta
+    Some(task) -> {
+      let meta = option.unwrap(meta, actions.RequestMeta(None, None))
+      Some(
+        actions.RequestMeta(
+          ..meta,
+          extra: Some(merge_related_task_meta(meta.extra, task)),
+        ),
+      )
+    }
+  }
+}
+
+fn associate_notification_meta(
+  meta: Option(actions.NotificationMeta),
+  task: Option(String),
+) -> Option(actions.NotificationMeta) {
+  case task {
+    None -> meta
+    Some(task) -> {
+      let meta = option.unwrap(meta, actions.NotificationMeta(None))
+      Some(
+        actions.NotificationMeta(
+          extra: Some(merge_related_task_meta(meta.extra, task)),
+        ),
+      )
+    }
+  }
+}
+
+fn associate_notification(
+  notification: jsonrpc.Request(actions.ActionNotification),
+  task: Option(String),
+) -> jsonrpc.Request(actions.ActionNotification) {
+  case notification {
+    jsonrpc.Notification(method, Some(action)) -> {
+      let action = case action {
+        actions.NotifyInitialized(meta) ->
+          actions.NotifyInitialized(associate_notification_meta(meta, task))
+        actions.NotifyCancelled(params) ->
+          actions.NotifyCancelled(
+            actions.CancelledNotificationParams(
+              ..params,
+              meta: associate_notification_meta(params.meta, task),
+            ),
+          )
+        actions.NotifyProgress(params) ->
+          actions.NotifyProgress(
+            actions.ProgressNotificationParams(
+              ..params,
+              meta: associate_notification_meta(params.meta, task),
+            ),
+          )
+        actions.NotifyResourceListChanged(meta) ->
+          actions.NotifyResourceListChanged(associate_notification_meta(
+            meta,
+            task,
+          ))
+        actions.NotifyResourceUpdated(params) ->
+          actions.NotifyResourceUpdated(
+            actions.ResourceUpdatedNotificationParams(
+              ..params,
+              meta: associate_notification_meta(params.meta, task),
+            ),
+          )
+        actions.NotifyPromptListChanged(meta) ->
+          actions.NotifyPromptListChanged(associate_notification_meta(
+            meta,
+            task,
+          ))
+        actions.NotifyToolListChanged(meta) ->
+          actions.NotifyToolListChanged(associate_notification_meta(meta, task))
+        actions.NotifyLoggingMessage(params) ->
+          actions.NotifyLoggingMessage(
+            actions.LoggingMessageNotificationParams(
+              ..params,
+              meta: associate_notification_meta(params.meta, task),
+            ),
+          )
+        actions.NotifyRootsListChanged(meta) ->
+          actions.NotifyRootsListChanged(associate_notification_meta(meta, task))
+        actions.NotifyElicitationComplete(params) ->
+          case task {
+            None -> action
+            Some(_) ->
+              actions.NotifyElicitationComplete(
+                actions.ElicitationCompleteNotificationParamsWithMeta(
+                  actions.elicitation_complete_notification_id(params),
+                  associate_notification_meta(
+                    actions.elicitation_complete_notification_meta(params),
+                    task,
+                  ),
+                ),
+              )
+          }
+        actions.NotifyTaskStatus(_) -> action
+      }
+      jsonrpc.Notification(method, Some(action))
+    }
+    _ -> notification
+  }
+}
+
+fn associate_request(
+  request: jsonrpc.Request(actions.ServerActionRequest),
+  task: Option(String),
+) -> jsonrpc.Request(actions.ServerActionRequest) {
+  case request {
+    jsonrpc.Request(id, method, Some(action)) -> {
+      let action = case action {
+        actions.ServerRequestPing(meta) ->
+          actions.ServerRequestPing(associate_meta(meta, task))
+        actions.ServerRequestListRoots(meta) ->
+          actions.ServerRequestListRoots(associate_meta(meta, task))
+        actions.ServerRequestCreateMessage(params) ->
+          actions.ServerRequestCreateMessage(
+            actions.CreateMessageRequestParams(
+              ..params,
+              meta: associate_meta(params.meta, task),
+            ),
+          )
+        actions.ServerRequestElicit(actions.ElicitRequestForm(params)) ->
+          actions.ServerRequestElicit(actions.ElicitRequestForm(
+            actions.ElicitRequestFormParams(
+              ..params,
+              meta: associate_meta(params.meta, task),
+            ),
+          ))
+        actions.ServerRequestElicit(actions.ElicitRequestUrl(params)) ->
+          actions.ServerRequestElicit(actions.ElicitRequestUrl(
+            actions.ElicitRequestUrlParams(
+              ..params,
+              meta: associate_meta(params.meta, task),
+            ),
+          ))
+        actions.ServerRequestListTasks(params) ->
+          actions.ServerRequestListTasks(
+            actions.PaginatedRequestParams(
+              ..params,
+              meta: associate_meta(params.meta, task),
+            ),
+          )
+        _ -> action
+      }
+      jsonrpc.Request(id, method, Some(action))
+    }
+    _ -> request
+  }
+}
+
+/// Send progress only when the initiating request supplied a progress token.
+pub fn report_progress(
+  server: Server,
+  context: RequestContext,
+  progress: Float,
+  total: Option(Float),
+  message: Option(String),
+) -> Result(Nil, jsonrpc.RpcError) {
+  case progress_token(context) {
+    None -> Ok(Nil)
+    Some(token) ->
+      send_notification(
+        server,
+        context,
+        jsonrpc.Notification(
+          mcp.method_notify_progress,
+          Some(
+            actions.NotifyProgress(actions.ProgressNotificationParams(
+              token,
+              progress,
+              total,
+              message,
+              None,
+            )),
+          ),
+        ),
+      )
+  }
+}
+
+pub fn with_resource_subscriptions(server: Server) -> Server {
+  let caps = advertised_capabilities(server)
+  let resources =
+    option.unwrap(
+      caps.resources,
+      actions.ServerResourcesCapabilities(None, None),
+    )
+  with_capabilities(
+    server,
+    actions.ServerCapabilities(
+      ..caps,
+      resources: Some(
+        actions.ServerResourcesCapabilities(..resources, subscribe: Some(True)),
+      ),
+    ),
+  )
+}
+
+fn subscribe_resource(
+  server: Server,
+  context: RequestContext,
+  uri: String,
+  enabled: Bool,
+) -> Result(actions.ClientActionResult, jsonrpc.RpcError) {
+  case advertised_capabilities(server).resources {
+    Some(resources) if resources.subscribe == Some(True) -> {
+      let known = case
+        find_resource(server.resources, uri),
+        find_resource_template(server.resource_templates, uri)
+      {
+        Error(_), Error(_) -> False
+        _, _ -> True
+      }
+      case context.session_id, known {
+        Some(id), True -> {
+          runtime.subscribe(server.runtime, id, uri, enabled)
+          Ok(actions.ClientResultEmpty(None))
+        }
+        None, _ ->
+          Error(jsonrpc.invalid_params_error(
+            "Resource subscriptions require a session",
+          ))
+        _, False ->
+          Error(jsonrpc.invalid_params_error("Unknown resource: " <> uri))
+      }
+    }
+    _ -> Error(jsonrpc.method_not_found_error(mcp.method_subscribe_resource))
+  }
+}
+
+pub fn notify_resource_updated(server: Server, uri: String) -> Nil {
+  runtime.subscribers(server.runtime, uri)
+  |> list.each(fn(id) {
+    let _ =
+      send_notification(
+        server,
+        RequestContext(Some(id), None),
+        jsonrpc.Notification(
+          mcp.method_notify_resource_updated,
+          Some(
+            actions.NotifyResourceUpdated(
+              actions.ResourceUpdatedNotificationParams(uri, None),
+            ),
+          ),
+        ),
+      )
+    Nil
+  })
+}
+
 pub fn update_task_status(
   server: Server,
   context: RequestContext,
@@ -553,6 +1299,11 @@ pub fn update_task_status(
   status: actions.TaskStatus,
   status_message: Option(String),
 ) -> Result(actions.Task, jsonrpc.RpcError) {
+  use _ <- result.try(get_task_result(
+    server,
+    context,
+    actions.TaskIdParams(task_id),
+  ))
   let updated =
     task_store.update_status(server.task_store, task_id, status, status_message)
 
@@ -594,6 +1345,21 @@ pub fn elicit(
   context: RequestContext,
   params: actions.ElicitRequestParams,
 ) -> Result(actions.ElicitResult, jsonrpc.RpcError) {
+  case elicit_with_tasks(server, context, params) {
+    Ok(actions.Elicit(result)) -> Ok(result)
+    Ok(actions.ElicitTask(_)) ->
+      Error(jsonrpc.invalid_params_error(
+        "Use elicit_with_tasks for task-augmented elicitation",
+      ))
+    Error(error) -> Error(error)
+  }
+}
+
+pub fn elicit_with_tasks(
+  server: Server,
+  context: RequestContext,
+  params: actions.ElicitRequestParams,
+) -> Result(actions.ElicitResponse, jsonrpc.RpcError) {
   let request =
     jsonrpc.Request(
       jsonrpc.StringId(uuid.v4_string()),
@@ -603,7 +1369,9 @@ pub fn elicit(
 
   case send_request(server, context, request) {
     Ok(jsonrpc.ResultResponse(_, actions.ServerResultElicit(result))) ->
-      Ok(result)
+      Ok(actions.Elicit(result))
+    Ok(jsonrpc.ResultResponse(_, actions.ServerResultCreateTask(result))) ->
+      Ok(actions.ElicitTask(result))
     Ok(jsonrpc.ErrorResponse(_, error)) -> Error(error)
     Ok(_) ->
       Error(jsonrpc.invalid_params_error(
@@ -722,28 +1490,52 @@ fn dispatch_request(
   action: actions.ClientActionRequest,
 ) -> Result(actions.ClientActionResult, jsonrpc.RpcError) {
   case action {
-    actions.ClientRequestInitialize(_) -> Ok(initialization_result(server))
+    actions.ClientRequestInitialize(params) -> {
+      case context.session_id {
+        Some(id) -> {
+          let principal =
+            session_metadata(server, id)
+            |> option.then(fn(metadata) { metadata.principal })
+          streamable_http_store.set_metadata(
+            server.http_store,
+            id,
+            streamable_http_store.SessionMetadata(
+              jsonrpc.latest_protocol_version,
+              params.capabilities,
+              True,
+              False,
+              principal,
+            ),
+          )
+        }
+        None -> Nil
+      }
+      Ok(initialization_result(server))
+    }
     actions.ClientRequestPing(_) -> Ok(actions.ClientResultEmpty(None))
-    actions.ClientRequestListResources(_) -> Ok(list_resources_result(server))
-    actions.ClientRequestListResourceTemplates(_) ->
-      Ok(list_resource_templates_result(server))
+    actions.ClientRequestListResources(params) ->
+      list_resources_result(server, params)
+    actions.ClientRequestListResourceTemplates(params) ->
+      list_resource_templates_result(server, params)
     actions.ClientRequestReadResource(params) ->
       read_resource_result(server, params)
-    actions.ClientRequestSubscribeResource(_) ->
-      Error(jsonrpc.method_not_found_error(mcp.method_subscribe_resource))
-    actions.ClientRequestUnsubscribeResource(_) ->
-      Error(jsonrpc.method_not_found_error(mcp.method_unsubscribe_resource))
-    actions.ClientRequestListPrompts(_) -> Ok(list_prompts_result(server))
+    actions.ClientRequestSubscribeResource(params) ->
+      subscribe_resource(server, context, params.uri, True)
+    actions.ClientRequestUnsubscribeResource(params) ->
+      subscribe_resource(server, context, params.uri, False)
+    actions.ClientRequestListPrompts(params) ->
+      list_prompts_result(server, params)
     actions.ClientRequestGetPrompt(params) -> get_prompt_result(server, params)
-    actions.ClientRequestListTools(_) -> Ok(list_tools_result(server))
+    actions.ClientRequestListTools(params) -> list_tools_result(server, params)
     actions.ClientRequestCallTool(params) ->
       call_tool_result(server, context, params)
     actions.ClientRequestComplete(params) -> complete_result(server, params)
     actions.ClientRequestSetLoggingLevel(params) ->
       set_logging_level_result(server, params)
     actions.ClientRequestListTasks(params) ->
-      Ok(list_tasks_result(server, params))
-    actions.ClientRequestGetTask(params) -> get_task_result(server, params)
+      list_tasks_result(server, context, params)
+    actions.ClientRequestGetTask(params) ->
+      get_task_result(server, context, params)
     actions.ClientRequestGetTaskResult(params) ->
       get_task_payload_result(server, context, params)
     actions.ClientRequestCancelTask(params) ->
@@ -757,27 +1549,143 @@ fn initialization_result(server: Server) -> actions.ClientActionResult {
 
   actions.ClientResultInitialize(actions.InitializeResult(
     protocol_version: jsonrpc.latest_protocol_version,
-    capabilities: capabilities.infer(
-      has_tools: server.tools != [],
-      has_resources: server.resources != [] || server.resource_templates != [],
-      has_prompts: server.prompts != [],
-      has_completion: case server.completion_handler {
-        Some(_) -> True
-        None -> False
-      },
-      has_logging: case server.logging_handler {
-        Some(_) -> True
-        None -> False
-      },
-      has_tasks: server.tools != [],
-    ),
+    capabilities: advertised_capabilities(server),
     server_info: implementation,
     instructions: instructions,
     meta: None,
   ))
 }
 
-fn list_resources_result(server: Server) -> actions.ClientActionResult {
+pub fn advertised_capabilities(server: Server) -> actions.ServerCapabilities {
+  case server.options.capabilities {
+    Some(configured) -> configured
+    None ->
+      capabilities.infer(
+        has_tools: server.tools != [],
+        has_resources: server.resources != [] || server.resource_templates != [],
+        has_prompts: server.prompts != [],
+        has_completion: case server.completion_handler {
+          Some(_) -> True
+          None -> False
+        },
+        has_logging: case server.logging_handler {
+          Some(_) -> True
+          None -> False
+        },
+        has_tasks: list.any(server.tools, fn(registered) {
+          case tool_task_support(registered.tool) {
+            Some(actions.TaskForbidden) | None -> False
+            _ -> True
+          }
+        }),
+      )
+  }
+}
+
+fn action_meta(
+  action: actions.ClientActionRequest,
+) -> Option(actions.RequestMeta) {
+  case action {
+    actions.ClientRequestInitialize(params) -> params.meta
+    actions.ClientRequestPing(meta) -> meta
+    actions.ClientRequestListResources(params)
+    | actions.ClientRequestListResourceTemplates(params)
+    | actions.ClientRequestListPrompts(params)
+    | actions.ClientRequestListTools(params)
+    | actions.ClientRequestListTasks(params) -> params.meta
+    actions.ClientRequestReadResource(params) -> params.meta
+    actions.ClientRequestSubscribeResource(params) -> params.meta
+    actions.ClientRequestUnsubscribeResource(params) -> params.meta
+    actions.ClientRequestGetPrompt(params) -> params.meta
+    actions.ClientRequestCallTool(params) -> params.meta
+    actions.ClientRequestComplete(params) -> params.meta
+    actions.ClientRequestSetLoggingLevel(params) -> params.meta
+    actions.ClientRequestGetTask(_)
+    | actions.ClientRequestGetTaskResult(_)
+    | actions.ClientRequestCancelTask(_) -> None
+  }
+}
+
+fn check_request_lifecycle(
+  server: Server,
+  context: RequestContext,
+  action: actions.ClientActionRequest,
+) -> Result(Nil, jsonrpc.RpcError) {
+  use _ <- result.try(case context.session_id {
+    Some(id) ->
+      case has_streamable_http_session(server, id) {
+        True -> Ok(Nil)
+        False ->
+          Error(jsonrpc.invalid_params_error("MCP session is closed or unknown"))
+      }
+    None -> Ok(Nil)
+  })
+  case context.session_id |> option.then(session_metadata(server, _)) {
+    None -> Ok(Nil)
+    Some(metadata) -> {
+      case action {
+        actions.ClientRequestInitialize(_) ->
+          case metadata.initialized {
+            False -> Ok(Nil)
+            True ->
+              Error(jsonrpc.invalid_params_error(
+                "Session is already initialized",
+              ))
+          }
+        actions.ClientRequestPing(_) -> Ok(Nil)
+        _ ->
+          case metadata.ready {
+            False ->
+              Error(jsonrpc.invalid_params_error(
+                "Session is not ready; send notifications/initialized first",
+              ))
+            True -> check_client_request_capability(server, action)
+          }
+      }
+    }
+  }
+}
+
+fn check_client_request_capability(
+  server: Server,
+  action: actions.ClientActionRequest,
+) -> Result(Nil, jsonrpc.RpcError) {
+  let caps = advertised_capabilities(server)
+  let allowed = case action {
+    actions.ClientRequestListResources(_)
+    | actions.ClientRequestListResourceTemplates(_)
+    | actions.ClientRequestReadResource(_) -> option.is_some(caps.resources)
+    actions.ClientRequestSubscribeResource(_)
+    | actions.ClientRequestUnsubscribeResource(_) ->
+      case caps.resources {
+        Some(resources) -> resources.subscribe == Some(True)
+        None -> False
+      }
+    actions.ClientRequestListTools(_) | actions.ClientRequestCallTool(_) ->
+      option.is_some(caps.tools)
+    actions.ClientRequestListPrompts(_) | actions.ClientRequestGetPrompt(_) ->
+      option.is_some(caps.prompts)
+    actions.ClientRequestComplete(_) -> option.is_some(caps.completions)
+    actions.ClientRequestSetLoggingLevel(_) -> option.is_some(caps.logging)
+    actions.ClientRequestListTasks(_) ->
+      option.is_some(caps.tasks |> option.then(fn(tasks) { tasks.list }))
+    actions.ClientRequestCancelTask(_) ->
+      option.is_some(caps.tasks |> option.then(fn(tasks) { tasks.cancel }))
+    actions.ClientRequestGetTask(_) | actions.ClientRequestGetTaskResult(_) ->
+      option.is_some(caps.tasks)
+    _ -> True
+  }
+  case allowed {
+    True -> Ok(Nil)
+    False ->
+      Error(jsonrpc.method_not_found_error("Capability was not advertised"))
+  }
+}
+
+fn list_resources_result(
+  server: Server,
+  params: actions.PaginatedRequestParams,
+) -> Result(actions.ClientActionResult, jsonrpc.RpcError) {
   let Server(resources: resources, ..) = server
   let listed =
     listed_entries(resources, fn(registered) {
@@ -785,14 +1693,20 @@ fn list_resources_result(server: Server) -> actions.ClientActionResult {
       resource
     })
 
-  actions.ClientResultListResources(actions.ListResourcesResult(
-    resources: listed,
-    page: actions.Page(None),
-    meta: None,
-  ))
+  paginate(listed, params.cursor, "resources", server.options.page_size)
+  |> result.map(fn(page) {
+    actions.ClientResultListResources(actions.ListResourcesResult(
+      resources: page.0,
+      page: page.1,
+      meta: None,
+    ))
+  })
 }
 
-fn list_resource_templates_result(server: Server) -> actions.ClientActionResult {
+fn list_resource_templates_result(
+  server: Server,
+  params: actions.PaginatedRequestParams,
+) -> Result(actions.ClientActionResult, jsonrpc.RpcError) {
   let Server(resource_templates: resource_templates, ..) = server
   let listed =
     listed_entries(resource_templates, fn(registered) {
@@ -800,11 +1714,16 @@ fn list_resource_templates_result(server: Server) -> actions.ClientActionResult 
       resource_template
     })
 
-  actions.ClientResultListResourceTemplates(actions.ListResourceTemplatesResult(
-    resource_templates: listed,
-    page: actions.Page(None),
-    meta: None,
-  ))
+  paginate(listed, params.cursor, "templates", server.options.page_size)
+  |> result.map(fn(page) {
+    actions.ClientResultListResourceTemplates(
+      actions.ListResourceTemplatesResult(
+        resource_templates: page.0,
+        page: page.1,
+        meta: None,
+      ),
+    )
+  })
 }
 
 fn read_resource_result(
@@ -838,7 +1757,10 @@ fn read_resource_result(
   }
 }
 
-fn list_prompts_result(server: Server) -> actions.ClientActionResult {
+fn list_prompts_result(
+  server: Server,
+  params: actions.PaginatedRequestParams,
+) -> Result(actions.ClientActionResult, jsonrpc.RpcError) {
   let Server(prompts: prompts, ..) = server
   let listed =
     listed_entries(prompts, fn(registered) {
@@ -846,11 +1768,14 @@ fn list_prompts_result(server: Server) -> actions.ClientActionResult {
       prompt
     })
 
-  actions.ClientResultListPrompts(actions.ListPromptsResult(
-    prompts: listed,
-    page: actions.Page(None),
-    meta: None,
-  ))
+  paginate(listed, params.cursor, "prompts", server.options.page_size)
+  |> result.map(fn(page) {
+    actions.ClientResultListPrompts(actions.ListPromptsResult(
+      prompts: page.0,
+      page: page.1,
+      meta: None,
+    ))
+  })
 }
 
 fn get_prompt_result(
@@ -868,7 +1793,10 @@ fn get_prompt_result(
   }
 }
 
-fn list_tools_result(server: Server) -> actions.ClientActionResult {
+fn list_tools_result(
+  server: Server,
+  params: actions.PaginatedRequestParams,
+) -> Result(actions.ClientActionResult, jsonrpc.RpcError) {
   let Server(tools: tools, ..) = server
   let listed =
     listed_entries(tools, fn(registered) {
@@ -876,11 +1804,14 @@ fn list_tools_result(server: Server) -> actions.ClientActionResult {
       tool
     })
 
-  actions.ClientResultListTools(actions.ListToolsResult(
-    tools: listed,
-    page: actions.Page(None),
-    meta: None,
-  ))
+  paginate(listed, params.cursor, "tools", server.options.page_size)
+  |> result.map(fn(page) {
+    actions.ClientResultListTools(actions.ListToolsResult(
+      tools: page.0,
+      page: page.1,
+      meta: None,
+    ))
+  })
 }
 
 fn call_tool_result(
@@ -889,23 +1820,38 @@ fn call_tool_result(
   params: actions.CallToolRequestParams,
 ) -> Result(actions.ClientActionResult, jsonrpc.RpcError) {
   let actions.CallToolRequestParams(name, arguments, task, _) = params
+  let support =
+    advertised_capabilities(server).tasks
+    |> option.then(fn(tasks) { tasks.requests })
+    |> option.then(fn(requests) { requests.tools_call })
 
   case find_tool(server.tools, name) {
     Ok(RegisteredTool(tool:, handler:)) ->
-      case task, tool_task_support(tool) {
-        Some(actions.TaskMetadata(ttl_ms)), _ ->
-          Ok(create_tool_task_result(
-            server,
-            handler,
-            context,
-            arguments,
-            ttl_ms,
-          ))
-        None, Some(actions.TaskRequired) ->
-          Error(jsonrpc.method_not_found_error(mcp.method_call_tool))
-        None, _ ->
+      case support {
+        None ->
           run_tool_handler(server, handler, context, arguments)
           |> result.map(actions.ClientResultCallTool)
+        Some(_) ->
+          case task, tool_task_support(tool) {
+            Some(_), Some(actions.TaskForbidden) | Some(_), None ->
+              Error(jsonrpc.invalid_params_error(
+                "Tool does not support task execution",
+              ))
+            Some(actions.TaskMetadata(ttl_ms)), _ -> {
+              Ok(create_tool_task_result(
+                server,
+                handler,
+                context,
+                arguments,
+                ttl_ms,
+              ))
+            }
+            None, Some(actions.TaskRequired) ->
+              Error(jsonrpc.method_not_found_error(mcp.method_call_tool))
+            None, _ ->
+              run_tool_handler(server, handler, context, arguments)
+              |> result.map(actions.ClientResultCallTool)
+          }
       }
     Error(Nil) -> Error(jsonrpc.invalid_params_error("Unknown tool: " <> name))
   }
@@ -918,32 +1864,51 @@ fn create_tool_task_result(
   arguments: Option(dict.Dict(String, jsonrpc.Value)),
   ttl_ms: Option(Int),
 ) -> actions.ClientActionResult {
-  let created = task_store.create(server.task_store, ttl_ms)
+  let created =
+    task_store.create_scoped(
+      server.task_store,
+      ttl_ms,
+      context_task_scope(server, context),
+    )
+  let task_context = case context {
+    RequestContext(_, _) ->
+      RequestContext(context.session_id, Some(created.task_id))
+    RequestContextWithMeta(_, _, id, meta) ->
+      RequestContextWithMeta(
+        context.session_id,
+        Some(created.task_id),
+        id,
+        meta,
+      )
+  }
   let _ =
-    process.spawn(fn() {
-      let RequestContext(session_id:, ..) = context
-      let task_context =
-        RequestContext(session_id: session_id, task_id: Some(created.task_id))
-      let outcome =
-        run_tool_handler(server, handler, task_context, arguments)
-        |> result.map(actions.TaskCallTool)
-      let _ = complete_task(server, task_context, created.task_id, outcome)
-      Nil
+    task_store.start_worker(server.task_store, created.task_id, fn() {
+      run_tool_handler(server, handler, task_context, arguments)
+      |> result.map(actions.TaskCallTool)
+    })
+  // Observe completion independently of the worker so crashes/cancellation also
+  // produce status notifications when a transport is listening.
+  let _ =
+    process.spawn_unlinked(fn() {
+      let _ =
+        task_store.result_scoped(
+          server.task_store,
+          created.task_id,
+          context_task_scope(server, context),
+        )
+      case task_store.get(server.task_store, created.task_id) {
+        Ok(task) ->
+          case task.status {
+            actions.Cancelled -> Nil
+            _ -> {
+              let _ = send_task_status_notification(server, task_context, task)
+              Nil
+            }
+          }
+        Error(_) -> Nil
+      }
     })
   actions.ClientResultCreateTask(actions.CreateTaskResult(created, None))
-}
-
-fn complete_task(
-  server: Server,
-  context: RequestContext,
-  task_id: String,
-  outcome: Result(actions.TaskResult, jsonrpc.RpcError),
-) -> Result(actions.Task, jsonrpc.RpcError) {
-  task_store.complete(server.task_store, task_id, outcome)
-  |> result.map(fn(task) {
-    let _ = send_task_status_notification(server, context, task)
-    task
-  })
 }
 
 fn tool_task_support(tool: actions.Tool) -> Option(actions.TaskSupport) {
@@ -969,21 +1934,38 @@ fn run_tool_handler(
 
 fn list_tasks_result(
   server: Server,
-  _params: actions.PaginatedRequestParams,
-) -> actions.ClientActionResult {
-  actions.ClientResultListTasks(actions.ListTasksResult(
-    tasks: task_store.list(server.task_store),
-    page: actions.Page(None),
-    meta: None,
-  ))
+  context: RequestContext,
+  params: actions.PaginatedRequestParams,
+) -> Result(actions.ClientActionResult, jsonrpc.RpcError) {
+  let tasks = case context.session_id {
+    None -> task_store.list(server.task_store)
+    Some(_) ->
+      task_store.list_scoped(
+        server.task_store,
+        context_task_scope(server, context),
+      )
+  }
+  paginate(tasks, params.cursor, "tasks", server.options.page_size)
+  |> result.map(fn(page) {
+    actions.ClientResultListTasks(actions.ListTasksResult(page.0, page.1, None))
+  })
 }
 
 fn get_task_result(
   server: Server,
+  context: RequestContext,
   params: actions.TaskIdParams,
 ) -> Result(actions.ClientActionResult, jsonrpc.RpcError) {
-  let actions.TaskIdParams(task_id) = params
-  task_store.get(server.task_store, task_id)
+  let task = case context.session_id {
+    None -> task_store.get(server.task_store, params.task_id)
+    Some(_) ->
+      task_store.get_scoped(
+        server.task_store,
+        params.task_id,
+        context_task_scope(server, context),
+      )
+  }
+  task
   |> result.map(fn(task) {
     actions.ClientResultGetTask(actions.GetTaskResult(task, None))
   })
@@ -994,12 +1976,57 @@ fn get_task_payload_result(
   context: RequestContext,
   params: actions.TaskIdParams,
 ) -> Result(actions.ClientActionResult, jsonrpc.RpcError) {
-  let actions.TaskIdParams(task_id) = params
-  case run_task_result_request_handler(server, context, task_id) {
-    Ok(Nil) ->
-      task_result(server, task_id)
-      |> result.map(actions.ClientResultTaskResult)
-    Error(error) -> Error(error)
+  // Authorize before calling an application hook or waiting on the outcome.
+  use _ <- result.try(get_task_result(server, context, params))
+  use _ <- result.try(run_task_result_request_handler(
+    server,
+    context,
+    params.task_id,
+  ))
+  let payload = case context.session_id {
+    None -> task_store.result(server.task_store, params.task_id)
+    Some(_) ->
+      task_store.result_scoped(
+        server.task_store,
+        params.task_id,
+        context_task_scope(server, context),
+      )
+  }
+  payload |> result.map(actions.ClientResultTaskResult)
+}
+
+fn paginate(
+  entries: List(a),
+  cursor: Option(actions.Cursor),
+  kind: String,
+  size: Int,
+) -> Result(#(List(a), actions.Page), jsonrpc.RpcError) {
+  let offset = case cursor {
+    None -> Ok(0)
+    Some(actions.Cursor(value)) -> {
+      case string.split(value, ":") {
+        [tag, value] if tag == kind -> int.parse(value)
+        _ -> Error(Nil)
+      }
+    }
+  }
+  use offset <- result.try(
+    offset
+    |> result.map_error(fn(_) {
+      jsonrpc.invalid_params_error("Invalid pagination cursor")
+    }),
+  )
+  case offset < 0 || offset > list.length(entries) {
+    True -> Error(jsonrpc.invalid_params_error("Invalid pagination cursor"))
+    False -> {
+      let page = entries |> list.drop(offset) |> list.take(size)
+      let next_offset = offset + list.length(page)
+      let next = case next_offset < list.length(entries) {
+        True -> Some(actions.Cursor(kind <> ":" <> int.to_string(next_offset)))
+        False -> None
+      }
+      Ok(#(page, actions.Page(next)))
+    }
   }
 }
 
@@ -1022,7 +2049,16 @@ fn cancel_task_result(
   params: actions.TaskIdParams,
 ) -> Result(actions.ClientActionResult, jsonrpc.RpcError) {
   let actions.TaskIdParams(task_id) = params
-  task_store.cancel(server.task_store, task_id)
+  let cancelled = case context.session_id {
+    None -> task_store.cancel(server.task_store, task_id)
+    Some(_) ->
+      task_store.cancel_scoped(
+        server.task_store,
+        task_id,
+        context_task_scope(server, context),
+      )
+  }
+  cancelled
   |> result.map(fn(task) {
     let _ = send_task_status_notification(server, context, task)
     task
@@ -1037,7 +2073,26 @@ fn complete_result(
   params: actions.CompleteRequestParams,
 ) -> Result(actions.ClientActionResult, jsonrpc.RpcError) {
   case server.completion_handler {
-    Some(handler) -> handler(params) |> result.map(actions.ClientResultComplete)
+    Some(handler) ->
+      handler(params)
+      |> result.map(fn(result) {
+        let completion = result.completion
+        let values = list.take(completion.values, 100)
+        let truncated = list.length(completion.values) > 100
+        actions.ClientResultComplete(
+          actions.CompleteResult(
+            ..result,
+            completion: actions.CompletionValues(
+              ..completion,
+              values: values,
+              has_more: case truncated {
+                True -> Some(True)
+                False -> completion.has_more
+              },
+            ),
+          ),
+        )
+      })
     None -> Error(jsonrpc.method_not_found_error(mcp.method_complete))
   }
 }
@@ -1099,34 +2154,7 @@ fn with_server_metadata(
   instructions instructions: Option(String),
   authorization authorization: Option(HeaderAuthorization),
 ) -> Server {
-  let Server(
-    implementation: implementation,
-    task_store: tasks,
-    http_store: http_store,
-    tools: tools,
-    resources: resources,
-    resource_templates: resource_templates,
-    prompts: prompts,
-    completion_handler: completion_handler,
-    logging_handler: logging_handler,
-    task_result_request_handler: task_result_request_handler,
-    ..,
-  ) = server
-
-  Server(
-    implementation,
-    instructions,
-    authorization,
-    tasks,
-    http_store,
-    tools,
-    resources,
-    resource_templates,
-    prompts,
-    completion_handler,
-    logging_handler,
-    task_result_request_handler,
-  )
+  Server(..server, instructions: instructions, authorization: authorization)
 }
 
 fn with_server_registry(
@@ -1136,31 +2164,12 @@ fn with_server_registry(
   resource_templates resource_templates: List(RegisteredResourceTemplate),
   prompts prompts: List(RegisteredPrompt),
 ) -> Server {
-  let Server(
-    implementation: implementation,
-    instructions: instructions,
-    authorization: authorization,
-    task_store: tasks,
-    http_store: http_store,
-    completion_handler: completion_handler,
-    logging_handler: logging_handler,
-    task_result_request_handler: task_result_request_handler,
-    ..,
-  ) = server
-
   Server(
-    implementation,
-    instructions,
-    authorization,
-    tasks,
-    http_store,
-    tools,
-    resources,
-    resource_templates,
-    prompts,
-    completion_handler,
-    logging_handler,
-    task_result_request_handler,
+    ..server,
+    tools: tools,
+    resources: resources,
+    resource_templates: resource_templates,
+    prompts: prompts,
   )
 }
 
@@ -1172,32 +2181,11 @@ fn with_server_handlers(
     TaskResultRequestHandler,
   ),
 ) -> Server {
-  let Server(
-    implementation: implementation,
-    instructions: instructions,
-    authorization: authorization,
-    task_store: tasks,
-    http_store: http_store,
-    tools: tools,
-    resources: resources,
-    resource_templates: resource_templates,
-    prompts: prompts,
-    ..,
-  ) = server
-
   Server(
-    implementation,
-    instructions,
-    authorization,
-    tasks,
-    http_store,
-    tools,
-    resources,
-    resource_templates,
-    prompts,
-    completion_handler,
-    logging_handler,
-    task_result_request_handler,
+    ..server,
+    completion_handler: completion_handler,
+    logging_handler: logging_handler,
+    task_result_request_handler: task_result_request_handler,
   )
 }
 

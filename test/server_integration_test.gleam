@@ -271,8 +271,7 @@ pub fn http_server_rejects_requests_with_invalid_authorization_header_test() {
     )
 
   case client.initialize(app_client, server_test_support.sample_client_info()) {
-    Error(client.Transport(transport.HttpError(message))) ->
-      should.be_true(string.contains(message, "status 401"))
+    Error(client.Transport(transport.AuthorizationRequired(401, None))) -> Nil
     _ -> should.fail()
   }
 }
@@ -323,7 +322,7 @@ pub fn http_server_rejects_sse_listen_without_session_test() {
     |> httpc.timeout(1000)
     |> httpc.dispatch(http_request)
 
-  should.equal(http_response.status, 404)
+  should.equal(http_response.status, 400)
 }
 
 pub fn http_server_rejects_non_initialize_requests_without_session_test() {
@@ -338,7 +337,7 @@ pub fn http_server_rejects_non_initialize_requests_without_session_test() {
 
   case result {
     Error(client.Transport(transport.HttpError(message))) ->
-      should.be_true(string.contains(message, "status 404"))
+      should.be_true(string.contains(message, "400"))
     _ -> should.fail()
   }
 }
@@ -366,8 +365,7 @@ pub fn http_server_rejects_non_initialize_requests_with_invalid_session_test() {
       client_codec.decode_response,
     )
   {
-    Error(transport.HttpError(message)) ->
-      should.be_true(string.contains(message, "status 404"))
+    Error(transport.SessionExpired) -> Nil
     _ -> should.fail()
   }
 }

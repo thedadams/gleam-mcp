@@ -1,4 +1,5 @@
-import envoy
+import child_process
+import child_process/stdio as process_stdio
 import gleam/bit_array
 import gleam/dict
 import gleam/erlang/process
@@ -11,7 +12,6 @@ import gleam_mcp/client/capabilities
 import gleam_mcp/client/codec as client_codec
 import gleam_mcp/jsonrpc
 import gleam_mcp/server/codec as server_codec
-import sceall
 import youid/uuid
 
 pub type Config {
@@ -29,6 +29,8 @@ pub opaque type Manager {
 }
 
 type Command {
+  Close(Option(String), process.Subject(Nil))
+  SessionFailed(String)
   Request(
     config: Config,
     session_id: Option(String),
@@ -56,6 +58,9 @@ type Session {
 }
 
 type SessionCommand {
+  Shutdown(process.Subject(Nil))
+  DeliverReply(String)
+  RequestTimeout(String)
   PerformRequest(
     payload: String,
     timeout: Int,
@@ -75,13 +80,15 @@ type SessionCommand {
 
 type SessionEvent {
   SessionEvent(SessionCommand)
-  PortEvent(sceall.ProgramMessage)
+  ProcessData(BitArray)
+  ProcessExited(Int)
 }
 
 type PendingRequest {
   PendingRequest(
     reply_to: process.Subject(Result(String, String)),
-    timeout: Int,
+    token: String,
+    timer: process.Timer,
     capability_config: capabilities.Config,
   )
 }
@@ -104,6 +111,20 @@ fn manager_worker(reply_to: process.Subject(process.Subject(Command))) {
   let subject = process.new_subject()
   process.send(reply_to, subject)
   loop(subject, dict.new())
+}
+
+/// Shut down one subprocess session, or all sessions owned by this manager.
+pub fn close(
+  manager: Manager,
+  session_id: Option(String),
+) -> Result(Nil, String) {
+  let Manager(subject) = manager
+  let reply = process.new_subject()
+  process.send(subject, Close(session_id, reply))
+  case process.receive(reply, 1000) {
+    Ok(_) -> Ok(Nil)
+    Error(_) -> Error("timeout")
+  }
 }
 
 pub fn request(
@@ -182,136 +203,126 @@ pub fn listen(
   }
 }
 
-fn loop(subject: process.Subject(Command), sessions: dict.Dict(String, Session)) {
+fn loop(
+  subject: process.Subject(Command),
+  sessions: dict.Dict(String, Session),
+) {
   case process.receive_forever(subject) {
+    SessionFailed(id) -> loop(subject, dict.delete(sessions, id))
+    Close(session_id, reply) -> {
+      let closing = case session_id {
+        Some(id) ->
+          case dict.get(sessions, id) {
+            Ok(session) -> [#(id, session)]
+            Error(_) -> []
+          }
+        None -> dict.to_list(sessions)
+      }
+      let remaining =
+        list.fold(closing, sessions, fn(sessions, pair) {
+          let #(id, Session(session_subject)) = pair
+          let stopped = process.new_subject()
+          process.send(session_subject, Shutdown(stopped))
+          let _ = process.receive(stopped, 500)
+          dict.delete(sessions, id)
+        })
+      process.send(reply, Nil)
+      loop(subject, remaining)
+    }
     Request(config:, session_id:, capability_config:, payload:, reply_to:) -> {
-      let #(next_sessions, response) =
-        perform_request(
-          sessions,
-          config,
-          session_id,
-          capability_config,
-          payload,
-        )
-      process.send(reply_to, response)
-      loop(subject, next_sessions)
+      case ensure_session(sessions, config, session_id) {
+        Error(error) -> {
+          process.send(reply_to, Error(error))
+          loop(subject, sessions)
+        }
+        Ok(#(next_sessions, id)) -> {
+          let assert Ok(Session(session)) = dict.get(next_sessions, id)
+          let ready = process.new_subject()
+          let _ =
+            process.spawn_unlinked(fn() {
+              let reply = process.new_subject()
+              process.send(ready, reply)
+              let response =
+                process.receive(reply, timeout_ms(config) + 100)
+                |> result.unwrap(Error("timeout"))
+              case response {
+                Error(_) -> process.send(subject, SessionFailed(id))
+                Ok(_) -> Nil
+              }
+              process.send(
+                reply_to,
+                result.map(response, fn(payload) { #(payload, Some(id)) }),
+              )
+            })
+          process.send(
+            session,
+            PerformRequest(
+              payload,
+              timeout_ms(config),
+              capability_config,
+              process.receive_forever(ready),
+            ),
+          )
+          loop(subject, next_sessions)
+        }
+      }
     }
     Notification(config:, session_id:, capability_config:, payload:, reply_to:) -> {
-      let #(next_sessions, response) =
-        perform_notification(
-          sessions,
-          config,
-          session_id,
-          capability_config,
-          payload,
-        )
-      process.send(reply_to, response)
-      loop(subject, next_sessions)
+      case ensure_session(sessions, config, session_id) {
+        Error(error) -> {
+          process.send(reply_to, Error(error))
+          loop(subject, sessions)
+        }
+        Ok(#(next_sessions, id)) -> {
+          let assert Ok(Session(session)) = dict.get(next_sessions, id)
+          let ready = process.new_subject()
+          let _ =
+            process.spawn_unlinked(fn() {
+              let reply = process.new_subject()
+              process.send(ready, reply)
+              let response =
+                process.receive(reply, timeout_ms(config) + 100)
+                |> result.unwrap(Error("timeout"))
+              process.send(reply_to, result.map(response, fn(_) { Some(id) }))
+            })
+          process.send(
+            session,
+            PerformNotification(
+              payload,
+              capability_config,
+              process.receive_forever(ready),
+            ),
+          )
+          loop(subject, next_sessions)
+        }
+      }
     }
     Listen(config:, session_id:, capability_config:, reply_to:) -> {
-      let #(next_sessions, response) =
-        perform_listen(sessions, config, session_id, capability_config)
-      process.send(reply_to, response)
-      loop(subject, next_sessions)
-    }
-  }
-}
-
-fn perform_request(
-  sessions: dict.Dict(String, Session),
-  config: Config,
-  session_id: Option(String),
-  capability_config: capabilities.Config,
-  payload: String,
-) -> #(dict.Dict(String, Session), Result(#(String, Option(String)), String)) {
-  case ensure_session(sessions, config, session_id) {
-    Ok(#(next_sessions, ensured_session_id)) -> {
-      let assert Ok(Session(subject: session_subject)) =
-        dict.get(next_sessions, ensured_session_id)
-      let reply_to = process.new_subject()
-      process.send(
-        session_subject,
-        PerformRequest(payload, timeout_ms(config), capability_config, reply_to),
-      )
-
-      case process.receive(reply_to, timeout_ms(config) + 100) {
-        Ok(Ok(response_payload)) -> #(
-          next_sessions,
-          Ok(#(response_payload, Some(ensured_session_id))),
-        )
-        Ok(Error(error)) -> #(
-          dict.delete(next_sessions, ensured_session_id),
-          Error(error),
-        )
-        Error(Nil) -> #(
-          dict.delete(next_sessions, ensured_session_id),
-          Error("timeout"),
-        )
+      case ensure_session(sessions, config, session_id) {
+        Error(error) -> {
+          process.send(reply_to, Error(error))
+          loop(subject, sessions)
+        }
+        Ok(#(next_sessions, id)) -> {
+          let assert Ok(Session(session)) = dict.get(next_sessions, id)
+          let ready = process.new_subject()
+          let _ =
+            process.spawn_unlinked(fn() {
+              let reply = process.new_subject()
+              process.send(ready, reply)
+              let response =
+                process.receive(reply, timeout_ms(config) + 100)
+                |> result.unwrap(Error("timeout"))
+              process.send(reply_to, result.map(response, fn(_) { Some(id) }))
+            })
+          process.send(
+            session,
+            PerformListen(capability_config, process.receive_forever(ready)),
+          )
+          loop(subject, next_sessions)
+        }
       }
     }
-    Error(error) -> #(sessions, Error(error))
-  }
-}
-
-fn perform_notification(
-  sessions: dict.Dict(String, Session),
-  config: Config,
-  session_id: Option(String),
-  capability_config: capabilities.Config,
-  payload: String,
-) -> #(dict.Dict(String, Session), Result(Option(String), String)) {
-  case ensure_session(sessions, config, session_id) {
-    Ok(#(next_sessions, ensured_session_id)) -> {
-      let assert Ok(Session(subject: session_subject)) =
-        dict.get(next_sessions, ensured_session_id)
-      let reply_to = process.new_subject()
-      process.send(
-        session_subject,
-        PerformNotification(payload, capability_config, reply_to),
-      )
-
-      case process.receive(reply_to, timeout_ms(config) + 100) {
-        Ok(Ok(Nil)) -> #(next_sessions, Ok(Some(ensured_session_id)))
-        Ok(Error(error)) -> #(
-          dict.delete(next_sessions, ensured_session_id),
-          Error(error),
-        )
-        Error(Nil) -> #(
-          dict.delete(next_sessions, ensured_session_id),
-          Error("timeout"),
-        )
-      }
-    }
-    Error(error) -> #(sessions, Error(error))
-  }
-}
-
-fn perform_listen(
-  sessions: dict.Dict(String, Session),
-  config: Config,
-  session_id: Option(String),
-  capability_config: capabilities.Config,
-) -> #(dict.Dict(String, Session), Result(Option(String), String)) {
-  case ensure_session(sessions, config, session_id) {
-    Ok(#(next_sessions, ensured_session_id)) -> {
-      let assert Ok(Session(subject: session_subject)) =
-        dict.get(next_sessions, ensured_session_id)
-      let reply_to = process.new_subject()
-      process.send(session_subject, PerformListen(capability_config, reply_to))
-
-      case process.receive(reply_to, timeout_ms(config) + 100) {
-        Ok(Ok(Nil)) -> #(next_sessions, Ok(Some(ensured_session_id)))
-        Ok(Error(error)) -> #(
-          dict.delete(next_sessions, ensured_session_id),
-          Error(error),
-        )
-        Error(Nil) -> #(
-          dict.delete(next_sessions, ensured_session_id),
-          Error("timeout"),
-        )
-      }
-    }
-    Error(error) -> #(sessions, Error(error))
   }
 }
 
@@ -361,34 +372,29 @@ fn session_worker(
   }
 }
 
-fn start_program(config: Config) -> Result(sceall.ProgramHandle, String) {
+fn start_program(config: Config) -> Result(child_process.Process, String) {
   let Config(command:, args:, env:, cwd:, ..) = config
 
   use executable <- result.try(find_executable(command))
 
-  let directory = case cwd {
-    Some(value) -> value
-    None -> "."
+  let builder =
+    child_process.from_file(executable)
+    |> child_process.args(args)
+    |> child_process.envs(env)
+  let builder = case cwd {
+    Some(directory) -> child_process.cwd(builder, directory)
+    None -> builder
   }
 
-  let environment =
-    list.fold(over: env, from: envoy.all(), with: fn(environment, entry) {
-      let #(key, value) = entry
-      dict.insert(environment, key, value)
-    })
-
-  sceall.spawn_program(
-    executable_path: executable,
-    working_directory: directory,
-    command_line_arguments: args,
-    environment_variables: dict.to_list(environment),
-  )
-  |> result.map_error(spawn_error_message)
+  // MCP frames arrive exclusively on stdout. Diagnostic stderr must never be
+  // mistaken for a response, even when it happens to contain JSON.
+  child_process.spawn_raw(builder, process_stdio.capture(False))
+  |> result.map_error(child_process.describe_start_error)
 }
 
 fn session_loop(
   subject: process.Subject(SessionCommand),
-  handle: sceall.ProgramHandle,
+  handle: child_process.Process,
   buffer: BitArray,
   pending: Option(PendingRequest),
   listener: Option(Listener),
@@ -396,15 +402,32 @@ fn session_loop(
   let selector =
     process.new_selector()
     |> process.select_map(subject, SessionEvent)
-    |> sceall.select(handle, PortEvent)
+    |> process_stdio.select(handle, ProcessData, ProcessExited)
 
-  let event = case pending {
-    Some(PendingRequest(timeout:, ..)) ->
-      process.selector_receive(selector, timeout)
-    None -> process.selector_receive_forever(selector) |> Ok
-  }
+  let event = process.selector_receive_forever(selector) |> Ok
 
   case event {
+    Ok(SessionEvent(RequestTimeout(token))) -> {
+      case pending {
+        Some(request) if request.token == token -> {
+          notify_pending_error(pending, "timeout")
+          stop_program(handle)
+        }
+        _ -> session_loop(subject, handle, buffer, pending, listener)
+      }
+    }
+    Ok(SessionEvent(DeliverReply(payload))) -> {
+      case child_process.writeln(handle, payload) {
+        Ok(_) -> session_loop(subject, handle, buffer, pending, listener)
+        Error(_) ->
+          notify_pending_error(pending, "Stdio transport process exited")
+      }
+    }
+    Ok(SessionEvent(Shutdown(reply))) -> {
+      notify_pending_error(pending, "Stdio transport closed")
+      stop_program(handle)
+      process.send(reply, Nil)
+    }
     Error(Nil) -> notify_pending_error(pending, "timeout")
     Ok(SessionEvent(PerformRequest(
       payload,
@@ -418,21 +441,25 @@ fn session_loop(
           session_loop(subject, handle, buffer, pending, listener)
         }
         None ->
-          case sceall.send(handle, bit_array.from_string(payload <> "\n")) {
-            Ok(Nil) ->
+          case child_process.writeln(handle, payload) {
+            Ok(Nil) -> {
+              let token = uuid.v4_string()
+              let timer =
+                process.send_after(subject, timeout, RequestTimeout(token))
               session_loop(
                 subject,
                 handle,
                 buffer,
-                Some(PendingRequest(reply_to, timeout, capability_config)),
+                Some(PendingRequest(reply_to, token, timer, capability_config)),
                 listener,
               )
+            }
             Error(_) ->
               process.send(reply_to, Error("Stdio transport process exited"))
           }
       }
     Ok(SessionEvent(PerformNotification(payload, _capability_config, reply_to))) ->
-      case sceall.send(handle, bit_array.from_string(payload <> "\n")) {
+      case child_process.writeln(handle, payload) {
         Ok(Nil) -> {
           process.send(reply_to, Ok(Nil))
           session_loop(subject, handle, buffer, pending, listener)
@@ -460,7 +487,7 @@ fn session_loop(
           )
         }
       }
-    Ok(PortEvent(sceall.Data(_, data))) ->
+    Ok(ProcessData(data)) ->
       case
         process_output(
           subject,
@@ -480,7 +507,7 @@ fn session_loop(
           )
         Error(error) -> notify_pending_error(pending, error)
       }
-    Ok(PortEvent(sceall.Exited(_, _))) -> {
+    Ok(ProcessExited(_)) -> {
       notify_pending_error(pending, "Stdio transport process exited")
     }
   }
@@ -488,7 +515,7 @@ fn session_loop(
 
 fn process_output(
   subject: process.Subject(SessionCommand),
-  handle: sceall.ProgramHandle,
+  handle: child_process.Process,
   buffer: BitArray,
   pending: Option(PendingRequest),
   listener: Option(Listener),
@@ -505,6 +532,7 @@ fn process_output(
       )
       let line = trim_carriage_return(line)
       use #(next_pending, next_listener) <- result.try(process_line(
+        subject,
         handle,
         line,
         pending,
@@ -516,7 +544,8 @@ fn process_output(
 }
 
 fn process_line(
-  handle: sceall.ProgramHandle,
+  subject: process.Subject(SessionCommand),
+  handle: child_process.Process,
   line: String,
   pending: Option(PendingRequest),
   listener: Option(Listener),
@@ -525,17 +554,19 @@ fn process_line(
     False -> Ok(#(pending, listener))
     True ->
       case looks_like_jsonrpc_response(line), pending {
-        True, Some(PendingRequest(reply_to:, ..)) -> {
+        True, Some(PendingRequest(reply_to:, timer:, ..)) -> {
+          let _ = process.cancel_timer(timer)
           process.send(reply_to, Ok(line))
           Ok(#(None, listener))
         }
-        _, _ -> handle_server_message(handle, line, pending, listener)
+        _, _ -> handle_server_message(subject, handle, line, pending, listener)
       }
   }
 }
 
 fn handle_server_message(
-  handle: sceall.ProgramHandle,
+  subject: process.Subject(SessionCommand),
+  handle: child_process.Process,
   line: String,
   pending: Option(PendingRequest),
   listener: Option(Listener),
@@ -548,19 +579,31 @@ fn handle_server_message(
   }
 
   case client_codec.decode_server_message(line) {
-    Ok(client_codec.ServerActionRequest(request)) ->
-      case
-        capabilities.handle_request(capability_config, request)
-        |> result.map_error(rpc_error_message)
-      {
-        Ok(response) ->
-          send_server_message(
-            handle,
-            server_codec.encode_server_response(response),
+    Ok(client_codec.ServerActionRequest(request)) -> {
+      let registered = process.new_subject()
+      let _ =
+        process.spawn_unlinked(fn() {
+          let reply = process.new_subject()
+          process.send(registered, reply)
+          let response = case process.receive_forever(reply) {
+            Ok(response) -> response
+            Error(error) -> {
+              let assert jsonrpc.Request(id, _, _) = request
+              jsonrpc.ErrorResponse(Some(id), error)
+            }
+          }
+          process.send(
+            subject,
+            DeliverReply(server_codec.encode_server_response(response)),
           )
-          |> result.map(fn(_) { #(pending, listener) })
-        Error(error) -> Error(error)
-      }
+        })
+      capabilities.start_request(
+        capability_config,
+        request,
+        process.receive_forever(registered),
+      )
+      Ok(#(pending, listener))
+    }
     Ok(client_codec.ActionNotification(notification)) ->
       capabilities.handle_notification(capability_config, notification)
       |> result.map_error(rpc_error_message)
@@ -580,16 +623,19 @@ fn handle_server_message(
 }
 
 fn send_server_message(
-  handle: sceall.ProgramHandle,
+  handle: child_process.Process,
   payload: String,
 ) -> Result(Nil, String) {
-  sceall.send(handle, bit_array.from_string(payload <> "\n"))
+  child_process.writeln(handle, payload)
   |> result.map_error(fn(_) { "Stdio transport process exited" })
 }
 
 fn notify_pending_error(pending: Option(PendingRequest), error: String) {
   case pending {
-    Some(PendingRequest(reply_to:, ..)) -> process.send(reply_to, Error(error))
+    Some(PendingRequest(reply_to:, timer:, ..)) -> {
+      let _ = process.cancel_timer(timer)
+      process.send(reply_to, Error(error))
+    }
     None -> Nil
   }
 }
@@ -655,7 +701,7 @@ fn find_executable(command: String) -> Result(String, String) {
   case string.starts_with(command, "/") || string.starts_with(command, "./") {
     True -> Ok(command)
     False ->
-      case sceall.find_executable(command) {
+      case child_process.find_executable(command) {
         Ok(path) -> Ok(path)
         Error(Nil) -> Error("Command not found: " <> command)
       }
@@ -669,22 +715,27 @@ fn trim_carriage_return(line: String) -> String {
   }
 }
 
-fn spawn_error_message(error: sceall.SpawnProgramError) -> String {
-  case error {
-    sceall.NotEnoughBeamPorts ->
-      "Unable to start stdio process: not enough BEAM ports"
-    sceall.NotEnoughMemory -> "Unable to start stdio process: not enough memory"
-    sceall.NotEnoughOsProcesses ->
-      "Unable to start stdio process: not enough OS processes"
-    sceall.ExternalCommandTooLong ->
-      "Unable to start stdio process: external command too long"
-    sceall.NotEnoughFileDescriptors ->
-      "Unable to start stdio process: not enough file descriptors"
-    sceall.OsFileTableFull ->
-      "Unable to start stdio process: OS file table full"
-    sceall.FileNotExecutable ->
-      "Unable to start stdio process: file not executable"
-    sceall.FileDoesNotExist ->
-      "Unable to start stdio process: file does not exist"
+fn stop_program(handle: child_process.Process) {
+  child_process.close(handle)
+  let exited =
+    process.new_selector()
+    |> process_stdio.select(handle, fn(_) { False }, fn(_) { True })
+  case wait_for_exit(exited, 100) {
+    True -> Nil
+    False -> {
+      child_process.stop(handle)
+      case wait_for_exit(exited, 100) {
+        True -> Nil
+        False -> child_process.kill(handle)
+      }
+    }
+  }
+}
+
+fn wait_for_exit(selector: process.Selector(Bool), timeout: Int) -> Bool {
+  case process.selector_receive(selector, timeout) {
+    Ok(True) -> True
+    Ok(False) -> wait_for_exit(selector, timeout)
+    Error(_) -> False
   }
 }

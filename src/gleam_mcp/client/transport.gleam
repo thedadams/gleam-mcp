@@ -16,7 +16,6 @@ import gleam_mcp/client/codec as client_codec
 import gleam_mcp/client/http_stream
 import gleam_mcp/client/stdio_manager
 import gleam_mcp/jsonrpc.{type Request, type Response}
-import gleam_mcp/mcp
 import gleam_mcp/server/codec as server_codec
 
 pub type CompatibilityMode {
@@ -54,9 +53,11 @@ pub type SelectedMode {
 }
 
 pub type TransportError {
+  AuthorizationRequired(status: Int, challenge: Option(String))
   ProcessError(String)
   HttpError(String)
   TimeoutError
+  SessionExpired
   UnexpectedResponse(String)
 }
 
@@ -75,15 +76,13 @@ pub type Runners {
       Option(String),
       capabilities.Config,
       Request(ClientActionRequest),
-    ) ->
-      Result(TransportResponse(ClientActionResult), TransportError),
+    ) -> Result(TransportResponse(ClientActionResult), TransportError),
     stdio_notification: fn(
       StdioConfig,
       Option(String),
       capabilities.Config,
       Request(ActionNotification),
-    ) ->
-      Result(TransportResponse(Nil), TransportError),
+    ) -> Result(TransportResponse(Nil), TransportError),
     stdio_listen: fn(StdioConfig, Option(String), capabilities.Config) ->
       Result(TransportResponse(Nil), TransportError),
     streamable_request: fn(
@@ -92,22 +91,23 @@ pub type Runners {
       String,
       capabilities.Config,
       Request(ClientActionRequest),
-    ) ->
-      Result(TransportResponse(ClientActionResult), TransportError),
+    ) -> Result(TransportResponse(ClientActionResult), TransportError),
     streamable_notification: fn(
       HttpConfig,
       Option(String),
       String,
       capabilities.Config,
       Request(ActionNotification),
-    ) ->
-      Result(TransportResponse(Nil), TransportError),
+    ) -> Result(TransportResponse(Nil), TransportError),
   )
 }
 
 pub fn default_runners() -> Runners {
-  let manager = stdio_manager.start()
+  default_runners_with_manager(stdio_manager.start())
+}
 
+/// Reuse a manager that the caller retains for explicit subprocess shutdown.
+pub fn default_runners_with_manager(manager: stdio_manager.Manager) -> Runners {
   Runners(
     stdio_request: fn(config, session_id, capability_config, message) {
       stdio_process_request(
@@ -177,16 +177,14 @@ pub fn send_request(
     Option(String),
     capabilities.Config,
     Request(action),
-  ) ->
-    Result(TransportResponse(action_result), TransportError),
+  ) -> Result(TransportResponse(action_result), TransportError),
   streamable_request: fn(
     HttpConfig,
     Option(String),
     String,
     capabilities.Config,
     Request(action),
-  ) ->
-    Result(TransportResponse(action_result), TransportError),
+  ) -> Result(TransportResponse(action_result), TransportError),
 ) -> Result(TransportResponse(action_result), TransportError) {
   case config {
     Stdio(stdio_config) ->
@@ -286,112 +284,43 @@ pub fn streamable_http_request(
   encode: fn(Request(action)) -> String,
   decode: fn(String, Request(action)) -> Result(Response(result), String),
 ) -> Result(TransportResponse(result), TransportError) {
-  case should_stream_post_response(message) {
-    True ->
-      streamable_http_request_streaming(
-        config,
-        session_id,
-        protocol_version,
-        capability_config,
-        message,
-        encode,
-        decode,
-      )
-    False -> {
-      let http_request =
-        build_post_request(
-          config,
-          session_id,
-          protocol_version,
-          encode(message),
-          accept_header: "application/json, text/event-stream",
-        )
-
-      use http_response <- result.try(send_http_request(config, http_request))
-      let next_session_id = session_id_from_response(http_response)
-      let response.Response(status:, ..) = http_response
-
-      case status {
-        200 ->
-          decode_post_response(
-            config,
-            session_id,
-            protocol_version,
-            capability_config,
-            http_response,
-            message,
-            decode,
-          )
-          |> result.map(fn(response) {
-            TransportResponse(response:, session_id: next_session_id)
-          })
-        202 -> Error(UnexpectedResponse("Expected a JSON-RPC response body"))
-        _ -> Error(http_status_error(status, http_response.body))
-      }
-    }
-  }
-}
-
-fn streamable_http_request_streaming(
-  config: HttpConfig,
-  session_id: Option(String),
-  protocol_version: String,
-  capability_config: capabilities.Config,
-  message: Request(action),
-  encode: fn(Request(action)) -> String,
-  decode: fn(String, Request(action)) -> Result(Response(result), String),
-) -> Result(TransportResponse(result), TransportError) {
-  let HttpConfig(base_url:, timeout_ms:, ..) = config
-  let timeout_ms = case timeout_ms {
-    Some(timeout) -> timeout
-    None -> 30_000
-  }
+  let HttpConfig(base_url:, ..) = config
   let response_reply = process.new_subject()
-  let body = encode(message)
-
   use next_session_id <- result.try(
-    http_stream.request(
+    http_stream.request_until(
       http.Post,
       base_url,
       post_stream_headers(config, session_id, protocol_version),
-      body,
-      timeout_ms,
-      fn(payload) {
+      encode(message),
+      http_timeout_ms(config),
+      fn(payload, observed_session_id) {
         case decode(payload, message) {
           Ok(response) -> {
             process.send(response_reply, response)
-            Ok(Nil)
+            Ok(True)
           }
-          Error(_) -> {
+          Error(_) ->
             process_server_message(
               config,
-              session_id,
+              observed_session_id,
               protocol_version,
               capability_config,
               payload,
             )
-            |> result.map_error(transport_error_message)
-          }
+            |> result.map(fn(_) { False })
+            |> result.map_error(to_stream_error)
         }
       },
     )
-    |> result.map_error(map_stream_listener_error),
+    |> result.map_error(fn(error) { map_stream_error(error, session_id) }),
   )
-
-  case process.receive(response_reply, 100) {
+  case process.receive(response_reply, 0) {
     Ok(response) ->
       Ok(TransportResponse(response:, session_id: next_session_id))
     Error(Nil) ->
       Error(UnexpectedResponse(
-        "SSE stream ended before a JSON-RPC response was received",
+        "HTTP response did not contain a matching JSON-RPC response",
       ))
-  }
-}
-
-fn should_stream_post_response(message: Request(action)) -> Bool {
-  case message {
-    jsonrpc.Request(_, method, _) -> method == mcp.method_get_task_result
-    jsonrpc.Notification(_, _) -> False
   }
 }
 
@@ -406,6 +335,7 @@ fn post_stream_headers(
     #("accept", "application/json, text/event-stream"),
     #("content-type", "application/json"),
     #("mcp-protocol-version", protocol_version),
+    #("connection", "close"),
   ]
   |> prepend_optional_header("mcp-session-id", session_id)
   |> list.append(
@@ -443,7 +373,7 @@ pub fn streamable_http_notification(
         response: jsonrpc_ok(),
         session_id: session_id_from_response(http_response),
       ))
-    _ -> Error(http_status_error(status, http_response.body))
+    _ -> Error(http_response_error(http_response, session_id))
   }
 }
 
@@ -456,22 +386,73 @@ pub fn streamable_http_listen(
   let HttpConfig(base_url:, ..) = config
   let headers = streamable_get_headers(config, session_id, protocol_version)
 
-  http_stream.listen(
+  http_stream.listen_resumable(
     base_url,
     headers,
     stream_listener_timeout_ms(config),
-    fn(payload) {
+    fn(payload, observed_session_id) {
       process_server_message(
         config,
-        session_id,
+        observed_session_id,
         protocol_version,
         capability_config,
         payload,
       )
-      |> result.map_error(transport_error_message)
+      |> result.map(fn(_) { False })
+      |> result.map_error(to_stream_error)
     },
   )
-  |> result.map_error(map_stream_listener_error)
+  |> result.map_error(fn(error) { map_stream_error(error, session_id) })
+}
+
+pub fn streamable_http_listen_until_closed(
+  config: HttpConfig,
+  session_id: Option(String),
+  protocol_version: String,
+  capability_config: capabilities.Config,
+  stop: process.Subject(Nil),
+) -> Result(Option(String), TransportError) {
+  http_stream.listen_until_closed(
+    config.base_url,
+    streamable_get_headers(config, session_id, protocol_version),
+    stream_listener_timeout_ms(config),
+    stop,
+    fn(payload, observed_session_id) {
+      process_server_message(
+        config,
+        observed_session_id,
+        protocol_version,
+        capability_config,
+        payload,
+      )
+      |> result.map(fn(_) { False })
+      |> result.map_error(to_stream_error)
+    },
+  )
+  |> result.map_error(fn(error) { map_stream_error(error, session_id) })
+}
+
+/// Release a stateful HTTP session. Servers may decline DELETE with HTTP 405.
+pub fn close_http(
+  config: HttpConfig,
+  session_id: Option(String),
+  protocol_version: String,
+) -> Result(Nil, TransportError) {
+  let req =
+    build_post_request(
+      config,
+      session_id,
+      protocol_version,
+      "",
+      accept_header: "application/json, text/event-stream",
+    )
+    |> request.set_method(http.Delete)
+  use res <- result.try(send_http_request(config, req))
+  case res.status {
+    status if status >= 200 && status < 300 -> Ok(Nil)
+    405 -> Ok(Nil)
+    _ -> Error(http_response_error(res, session_id))
+  }
 }
 
 pub fn first_sse_data(body: String) -> Result(String, TransportError) {
@@ -505,6 +486,7 @@ fn build_post_request(
     |> request.set_header("accept", accept_header)
     |> request.set_header("content-type", "application/json")
     |> request.set_header("mcp-protocol-version", protocol_version)
+    |> request.set_header("connection", "close")
 
   let request = case session_id {
     Some(value) -> request.set_header(request, "mcp-session-id", value)
@@ -527,6 +509,7 @@ fn streamable_get_headers(
   [
     #("accept", "text/event-stream"),
     #("mcp-protocol-version", protocol_version),
+    #("connection", "close"),
   ]
   |> prepend_optional_header("mcp-session-id", session_id)
   |> list.append(
@@ -567,117 +550,6 @@ fn http_timeout_ms(config: HttpConfig) -> Int {
   }
 }
 
-fn decode_post_response(
-  config: HttpConfig,
-  session_id: Option(String),
-  protocol_version: String,
-  capability_config: capabilities.Config,
-  http_response: response.Response(String),
-  message: Request(action),
-  decode: fn(String, Request(action)) -> Result(Response(result), String),
-) -> Result(Response(result), TransportError) {
-  let response.Response(body:, ..) = http_response
-
-  case response.get_header(http_response, "content-type") {
-    Ok(content_type) ->
-      case string.starts_with(content_type, "application/json") {
-        True -> decode(body, message) |> result.map_error(UnexpectedResponse)
-        False ->
-          case string.starts_with(content_type, "text/event-stream") {
-            True ->
-              process_sse_request_events(
-                config,
-                session_id,
-                protocol_version,
-                capability_config,
-                body,
-                message,
-                decode,
-              )
-            False ->
-              Error(UnexpectedResponse(
-                "Unsupported HTTP response content type: " <> content_type,
-              ))
-          }
-      }
-    Error(_) ->
-      Error(UnexpectedResponse("HTTP response missing content-type header"))
-  }
-}
-
-fn process_sse_request_events(
-  config: HttpConfig,
-  session_id: Option(String),
-  protocol_version: String,
-  capability_config: capabilities.Config,
-  body: String,
-  message: Request(action),
-  decode: fn(String, Request(action)) -> Result(Response(result), String),
-) -> Result(Response(result), TransportError) {
-  use events <- result.try(parse_sse_events(body))
-  process_sse_request_event_list(
-    config,
-    session_id,
-    protocol_version,
-    capability_config,
-    events,
-    message,
-    decode,
-  )
-}
-
-fn process_sse_request_event_list(
-  config: HttpConfig,
-  session_id: Option(String),
-  protocol_version: String,
-  capability_config: capabilities.Config,
-  events: List(SseEvent),
-  message: Request(action),
-  decode: fn(String, Request(action)) -> Result(Response(result), String),
-) -> Result(Response(result), TransportError) {
-  case events {
-    [] ->
-      Error(UnexpectedResponse(
-        "SSE stream ended before a JSON-RPC response was received",
-      ))
-    [SseEvent(data: data), ..rest] ->
-      case string.is_empty(data) {
-        True ->
-          process_sse_request_event_list(
-            config,
-            session_id,
-            protocol_version,
-            capability_config,
-            rest,
-            message,
-            decode,
-          )
-        False ->
-          case decode(data, message) {
-            Ok(value) -> Ok(value)
-            Error(_) -> {
-              use _ <- result.try(process_server_message(
-                config,
-                session_id,
-                protocol_version,
-                capability_config,
-                data,
-              ))
-              process_sse_request_event_list(
-                config,
-                session_id,
-                protocol_version,
-                capability_config,
-                rest,
-                message,
-                decode,
-              )
-            }
-          }
-      }
-  }
-}
-
 fn process_server_message(
   config: HttpConfig,
   session_id: Option(String),
@@ -686,20 +558,35 @@ fn process_server_message(
   payload: String,
 ) -> Result(Nil, TransportError) {
   case client_codec.decode_server_message(payload) {
-    Ok(client_codec.ServerActionRequest(request)) ->
-      case
-        capabilities.handle_request(capability_config, request)
-        |> result.map_error(rpc_error_to_transport_error)
-      {
-        Ok(response) ->
-          post_streamable_message(
-            config,
-            session_id,
-            protocol_version,
-            server_codec.encode_server_response(response),
-          )
-        Error(error) -> Error(error)
-      }
+    Ok(client_codec.ServerActionRequest(incoming)) -> {
+      let registered = process.new_subject()
+      let _ =
+        process.spawn_unlinked(fn() {
+          let reply = process.new_subject()
+          process.send(registered, reply)
+          let response = case process.receive_forever(reply) {
+            Ok(response) -> response
+            Error(error) -> {
+              let assert jsonrpc.Request(id, _, _) = incoming
+              jsonrpc.ErrorResponse(Some(id), error)
+            }
+          }
+          let _ =
+            post_streamable_message(
+              config,
+              session_id,
+              protocol_version,
+              server_codec.encode_server_response(response),
+            )
+          Nil
+        })
+      capabilities.start_request(
+        capability_config,
+        incoming,
+        process.receive_forever(registered),
+      )
+      Ok(Nil)
+    }
     Ok(client_codec.ActionNotification(notification)) ->
       capabilities.handle_notification(capability_config, notification)
       |> result.map_error(rpc_error_to_transport_error)
@@ -737,7 +624,7 @@ fn post_streamable_message(
   let response.Response(status:, ..) = http_response
   case status {
     202 -> Ok(Nil)
-    _ -> Error(http_status_error(status, http_response.body))
+    _ -> Error(http_response_error(http_response, session_id))
   }
 }
 
@@ -799,17 +686,45 @@ fn normalise_sse_body(body: String) -> String {
 
 fn transport_error_message(error: TransportError) -> String {
   case error {
+    AuthorizationRequired(status, _) ->
+      "HTTP authorization required: " <> int.to_string(status)
     ProcessError(message) -> message
     HttpError(message) -> message
     TimeoutError -> "Timed out waiting for transport response"
+    SessionExpired -> "MCP session expired"
     UnexpectedResponse(message) -> message
   }
 }
 
-fn map_stream_listener_error(message: String) -> TransportError {
-  case message {
-    "Timed out waiting for transport response" -> TimeoutError
-    _ -> HttpError(message)
+fn map_stream_error(
+  error: http_stream.StreamError,
+  session_id: Option(String),
+) -> TransportError {
+  case error {
+    http_stream.AuthorizationRequired(status, challenge) ->
+      AuthorizationRequired(status, challenge)
+    http_stream.TimedOut -> TimeoutError
+    http_stream.Closed -> UnexpectedResponse("HTTP listener closed")
+    http_stream.HttpStatus(404, _) if session_id != None -> SessionExpired
+    http_stream.HttpStatus(405, message) -> UnexpectedResponse(message)
+    http_stream.HttpStatus(status, message) ->
+      ordinary_http_status_error(status, message)
+    http_stream.InvalidResponse(message) -> UnexpectedResponse(message)
+    http_stream.Failed(message) ->
+      case string.contains(string.lowercase(message), "timeout") {
+        True -> TimeoutError
+        False -> HttpError(message)
+      }
+  }
+}
+
+fn to_stream_error(error: TransportError) -> http_stream.StreamError {
+  case error {
+    AuthorizationRequired(status, challenge) ->
+      http_stream.AuthorizationRequired(status, challenge)
+    SessionExpired -> http_stream.HttpStatus(404, "MCP session expired")
+    TimeoutError -> http_stream.TimedOut
+    _ -> http_stream.Failed(transport_error_message(error))
   }
 }
 
@@ -833,7 +748,39 @@ fn session_id_from_response(
   }
 }
 
-fn http_status_error(status: Int, body: String) -> TransportError {
+fn http_status_error(
+  status: Int,
+  body: String,
+  session_id: Option(String),
+) -> TransportError {
+  case status == 404 && session_id != None {
+    True -> SessionExpired
+    False -> ordinary_http_status_error(status, body)
+  }
+}
+
+fn http_response_error(
+  res: response.Response(String),
+  session_id: Option(String),
+) -> TransportError {
+  case res.status {
+    401 | 403 -> {
+      let values =
+        res.headers
+        |> list.filter(fn(pair) {
+          string.lowercase(pair.0) == "www-authenticate"
+        })
+        |> list.map(fn(pair) { pair.1 })
+      AuthorizationRequired(res.status, case values {
+        [] -> None
+        _ -> Some(string.join(values, ", "))
+      })
+    }
+    _ -> http_status_error(res.status, res.body, session_id)
+  }
+}
+
+fn ordinary_http_status_error(status: Int, body: String) -> TransportError {
   let message = case string.trim(body) {
     "" -> "HTTP request failed with status " <> int.to_string(status)
     trimmed ->

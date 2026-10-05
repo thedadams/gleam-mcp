@@ -9,6 +9,7 @@ import gleam/result
 import gleam_mcp/actions
 import gleam_mcp/client/codec as client_codec
 import gleam_mcp/jsonrpc
+import gleam_mcp/mcp
 import youid/uuid
 
 pub opaque type Store {
@@ -22,7 +23,20 @@ pub type ListenerMessage {
   CloseListener
 }
 
+pub type SessionMetadata {
+  SessionMetadata(
+    protocol_version: String,
+    client_capabilities: actions.ClientCapabilities,
+    initialized: Bool,
+    ready: Bool,
+    principal: Option(String),
+  )
+}
+
 type Message {
+  GetMetadata(String, process.Subject(Option(SessionMetadata)))
+  SetMetadata(String, SessionMetadata, process.Subject(Nil))
+  DeleteSession(String, process.Subject(Nil))
   EnsureSession(session_id: Option(String), reply_to: process.Subject(String))
   HasSession(session_id: String, reply_to: process.Subject(Bool))
   RegisterListener(
@@ -42,6 +56,7 @@ type Message {
     reply_to: process.Subject(
       Result(jsonrpc.Response(actions.ServerActionResult), jsonrpc.RpcError),
     ),
+    timeout_ms: Int,
   )
   SendNotification(
     session_id: String,
@@ -52,19 +67,31 @@ type Message {
     body: String,
     reply_to: process.Subject(Result(Nil, jsonrpc.RpcError)),
   )
-  ExpireRequest(session_id: String, request_id: jsonrpc.RequestId)
+  ExpireRequest(
+    String,
+    jsonrpc.RequestId,
+    process.Subject(
+      Result(jsonrpc.Response(actions.ServerActionResult), jsonrpc.RpcError),
+    ),
+  )
+  CallerDown(process.Down)
 }
 
 type Session {
   Session(
     queued_requests: List(jsonrpc.Request(actions.ServerActionRequest)),
     pending_requests: Dict(String, PendingRequest),
-    listener: Option(Listener),
+    listener: List(Listener),
   )
 }
 
 type Listener {
-  Listener(id: String, subject: process.Subject(ListenerMessage))
+  Listener(
+    id: String,
+    subject: process.Subject(ListenerMessage),
+    owner: process.Pid,
+    monitor: process.Monitor,
+  )
 }
 
 type PendingRequest {
@@ -73,6 +100,9 @@ type PendingRequest {
     reply_to: process.Subject(
       Result(jsonrpc.Response(actions.ServerActionResult), jsonrpc.RpcError),
     ),
+    caller: process.Pid,
+    monitor: process.Monitor,
+    timer: process.Timer,
   )
 }
 
@@ -86,7 +116,7 @@ pub fn new() -> Store {
 fn start_store(reply_to: process.Subject(process.Subject(Message))) {
   let subject = process.new_subject()
   process.send(reply_to, subject)
-  loop(subject, dict.new())
+  loop(subject, dict.new(), dict.new())
 }
 
 pub fn ensure_session(store: Store, session_id: Option(String)) -> String {
@@ -100,6 +130,31 @@ pub fn has_session(store: Store, session_id: String) -> Bool {
   let Store(subject) = store
   let reply_to = process.new_subject()
   process.send(subject, HasSession(session_id, reply_to))
+  expect_ok(process.receive(reply_to, 1000))
+}
+
+pub fn metadata(store: Store, session_id: String) -> Option(SessionMetadata) {
+  let Store(subject) = store
+  let reply_to = process.new_subject()
+  process.send(subject, GetMetadata(session_id, reply_to))
+  expect_ok(process.receive(reply_to, 1000))
+}
+
+pub fn set_metadata(
+  store: Store,
+  session_id: String,
+  metadata: SessionMetadata,
+) -> Nil {
+  let Store(subject) = store
+  let reply_to = process.new_subject()
+  process.send(subject, SetMetadata(session_id, metadata, reply_to))
+  expect_ok(process.receive(reply_to, 1000))
+}
+
+pub fn delete_session(store: Store, session_id: String) -> Nil {
+  let Store(subject) = store
+  let reply_to = process.new_subject()
+  process.send(subject, DeleteSession(session_id, reply_to))
   expect_ok(process.receive(reply_to, 1000))
 }
 
@@ -141,12 +196,15 @@ pub fn send_request(
 ) -> Result(jsonrpc.Response(actions.ServerActionResult), jsonrpc.RpcError) {
   let Store(subject) = store
   let reply_to = process.new_subject()
-  process.send(subject, SendRequest(session_id, request, reply_to))
+  process.send(subject, SendRequest(session_id, request, reply_to, timeout_ms))
 
   case process.receive(reply_to, timeout_ms) {
     Ok(response) -> response
     Error(Nil) -> {
-      process.send(subject, ExpireRequest(session_id, request_id(request)))
+      process.send(
+        subject,
+        ExpireRequest(session_id, request_id(request), reply_to),
+      )
       Error(jsonrpc.invalid_params_error(
         "Timed out waiting for a client response to server-sent request",
       ))
@@ -177,59 +235,154 @@ pub fn resolve_response(
 fn loop(
   subject: process.Subject(Message),
   sessions: Dict(String, Session),
+  metadata: Dict(String, SessionMetadata),
 ) -> Nil {
-  case process.receive_forever(subject) {
+  let selector =
+    process.new_selector()
+    |> process.select(subject)
+    |> process.select_monitors(CallerDown)
+  case process.selector_receive_forever(selector) {
+    GetMetadata(session_id, reply_to) -> {
+      process.send(reply_to, case dict.get(metadata, session_id) {
+        Ok(entry) -> Some(entry)
+        Error(_) -> None
+      })
+      loop(subject, sessions, metadata)
+    }
+    SetMetadata(session_id, entry, reply_to) -> {
+      process.send(reply_to, Nil)
+      let next = case dict.has_key(sessions, session_id) {
+        True -> dict.insert(metadata, session_id, entry)
+        False -> metadata
+      }
+      loop(subject, sessions, next)
+    }
+    DeleteSession(session_id, reply_to) -> {
+      case dict.get(sessions, session_id) {
+        Ok(session) -> {
+          session.listener
+          |> list.each(fn(listener) {
+            process.demonitor_process(listener.monitor)
+            process.send(listener.subject, CloseListener)
+          })
+          session.pending_requests
+          |> dict.values
+          |> list.each(fn(pending) {
+            release_pending(pending)
+            process.send(
+              pending.reply_to,
+              Error(jsonrpc.invalid_params_error("MCP session closed")),
+            )
+          })
+        }
+        Error(_) -> Nil
+      }
+      process.send(reply_to, Nil)
+      loop(
+        subject,
+        dict.delete(sessions, session_id),
+        dict.delete(metadata, session_id),
+      )
+    }
     EnsureSession(session_id, reply_to) -> {
       let ensured = case session_id {
         Some(existing) -> existing
         None -> uuid.v4_string()
       }
       process.send(reply_to, ensured)
-      loop(subject, ensure_session_entry(sessions, ensured))
+      loop(subject, ensure_session_entry(sessions, ensured), metadata)
     }
     HasSession(session_id, reply_to) -> {
       process.send(reply_to, case dict.get(sessions, session_id) {
         Ok(_) -> True
         Error(Nil) -> False
       })
-      loop(subject, sessions)
+      loop(subject, sessions, metadata)
     }
     RegisterListener(session_id, listener_id, listener, reply_to) -> {
-      let next_sessions =
-        sessions
-        |> ensure_session_entry(session_id)
-        |> attach_listener(session_id, listener_id, listener)
+      let next_sessions = case dict.has_key(sessions, session_id) {
+        True -> attach_listener(sessions, session_id, listener_id, listener)
+        False -> {
+          process.send(listener, CloseListener)
+          sessions
+        }
+      }
       process.send(reply_to, Nil)
-      loop(subject, next_sessions)
+      loop(subject, next_sessions, metadata)
     }
     UnregisterListener(session_id, listener_id, reply_to) -> {
       let next_sessions = detach_listener(sessions, session_id, listener_id)
       process.send(reply_to, Nil)
-      loop(subject, next_sessions)
+      loop(subject, next_sessions, metadata)
     }
-    SendRequest(session_id, request, reply_to) -> {
-      let next_sessions =
-        sessions
-        |> ensure_session_entry(session_id)
-        |> enqueue_request(session_id, request, reply_to)
-      loop(subject, next_sessions)
+    SendRequest(session_id, request, reply_to, timeout_ms) -> {
+      let next_sessions = case dict.has_key(sessions, session_id) {
+        True ->
+          enqueue_request(
+            sessions,
+            subject,
+            session_id,
+            request,
+            reply_to,
+            timeout_ms,
+          )
+        False -> {
+          process.send(
+            reply_to,
+            Error(jsonrpc.invalid_params_error(
+              "MCP session is closed or unknown",
+            )),
+          )
+          sessions
+        }
+      }
+      loop(subject, next_sessions, metadata)
     }
     SendNotification(session_id, notification) -> {
       let next_sessions =
-        sessions
-        |> ensure_session_entry(session_id)
-        |> deliver_notification(session_id, notification)
-      loop(subject, next_sessions)
+        deliver_notification(sessions, session_id, notification)
+      loop(subject, next_sessions, metadata)
     }
     ResolveResponse(session_id, body, reply_to) -> {
       let #(next_sessions, result) =
         resolve_pending_response(sessions, session_id, body)
       process.send(reply_to, result)
-      loop(subject, next_sessions)
+      loop(subject, next_sessions, metadata)
     }
-    ExpireRequest(session_id, pending_id) -> {
-      loop(subject, expire_request(sessions, session_id, pending_id))
+    ExpireRequest(session_id, pending_id, reply_to) -> {
+      let session = get_session(sessions, session_id)
+      let next = case
+        dict.get(session.pending_requests, request_id_key(pending_id))
+      {
+        Ok(pending) if pending.reply_to == reply_to ->
+          expire_and_cancel(sessions, session_id, pending_id)
+        _ -> sessions
+      }
+      loop(subject, next, metadata)
     }
+    CallerDown(process.ProcessDown(_, caller, _)) -> {
+      let sessions = remove_listener_owner(sessions, caller)
+      let next =
+        list.fold(dict.to_list(sessions), sessions, fn(current, entry) {
+          list.fold(
+            dict.values(entry.1.pending_requests),
+            current,
+            fn(current, pending) {
+              case pending.caller == caller {
+                True ->
+                  expire_and_cancel(
+                    current,
+                    entry.0,
+                    request_id(pending.request),
+                  )
+                False -> current
+              }
+            },
+          )
+        })
+      loop(subject, next, metadata)
+    }
+    CallerDown(process.PortDown(..)) -> loop(subject, sessions, metadata)
   }
 }
 
@@ -238,15 +391,49 @@ fn deliver_notification(
   session_id: String,
   notification: jsonrpc.Request(actions.ActionNotification),
 ) -> Dict(String, Session) {
-  let Session(_, _, listener) = get_session(sessions, session_id)
-
-  case listener {
-    Some(Listener(subject: listener_subject, ..)) ->
-      process.send(listener_subject, DeliverNotification(notification))
-    None -> Nil
+  case dict.get(sessions, session_id) {
+    Error(_) -> sessions
+    Ok(session) -> {
+      let listeners = live_listeners(session.listener)
+      case list.first(listeners) {
+        Ok(listener) ->
+          process.send(listener.subject, DeliverNotification(notification))
+        Error(_) -> Nil
+      }
+      dict.insert(sessions, session_id, Session(..session, listener: listeners))
+    }
   }
+}
 
-  sessions
+fn live_listeners(listeners: List(Listener)) -> List(Listener) {
+  list.filter(listeners, fn(listener) {
+    case process.is_alive(listener.owner) {
+      True -> True
+      False -> {
+        process.demonitor_process(listener.monitor)
+        False
+      }
+    }
+  })
+}
+
+fn remove_listener_owner(
+  sessions: Dict(String, Session),
+  owner: process.Pid,
+) -> Dict(String, Session) {
+  dict.map_values(sessions, fn(_, session) {
+    let listeners =
+      list.filter(session.listener, fn(listener) {
+        case listener.owner == owner {
+          False -> True
+          True -> {
+            process.demonitor_process(listener.monitor)
+            False
+          }
+        }
+      })
+    Session(..session, listener: listeners)
+  })
 }
 
 fn ensure_session_entry(
@@ -255,8 +442,7 @@ fn ensure_session_entry(
 ) -> Dict(String, Session) {
   case dict.get(sessions, session_id) {
     Ok(_) -> sessions
-    Error(Nil) ->
-      dict.insert(sessions, session_id, Session([], dict.new(), None))
+    Error(Nil) -> dict.insert(sessions, session_id, Session([], dict.new(), []))
   }
 }
 
@@ -266,23 +452,34 @@ fn attach_listener(
   listener_id: String,
   listener: process.Subject(ListenerMessage),
 ) -> Dict(String, Session) {
-  let Session(queued_requests, pending_requests, current_listener) =
-    get_session(sessions, session_id)
+  case process.subject_owner(listener) {
+    Error(_) -> sessions
+    Ok(owner) ->
+      case process.is_alive(owner) {
+        False -> sessions
+        True -> {
+          let sessions = detach_listener(sessions, session_id, listener_id)
+          let Session(queued_requests, pending_requests, current_listener) =
+            get_session(sessions, session_id)
+          let listeners = live_listeners(current_listener)
+          let monitor = process.monitor(owner)
 
-  case current_listener {
-    Some(Listener(subject: current_subject, ..)) ->
-      process.send(current_subject, CloseListener)
-    None -> Nil
+          queued_requests
+          |> list.each(fn(request) {
+            process.send(listener, DeliverRequest(request))
+          })
+
+          dict.insert(
+            sessions,
+            session_id,
+            Session([], pending_requests, [
+              Listener(listener_id, listener, owner, monitor),
+              ..listeners
+            ]),
+          )
+        }
+      }
   }
-
-  queued_requests
-  |> list.each(fn(request) { process.send(listener, DeliverRequest(request)) })
-
-  dict.insert(
-    sessions,
-    session_id,
-    Session([], pending_requests, Some(Listener(listener_id, listener))),
-  )
 }
 
 fn detach_listener(
@@ -292,10 +489,16 @@ fn detach_listener(
 ) -> Dict(String, Session) {
   case dict.get(sessions, session_id) {
     Ok(Session(queued_requests, pending_requests, current_listener)) -> {
-      let next_listener = case current_listener {
-        Some(Listener(id:, ..)) if id == listener_id -> None
-        _ -> current_listener
-      }
+      let next_listener =
+        list.filter(current_listener, fn(listener) {
+          case listener.id == listener_id {
+            False -> True
+            True -> {
+              process.demonitor_process(listener.monitor)
+              False
+            }
+          }
+        })
 
       dict.insert(
         sessions,
@@ -309,38 +512,68 @@ fn detach_listener(
 
 fn enqueue_request(
   sessions: Dict(String, Session),
+  subject: process.Subject(Message),
   session_id: String,
   request: jsonrpc.Request(actions.ServerActionRequest),
   reply_to: process.Subject(
     Result(jsonrpc.Response(actions.ServerActionResult), jsonrpc.RpcError),
   ),
+  timeout_ms: Int,
 ) -> Dict(String, Session) {
   let session = get_session(sessions, session_id)
-  let Session(queued_requests, pending_requests, listener) = session
+  let Session(queued_requests, pending_requests, current_listener) = session
+  let listener = live_listeners(current_listener)
 
-  case listener {
-    Some(Listener(subject: listener_subject, ..)) ->
-      process.send(listener_subject, DeliverRequest(request))
-    None -> Nil
+  case dict.has_key(pending_requests, request_id_key(request_id(request))) {
+    True -> {
+      process.send(
+        reply_to,
+        Error(jsonrpc.RpcError(
+          -32_600,
+          "Duplicate active server request id",
+          None,
+        )),
+      )
+      sessions
+    }
+    False -> {
+      let assert Ok(caller) = process.subject_owner(reply_to)
+      let monitor = process.monitor(caller)
+      let timeout = case timeout_ms < 1 {
+        True -> 1
+        False -> timeout_ms
+      }
+      let timer =
+        process.send_after(
+          subject,
+          timeout,
+          ExpireRequest(session_id, request_id(request), reply_to),
+        )
+      case list.first(listener) {
+        Ok(Listener(subject: listener_subject, ..)) ->
+          process.send(listener_subject, DeliverRequest(request))
+        Error(_) -> Nil
+      }
+
+      let next_queue = case list.first(listener) {
+        Ok(_) -> queued_requests
+        Error(_) -> list.append(queued_requests, [request])
+      }
+
+      let next_session =
+        Session(
+          next_queue,
+          dict.insert(
+            pending_requests,
+            request_id_key(request_id(request)),
+            PendingRequest(request, reply_to, caller, monitor, timer),
+          ),
+          listener,
+        )
+
+      dict.insert(sessions, session_id, next_session)
+    }
   }
-
-  let next_queue = case listener {
-    Some(_) -> queued_requests
-    None -> list.append(queued_requests, [request])
-  }
-
-  let next_session =
-    Session(
-      next_queue,
-      dict.insert(
-        pending_requests,
-        request_id_key(request_id(request)),
-        PendingRequest(request, reply_to),
-      ),
-      listener,
-    )
-
-  dict.insert(sessions, session_id, next_session)
 }
 
 fn resolve_pending_response(
@@ -356,7 +589,10 @@ fn resolve_pending_response(
       case dict.get(sessions, session_id) {
         Ok(Session(queued_requests, pending_requests, listener)) ->
           case dict.get(pending_requests, response_key) {
-            Ok(PendingRequest(request, waiting_reply)) ->
+            Ok(pending) -> {
+              let request = pending.request
+              let waiting_reply = pending.reply_to
+              release_pending(pending)
               case client_codec.decode_server_response(body, request) {
                 Ok(response) -> {
                   process.send(waiting_reply, Ok(response))
@@ -390,6 +626,7 @@ fn resolve_pending_response(
                   )
                 }
               }
+            }
             Error(Nil) -> #(
               sessions,
               Error(jsonrpc.invalid_params_error(
@@ -408,23 +645,93 @@ fn resolve_pending_response(
   }
 }
 
-fn expire_request(
+fn release_pending(pending: PendingRequest) -> Nil {
+  let _ = process.cancel_timer(pending.timer)
+  process.demonitor_process(pending.monitor)
+}
+
+fn expire_and_cancel(
   sessions: Dict(String, Session),
   session_id: String,
   pending_id: jsonrpc.RequestId,
 ) -> Dict(String, Session) {
-  case dict.get(sessions, session_id) {
-    Ok(Session(queued_requests, pending_requests, listener)) ->
-      dict.insert(
-        sessions,
+  let session = get_session(sessions, session_id)
+  case dict.get(session.pending_requests, request_id_key(pending_id)) {
+    Error(_) -> sessions
+    Ok(pending) -> {
+      release_pending(pending)
+      process.send(
+        pending.reply_to,
+        Error(jsonrpc.invalid_params_error(
+          "Server-sent request timed out or its caller stopped",
+        )),
+      )
+      let next =
+        dict.insert(
+          sessions,
+          session_id,
+          Session(
+            drop_request(session.queued_requests, pending_id),
+            dict.delete(session.pending_requests, request_id_key(pending_id)),
+            session.listener,
+          ),
+        )
+      deliver_notification(
+        next,
         session_id,
-        Session(
-          drop_request(queued_requests, pending_id),
-          dict.delete(pending_requests, request_id_key(pending_id)),
-          listener,
+        jsonrpc.Notification(
+          mcp.method_notify_cancelled,
+          Some(
+            actions.NotifyCancelled(actions.CancelledNotificationParams(
+              Some(pending_id),
+              Some("Request caller stopped or timed out"),
+              related_notification_meta(pending.request),
+            )),
+          ),
         ),
       )
-    Error(Nil) -> sessions
+    }
+  }
+}
+
+fn related_notification_meta(
+  request: jsonrpc.Request(actions.ServerActionRequest),
+) -> Option(actions.NotificationMeta) {
+  let meta = case request {
+    jsonrpc.Request(_, _, Some(actions.ServerRequestPing(meta)))
+    | jsonrpc.Request(_, _, Some(actions.ServerRequestListRoots(meta))) -> meta
+    jsonrpc.Request(_, _, Some(actions.ServerRequestCreateMessage(params))) ->
+      params.meta
+    jsonrpc.Request(
+      _,
+      _,
+      Some(actions.ServerRequestElicit(actions.ElicitRequestForm(params))),
+    ) -> params.meta
+    jsonrpc.Request(
+      _,
+      _,
+      Some(actions.ServerRequestElicit(actions.ElicitRequestUrl(params))),
+    ) -> params.meta
+    jsonrpc.Request(_, _, Some(actions.ServerRequestListTasks(params))) ->
+      params.meta
+    _ -> None
+  }
+  use meta <- option.then(meta)
+  use extra <- option.then(meta.extra)
+  case dict.get(extra.fields, "io.modelcontextprotocol/related-task") {
+    Ok(related) ->
+      Some(
+        actions.NotificationMeta(
+          Some(
+            actions.Meta(
+              dict.from_list([
+                #("io.modelcontextprotocol/related-task", related),
+              ]),
+            ),
+          ),
+        ),
+      )
+    Error(_) -> None
   }
 }
 
@@ -468,7 +775,7 @@ fn response_id_decoder() -> decode.Decoder(jsonrpc.RequestId) {
 fn get_session(sessions: Dict(String, Session), session_id: String) -> Session {
   case dict.get(sessions, session_id) {
     Ok(session) -> session
-    Error(Nil) -> Session([], dict.new(), None)
+    Error(Nil) -> Session([], dict.new(), [])
   }
 }
 

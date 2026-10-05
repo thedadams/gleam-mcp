@@ -510,8 +510,20 @@ fn encode_logging_message_notification_params(
 fn encode_elicitation_complete_notification_params(
   params: actions.ElicitationCompleteNotificationParams,
 ) -> json.Json {
-  let actions.ElicitationCompleteNotificationParams(elicitation_id) = params
-  json.object([#("elicitationId", json.string(elicitation_id))])
+  [
+    #(
+      "elicitationId",
+      json.string(actions.elicitation_complete_notification_id(params)),
+    ),
+  ]
+  |> append_optional(
+    "_meta",
+    option_map(
+      actions.elicitation_complete_notification_meta(params),
+      encode_notification_meta,
+    ),
+  )
+  |> json.object
 }
 
 fn encode_task_status_notification_params(
@@ -729,7 +741,9 @@ fn logging_level_string(level: actions.LoggingLevel) -> String {
   }
 }
 
-fn encode_model_preferences(preferences: actions.ModelPreferences) -> json.Json {
+fn encode_model_preferences(
+  preferences: actions.ModelPreferences,
+) -> json.Json {
   let actions.ModelPreferences(
     hints,
     cost_priority,
@@ -840,15 +854,19 @@ fn response_decoder(
 ) -> decode.Decoder(jsonrpc.Response(actions.ClientActionResult)) {
   case request {
     jsonrpc.Request(original_id, _, Some(action)) ->
-      decode.one_of(
-        result_response_decoder(original_id, action_result_decoder(action)),
-        or: [error_response_decoder()],
-      )
+      decode.then(codec_common.response_envelope_decoder(original_id), fn(_) {
+        decode.one_of(
+          result_response_decoder(original_id, action_result_decoder(action)),
+          or: [error_response_decoder()],
+        )
+      })
     jsonrpc.Request(original_id, _, None) ->
-      decode.one_of(
-        result_response_decoder(original_id, empty_result_decoder()),
-        or: [error_response_decoder()],
-      )
+      decode.then(codec_common.response_envelope_decoder(original_id), fn(_) {
+        decode.one_of(
+          result_response_decoder(original_id, empty_result_decoder()),
+          or: [error_response_decoder()],
+        )
+      })
     jsonrpc.Notification(_, _) ->
       decode.failure(
         jsonrpc.ErrorResponse(None, jsonrpc.user_rejected_error()),
@@ -862,21 +880,25 @@ fn server_response_decoder(
 ) -> decode.Decoder(jsonrpc.Response(actions.ServerActionResult)) {
   case request {
     jsonrpc.Request(original_id, _, Some(action)) ->
-      decode.one_of(
-        server_result_response_decoder(
-          original_id,
-          server_action_result_decoder(action),
-        ),
-        or: [server_error_response_decoder()],
-      )
+      decode.then(codec_common.response_envelope_decoder(original_id), fn(_) {
+        decode.one_of(
+          server_result_response_decoder(
+            original_id,
+            server_action_result_decoder(action),
+          ),
+          or: [server_error_response_decoder()],
+        )
+      })
     jsonrpc.Request(original_id, _, None) ->
-      decode.one_of(
-        server_result_response_decoder(
-          original_id,
-          server_empty_result_decoder(),
-        ),
-        or: [server_error_response_decoder()],
-      )
+      decode.then(codec_common.response_envelope_decoder(original_id), fn(_) {
+        decode.one_of(
+          server_result_response_decoder(
+            original_id,
+            server_empty_result_decoder(),
+          ),
+          or: [server_error_response_decoder()],
+        )
+      })
     jsonrpc.Notification(_, _) ->
       decode.failure(
         jsonrpc.ErrorResponse(None, jsonrpc.user_rejected_error()),
@@ -885,7 +907,9 @@ fn server_response_decoder(
   }
 }
 
-fn server_message_decoder() -> decode.Decoder(ServerMessage) {
+pub fn server_message_decoder() -> decode.Decoder(ServerMessage) {
+  use _ <- decode.then(codec_common.request_envelope_decoder())
+  use _ <- decode.then(codec_common.request_parameters_decoder())
   decode.then(decode.at(["method"], decode.string), fn(method) {
     case method {
       method if method == mcp.method_ping -> ping_message_decoder()
@@ -897,8 +921,7 @@ fn server_message_decoder() -> decode.Decoder(ServerMessage) {
       method if method == mcp.method_get_task -> get_task_message_decoder()
       method if method == mcp.method_get_task_result ->
         get_task_result_message_decoder()
-      method if method == mcp.method_cancel_task ->
-        cancel_task_message_decoder()
+      method if method == mcp.method_cancel_task -> cancel_task_message_decoder()
       method if method == mcp.method_notify_cancelled ->
         cancelled_notification_decoder()
       method if method == mcp.method_notify_progress ->
@@ -928,7 +951,7 @@ fn ping_message_decoder() -> decode.Decoder(ServerMessage) {
   decode_optional_server_request_message(
     mcp.method_ping,
     None,
-    decode.optional(request_meta_decoder()),
+    request_meta_only_decoder(),
     actions.ServerRequestPing,
   )
 }
@@ -937,7 +960,7 @@ fn list_roots_message_decoder() -> decode.Decoder(ServerMessage) {
   decode_optional_server_request_message(
     mcp.method_list_roots,
     None,
-    decode.optional(request_meta_decoder()),
+    request_meta_only_decoder(),
     actions.ServerRequestListRoots,
   )
 }
@@ -1306,7 +1329,19 @@ fn elicitation_complete_notification_params_decoder() -> decode.Decoder(
 ) {
   {
     use elicitation_id <- decode.field("elicitationId", decode.string)
-    decode.success(actions.ElicitationCompleteNotificationParams(elicitation_id))
+    use meta <- decode.optional_field(
+      "_meta",
+      None,
+      decode.optional(notification_meta_decoder()),
+    )
+    decode.success(case meta {
+      None -> actions.ElicitationCompleteNotificationParams(elicitation_id)
+      Some(_) ->
+        actions.ElicitationCompleteNotificationParamsWithMeta(
+          elicitation_id,
+          meta,
+        )
+    })
   }
 }
 
@@ -1479,26 +1514,22 @@ fn server_empty_result_decoder() -> decode.Decoder(actions.ServerActionResult) {
 }
 
 fn successful_response_decoder(
-  original_id: jsonrpc.RequestId,
+  _original_id: jsonrpc.RequestId,
   result_decoder: decode.Decoder(result),
 ) -> decode.Decoder(jsonrpc.Response(result)) {
   {
     use version <- decode.field("jsonrpc", decode.string)
-    use _id <- decode.field("id", request_id_decoder())
+    use id <- decode.field("id", request_id_decoder())
     use result <- decode.field("result", result_decoder)
     let _ = version
-    decode.success(jsonrpc.ResultResponse(original_id, result))
+    decode.success(jsonrpc.ResultResponse(id, result))
   }
 }
 
 fn failed_response_decoder() -> decode.Decoder(jsonrpc.Response(result)) {
   {
     use version <- decode.field("jsonrpc", decode.string)
-    use id <- decode.optional_field(
-      "id",
-      None,
-      decode.optional(request_id_decoder()),
-    )
+    use id <- decode.field("id", decode.optional(request_id_decoder()))
     use error <- decode.field("error", error_decoder())
     let _ = version
     decode.success(jsonrpc.ErrorResponse(id, error))
@@ -1680,10 +1711,7 @@ fn standard_create_message_result_decoder() -> decode.Decoder(
 ) {
   {
     use role <- decode.field("role", role_decoder())
-    use content <- decode.field(
-      "content",
-      sampling_message_content_block_decoder(),
-    )
+    use content <- decode.field("content", sampling_content_decoder())
     use model <- decode.field("model", decode.string)
     use stop_reason <- decode.optional_field(
       "stopReason",
@@ -1696,11 +1724,7 @@ fn standard_create_message_result_decoder() -> decode.Decoder(
       decode.optional(meta_decoder()),
     )
     decode.success(actions.CreateMessageResult(
-      message: actions.SamplingMessage(
-        role,
-        actions.SingleSamplingContent(content),
-        None,
-      ),
+      message: actions.SamplingMessage(role, content, None),
       model: model,
       stop_reason: stop_reason,
       meta: meta,
@@ -1851,7 +1875,7 @@ fn elicit_request_params_decoder() -> decode.Decoder(
     use mode <- decode.optional_field(
       "mode",
       None,
-      decode.optional(decode.string),
+      decode.map(decode.string, Some),
     )
     case mode {
       Some("url") ->
@@ -1859,10 +1883,20 @@ fn elicit_request_params_decoder() -> decode.Decoder(
           elicit_request_url_params_decoder(),
           actions.ElicitRequestUrl,
         )
-      _ ->
+      None | Some("form") ->
         decode.map(
           elicit_request_form_params_decoder(),
           actions.ElicitRequestForm,
+        )
+      Some(_) ->
+        decode.failure(
+          actions.ElicitRequestForm(actions.ElicitRequestFormParams(
+            "",
+            jsonrpc.VObject([]),
+            None,
+            None,
+          )),
+          expected: "Elicitation mode form or url",
         )
     }
   }
@@ -1922,18 +1956,28 @@ fn elicit_request_url_params_decoder() -> decode.Decoder(
 
 fn request_meta_decoder() -> decode.Decoder(actions.RequestMeta) {
   {
+    use fields <- decode.then(value_dict_decoder())
     use progress_token <- decode.optional_field(
       "progressToken",
       None,
-      decode.optional(request_id_decoder()),
+      decode.map(request_id_decoder(), Some),
     )
-    use extra <- decode.optional_field(
-      "extra",
-      None,
-      decode.optional(meta_decoder()),
-    )
+    let fields = dict.delete(fields, "progressToken")
+    let extra = case dict.size(fields) {
+      0 -> None
+      _ -> Some(actions.Meta(fields))
+    }
     decode.success(actions.RequestMeta(progress_token, extra))
   }
+}
+
+fn request_meta_only_decoder() -> decode.Decoder(Option(actions.RequestMeta)) {
+  use meta <- decode.optional_field(
+    "_meta",
+    None,
+    decode.map(request_meta_decoder(), Some),
+  )
+  decode.success(meta)
 }
 
 fn notification_meta_only_decoder() -> decode.Decoder(
@@ -1950,14 +1994,13 @@ fn notification_meta_only_decoder() -> decode.Decoder(
 }
 
 fn notification_meta_decoder() -> decode.Decoder(actions.NotificationMeta) {
-  {
-    use extra <- decode.optional_field(
-      "extra",
-      None,
-      decode.optional(meta_decoder()),
-    )
-    decode.success(actions.NotificationMeta(extra))
-  }
+  decode.map(value_dict_decoder(), fn(fields) {
+    let extra = case dict.size(fields) {
+      0 -> None
+      _ -> Some(actions.Meta(fields))
+    }
+    actions.NotificationMeta(extra)
+  })
 }
 
 fn task_metadata_decoder() -> decode.Decoder(actions.TaskMetadata) {
@@ -2124,10 +2167,10 @@ fn get_task_result_decoder() -> decode.Decoder(actions.GetTaskResult) {
 
 fn task_result_decoder() -> decode.Decoder(actions.TaskResult) {
   decode.one_of(
-    decode.map(call_tool_result_decoder(), actions.TaskCallTool),
+    decode.map(create_message_result_decoder(), actions.TaskCreateMessage),
     or: [
-      decode.map(create_message_result_decoder(), actions.TaskCreateMessage),
       decode.map(elicit_result_decoder(), actions.TaskElicit),
+      decode.map(call_tool_result_decoder(), actions.TaskCallTool),
     ],
   )
 }

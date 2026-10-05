@@ -250,7 +250,9 @@ fn test_task_for_transport(config: transport.Config) {
   let _ = cancel_result |> should.be_error
 }
 
-fn simulate_research_query_runs_as_task_with_transport(config: transport.Config) {
+fn simulate_research_query_runs_as_task_with_transport(
+  config: transport.Config,
+) {
   let client = client.new(config, capabilities.none())
   let #(client, _) = initialize_client(client)
 

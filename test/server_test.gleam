@@ -416,7 +416,7 @@ pub fn task_backed_tool_calls_can_be_polled_test() {
 }
 
 pub fn task_backed_tool_calls_can_be_cancelled_test() {
-  let sample_server = example_server.sample_server()
+  let sample_server = task_status_test_server()
   let #(_, create_response) =
     server.handle_request(
       sample_server,
@@ -425,9 +425,9 @@ pub fn task_backed_tool_calls_can_be_cancelled_test() {
         mcp.method_call_tool,
         Some(
           actions.ClientRequestCallTool(actions.CallToolRequestParams(
-            "echo",
+            "pause",
             Some(dict.from_list([#("message", jsonrpc.VString("hello"))])),
-            Some(actions.TaskMetadata(Some(1000))),
+            Some(actions.TaskMetadata(Some(5000))),
             None,
           )),
         ),
@@ -482,8 +482,12 @@ pub fn task_backed_tool_calls_can_be_cancelled_test() {
 
 pub fn update_task_status_sends_notification_for_http_session_test() {
   let sample_server = task_status_test_server()
-  let task_id = create_task_id(sample_server)
   let session_id = server.ensure_streamable_http_session(sample_server, None)
+  let task_id =
+    create_task_id_with_context(
+      sample_server,
+      server.RequestContext(Some(session_id), None),
+    )
   let listener_id = server.new_streamable_http_listener_id()
   let listener = process.new_subject()
 
@@ -745,7 +749,7 @@ fn create_task_id_with_context(
           actions.ClientRequestCallTool(actions.CallToolRequestParams(
             "pause",
             None,
-            Some(actions.TaskMetadata(Some(1000))),
+            Some(actions.TaskMetadata(Some(5000))),
             None,
           )),
         ),
