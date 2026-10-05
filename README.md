@@ -171,6 +171,10 @@ The script starts the Gleam server, launches the Gleam client for each scenario,
 and saves raw results and pass/fail summaries outside the repository. It needs
 Bash, Git, Node.js 20 or later, npm, Gleam, curl, and pgrep.
 
+The selection and reporting helpers in `scripts/conformance` have independent
+tests: run `node --test scripts/conformance/*.test.mjs` without downloading the
+official runner.
+
 Use `scripts/run-conformance.sh --mode optional` for schema preservation, HTTP
 header validation, and the tasks extension. Use `--mode all` to run both required
 and selected optional scenarios. The reports keep the required score and optional
