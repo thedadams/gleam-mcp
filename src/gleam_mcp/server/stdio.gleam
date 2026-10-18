@@ -13,7 +13,7 @@ import gleam_mcp/server
 import gleam_mcp/server/codec
 import gleam_mcp/server/streamable_http_store
 import gleam_mcp/wire
-import stdin
+import in
 import youid/uuid
 
 type Message {
@@ -43,7 +43,14 @@ type State {
 }
 
 pub fn serve(server: server.Server) {
-  serve_with_lines(server, stdin.read_lines())
+  let lines =
+    yielder.unfold(Nil, fn(_) {
+      case in.read_line() {
+        Ok(line) -> yielder.Next(line, Nil)
+        Error(_) -> yielder.Done
+      }
+    })
+  serve_with_lines(server, lines)
 }
 
 pub fn serve_with_lines(server: server.Server, lines: yielder.Yielder(String)) {

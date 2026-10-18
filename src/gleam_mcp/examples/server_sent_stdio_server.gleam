@@ -9,7 +9,7 @@ import gleam_mcp/jsonrpc
 import gleam_mcp/mcp
 import gleam_mcp/server/capabilities as server_capabilities
 import gleam_mcp/server/codec as server_codec
-import stdin
+import in
 
 type PendingInteraction {
   PendingInteraction(
@@ -24,8 +24,14 @@ type State {
 }
 
 pub fn main() -> Nil {
-  let _ =
-    stdin.read_lines() |> yielder.fold(from: State(None), with: handle_line)
+  let lines =
+    yielder.unfold(Nil, fn(_) {
+      case in.read_line() {
+        Ok(line) -> yielder.Next(line, Nil)
+        Error(_) -> yielder.Done
+      }
+    })
+  let _ = yielder.fold(lines, from: State(None), with: handle_line)
   Nil
 }
 

@@ -4,10 +4,9 @@ import gleam_mcp/actions
 import gleam_mcp/jsonrpc
 import gleam_mcp/server
 import gleam_mcp/server/stdio
-import stdin
 
 pub fn main() {
-  stdio.serve_with_lines(sample_server(), stdin.read_lines())
+  stdio.serve(sample_server())
 }
 
 pub fn sample_server() -> server.Server {
