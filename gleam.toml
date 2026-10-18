@@ -6,7 +6,7 @@ repository = { type = "github", user = "thedadams", repo = "gleam-mcp" }
 
 [dependencies]
 argv = ">= 1.0.2 and < 2.0.0"
-gleam_stdlib = ">= 0.44.0 and < 2.0.0"
+gleam_stdlib = ">= 1.0.0 and < 2.0.0"
 gleam_time = ">= 1.7.0 and < 2.0.0"
 youid = ">= 1.5.1 and < 2.0.0"
 gleam_http = ">= 4.3.0 and < 5.0.0"
@@ -22,7 +22,7 @@ gleam_yielder = ">= 1.1.0 and < 2.0.0"
 child_process = ">= 2.1.4 and < 3.0.0"
 gleam_crypto = ">= 1.5.1 and < 2.0.0"
 flwr_oauth2 = ">= 3.1.0 and < 4.0.0"
-httpp = ">= 1.8.0 and < 2.0.0"
+httpp = { git = "https://github.com/thedadams/httpp.git", ref = "0ae1235ce37a5b5a29d01030667018a6ab59d342" }
 gzlib = ">= 2.0.0 and < 3.0.0"
 
 [dev-dependencies]
