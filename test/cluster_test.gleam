@@ -1,11 +1,14 @@
 //// Two servers in one node that share stores and a cluster name behave as two
 //// replicas: glyn delivers between them exactly as between connected nodes.
 
+import envoy
+import gleam/crypto
 import gleam/dict
 import gleam/erlang/process
 import gleam/int
 import gleam/option.{None, Some}
 import gleam/otp/actor
+import gleam/result
 import gleam/string
 import gleam_mcp/actions
 import gleam_mcp/examples/everything/tool_helpers
@@ -28,12 +31,15 @@ fn replicas() -> Replicas {
     memory.start_sessions(process.new_name("cluster_test_sessions"))
   let assert Ok(actor.Started(data: tasks, ..)) =
     memory.start_tasks(process.new_name("cluster_test_tasks"))
+  let secret = crypto.strong_random_bytes(32)
   let replica = fn() {
     let app =
       server.new(server_test_support.sample_client_info())
       |> server.with_session_store(sessions)
       |> server.with_task_store(tasks)
-      |> server.with_cluster(name)
+      |> server.with_request_state_secret(secret)
+      |> result.try(server.with_cluster(_, name))
+      |> should.be_ok
     let assert Ok(Nil) = server.start_services(app)
     app
   }
@@ -344,4 +350,23 @@ pub fn waiting_for_a_task_finished_by_another_replica_test() {
   // The second replica waits; the first runs the worker and announces it.
   let assert actions.TaskCallTool(_) =
     server.task_result(second, created.task.task_id) |> should.be_ok
+}
+
+pub fn clustering_requires_a_shared_state_secret_test() {
+  server.new(server_test_support.sample_client_info())
+  |> server.with_cluster("no-secret")
+  |> should.be_error
+}
+
+pub fn peers_are_read_from_the_environment_test() {
+  envoy.set("CLUSTER_TEST_PEERS", " mcp@a , ,mcp@b")
+  cluster.peers_from_env("CLUSTER_TEST_PEERS")
+  |> should.equal(["mcp@a", "mcp@b"])
+  cluster.peers_from_env("CLUSTER_TEST_UNSET") |> should.equal([])
+}
+
+pub fn connecting_to_unreachable_peers_reports_them_test() {
+  // A node that is not distributed cannot reach any peer.
+  cluster.connect(["mcp@unreachable.invalid"])
+  |> should.equal(["mcp@unreachable.invalid"])
 }

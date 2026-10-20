@@ -10,6 +10,7 @@
 //// Replicas find each other through Erlang distribution: connect the nodes
 //// (see `connect`) and give every replica the same cluster name.
 
+import envoy
 import gleam/dict.{type Dict}
 import gleam/dynamic/decode
 import gleam/erlang/atom
@@ -22,6 +23,7 @@ import gleam/otp/actor
 import gleam/otp/supervision
 import gleam/result
 import gleam/set.{type Set}
+import gleam/string
 import gleam_mcp/codec_common
 import gleam_mcp/codec_decode
 import gleam_mcp/jsonrpc
@@ -147,6 +149,52 @@ pub fn connect(peers: List(String)) -> List(String) {
   peers
   |> list.filter(fn(peer) { peer != self && !list.contains(connected, peer) })
   |> list.filter(fn(peer) { node.connect(atom.create(peer)) |> result.is_error })
+}
+
+/// Read peer node names from a comma-separated environment variable, such as
+/// `MCP_CLUSTER_PEERS=mcp@app-0.app,mcp@app-1.app`.
+pub fn peers_from_env(variable: String) -> List(String) {
+  case envoy.get(variable) {
+    Ok(value) ->
+      value
+      |> string.split(",")
+      |> list.map(string.trim)
+      |> list.filter(fn(peer) { peer != "" })
+    Error(Nil) -> []
+  }
+}
+
+pub opaque type ConnectorMessage {
+  Reconnect
+}
+
+/// Keep this node connected to `peers`, retrying every `interval_ms` so that
+/// restarted peers rejoin.
+pub fn start_connector(
+  peers: List(String),
+  interval_ms: Int,
+) -> actor.StartResult(process.Subject(ConnectorMessage)) {
+  actor.new_with_initialiser(1000, fn(subject) {
+    process.send(subject, Reconnect)
+    actor.initialised(subject) |> actor.returning(subject) |> Ok
+  })
+  |> actor.on_message(fn(subject, message) {
+    case message {
+      Reconnect -> {
+        let _ = connect(peers)
+        process.send_after(subject, interval_ms, Reconnect)
+        actor.continue(subject)
+      }
+    }
+  })
+  |> actor.start
+}
+
+pub fn supervised_connector(
+  peers: List(String),
+  interval_ms: Int,
+) -> supervision.ChildSpecification(process.Subject(ConnectorMessage)) {
+  supervision.worker(fn() { start_connector(peers, interval_ms) })
 }
 
 /// Handlers the relay calls for events from other replicas.

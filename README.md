@@ -154,6 +154,44 @@ A server's OAuth verifier authenticates token signatures or introspection before
 returning `VerifiedToken`; the SDK then enforces its configured resource and
 permissions. Authorization-server hosting belongs to the selected provider.
 
+## Running several replicas
+
+A server keeps sessions, resource subscriptions and tasks in stores, and
+in-memory stores by default. To survive restarts or serve one client from
+several replicas without sticky routing, every replica needs:
+
+- shared stores: `server.with_session_store` and `server.with_task_store`, for
+  example from `gleam_mcp_postgres`;
+- the same request state secret: `server.with_request_state_secret`;
+- the same cluster name: `server.with_cluster`, which fails without the secret;
+- connected nodes: start each node with Erlang distribution (`-name` and a
+  shared cookie, ideally over TLS) and keep it connected to its peers with
+  `cluster.supervised_connector(cluster.peers_from_env("MCP_CLUSTER_PEERS"), 5000)`.
+  Stable node names, such as a Kubernetes StatefulSet's, suit a fixed peer list.
+
+```gleam
+let assert Ok(app) =
+  server.new(implementation)
+  |> server.with_session_store(stores.sessions)
+  |> server.with_task_store(stores.tasks)
+  |> server.with_request_state_secret(secret)
+  |> result.try(server.with_cluster(_, "my-mcp-server"))
+```
+
+Connections and request workers stay on the replica that accepted them;
+replicas forward messages to them. A notification or server request for a
+2025-11-25 session reaches the client's stream on whichever replica holds it,
+and the client's response may arrive at any replica. A response to an unknown
+request is accepted and dropped. 2026-07-28 subscriptions receive changes
+published on any replica, and any replica can read, await or cancel a task. A
+task whose replica stops is reported as failed.
+
+Sessions expire after 30 days without a request; each request extends the
+lifetime, writing to the store at most once a day. Configure both with
+`server.with_session_ttl`. The HTTP and stdio transports call
+`server.start_services`, which relays events between replicas and sweeps
+expired sessions and tasks; call it yourself with another transport.
+
 ## Validation and testing
 
 General JSON Schema 2020-12 validation remains an outstanding limitation. Tool

@@ -130,6 +130,8 @@ type Options {
     page_size: Int,
     modern_handler: Option(ModernRequestHandler),
     state_secret: BitArray,
+    /// Whether the secret was supplied rather than generated for this server.
+    shared_state_secret: Bool,
     extensions: dict.Dict(String, jsonrpc.Value),
     projection: Option(fn(Server, RequestContext) -> Server),
     session_close: Option(fn(String) -> Nil),
@@ -242,6 +244,7 @@ pub fn new(implementation: actions.Implementation) -> Server {
       page_size: 100,
       modern_handler: None,
       state_secret: crypto.strong_random_bytes(32),
+      shared_state_secret: False,
       extensions: dict.new(),
       projection: None,
       session_close: None,
@@ -300,13 +303,29 @@ pub fn start_services(server: Server) -> Result(Nil, actor.StartError) {
 /// server: the nodes connected to this one through Erlang distribution that
 /// use the same cluster `name`. Pair it with session and task stores that
 /// every replica shares.
-pub fn with_cluster(server: Server, name: String) -> Server {
-  let replicas = cluster.shared(name, cluster.replica(server.cluster))
-  Server(
-    ..server,
-    cluster: replicas,
-    task_store: task_store.with_peers(server.task_store, task_peers(replicas)),
-  )
+///
+/// A replica must accept request state signed by any other, so configure the
+/// shared secret with `with_request_state_secret` first.
+pub fn with_cluster(server: Server, name: String) -> Result(Server, String) {
+  case server.options.shared_state_secret {
+    False ->
+      Error(
+        "Clustered servers need the same request state secret on every replica; call with_request_state_secret before with_cluster",
+      )
+    True -> {
+      let replicas = cluster.shared(name, cluster.replica(server.cluster))
+      Ok(
+        Server(
+          ..server,
+          cluster: replicas,
+          task_store: task_store.with_peers(
+            server.task_store,
+            task_peers(replicas),
+          ),
+        ),
+      )
+    }
+  }
 }
 
 fn task_peers(replicas: cluster.Cluster) -> task_store.Peers {
@@ -571,7 +590,11 @@ pub fn with_request_state_secret(
       Ok(
         Server(
           ..server,
-          options: Options(..server.options, state_secret: secret),
+          options: Options(
+            ..server.options,
+            state_secret: secret,
+            shared_state_secret: True,
+          ),
         ),
       )
     False ->
