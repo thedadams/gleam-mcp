@@ -926,8 +926,8 @@ fn modern_sse_response(
       fn(state, message, connection) {
         case message {
           streamable_http_store.DeliverRequest(_)
-          | streamable_http_store.DeliverReplay(_, _, _) ->
-            actor.continue(state)
+          | streamable_http_store.DeliverReplay(_, _, _)
+          | streamable_http_store.DeliverPayload(_) -> actor.continue(state)
           streamable_http_store.DeliverNotification(notification) -> {
             case
               mist.send_event(
@@ -1086,6 +1086,7 @@ fn handle_legacy_message(
         None, True -> {
           let id = server.ensure_streamable_http_session(server, None)
           let _ = server.bind_session(server, id, principal)
+          server.attach_session(server, id)
           Ok(id)
         }
         _, _ ->
@@ -1237,7 +1238,10 @@ fn require_existing_session(
         Ok(None) -> Error(#(404, "Unknown MCP session"))
         Ok(Some(_)) ->
           case server.bind_session(server, id, principal) {
-            True -> Ok(id)
+            True -> {
+              server.attach_session(server, id)
+              Ok(id)
+            }
             False -> Error(#(404, "Unknown MCP session"))
           }
       }
@@ -1272,7 +1276,7 @@ fn handle_streamed_request(
       )
       |> response.set_header("mcp-session-id", session_id),
     init: fn(listener) {
-      server.register_streamable_http_listener(
+      server.register_streamable_http_request_stream(
         server,
         session_id,
         listener_id,
@@ -1525,6 +1529,20 @@ fn handle_live_sse_message(
         Error(Nil) -> actor.stop()
       }
     }
+    streamable_http_store.DeliverPayload(payload) ->
+      case
+        mist.send_event(
+          connection,
+          mist.event(payload |> string_tree.from_string)
+            |> mist.event_name("message"),
+        )
+      {
+        Ok(Nil) -> actor.continue(state)
+        Error(Nil) -> {
+          close_sse(state)
+          actor.stop()
+        }
+      }
     streamable_http_store.CloseListener -> {
       close_sse(state)
       actor.stop()

@@ -410,7 +410,8 @@ fn handle_sse_message(
             client_codec.encode_notification(notification),
           )
         streamable_http_store.DeliverResponse("") -> Ok(Nil)
-        streamable_http_store.DeliverResponse(body) ->
+        streamable_http_store.DeliverResponse(body)
+        | streamable_http_store.DeliverPayload(body) ->
           send_message(connection, body)
         streamable_http_store.DeliverReplay(id, body, close) -> {
           let result =

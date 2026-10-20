@@ -73,6 +73,9 @@ pub type TaskRecord {
     cancellation_status_message: Option(String),
     cancellation_meta: Option(actions.Meta),
     expires_at: Option(Timestamp),
+    /// The replica running the task's worker. A task whose owner has stopped
+    /// can never finish, so readers fail it.
+    owner: Option(String),
     /// Incremented by every write, for optimistic concurrency.
     version: Int,
   )

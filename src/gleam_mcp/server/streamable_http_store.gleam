@@ -8,6 +8,7 @@ import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
 import gleam/otp/supervision
 import gleam/result
+import gleam/time/timestamp
 import gleam_mcp/actions
 import gleam_mcp/client/codec as client_codec
 import gleam_mcp/jsonrpc
@@ -23,7 +24,20 @@ pub type ListenerMessage {
   DeliverNotification(jsonrpc.Request(actions.ActionNotification))
   DeliverResponse(String)
   DeliverReplay(event_id: String, payload: String, close: Bool)
+  /// An encoded message relayed from another replica.
+  DeliverPayload(String)
   CloseListener
+}
+
+/// Where a listener's messages go.
+pub type ListenerKind {
+  /// A stream the client opened for the whole session (an HTTP GET). Other
+  /// replicas forward session messages to it.
+  SessionStream
+  /// The response stream of one request, which only this replica writes to.
+  RequestStream
+  /// Stands in for a session stream held by another replica.
+  RemoteStream
 }
 
 pub opaque type Message {
@@ -34,8 +48,27 @@ pub opaque type Message {
     session_id: String,
     listener_id: String,
     listener: process.Subject(ListenerMessage),
+    kind: ListenerKind,
+    attached_at: Int,
     reply_to: process.Subject(Nil),
   )
+  SendToListener(
+    session_id: String,
+    listener_id: String,
+    message: ListenerMessage,
+  )
+  DeliverIfOwner(
+    session_id: String,
+    payload: String,
+    record: Option(fn(String, String) -> String),
+  )
+  DropListener(session_id: String, listener_id: String)
+  SessionStreams(
+    session_id: String,
+    reply_to: process.Subject(List(#(String, Int))),
+  )
+  HasListener(session_id: String, reply_to: process.Subject(Bool))
+  SessionIds(reply_to: process.Subject(List(String)))
   UnregisterListener(
     session_id: String,
     listener_id: String,
@@ -92,6 +125,9 @@ type Listener {
     subject: process.Subject(ListenerMessage),
     owner: process.Pid,
     monitor: process.Monitor,
+    kind: ListenerKind,
+    /// Unix time in nanoseconds; the newest listener receives messages.
+    attached_at: Int,
   )
 }
 
@@ -177,9 +213,87 @@ pub fn register_listener(
   listener_id: String,
   listener: process.Subject(ListenerMessage),
 ) -> Nil {
+  register_listener_as(
+    store,
+    session_id,
+    listener_id,
+    listener,
+    SessionStream,
+    now_nanoseconds(),
+  )
+}
+
+pub fn register_listener_as(
+  store: Store,
+  session_id: String,
+  listener_id: String,
+  listener: process.Subject(ListenerMessage),
+  kind: ListenerKind,
+  attached_at: Int,
+) -> Nil {
   process.call(store.subject, 1000, fn(reply_to) {
-    RegisterListener(session_id, listener_id, listener, reply_to)
+    RegisterListener(
+      session_id,
+      listener_id,
+      listener,
+      kind,
+      attached_at,
+      reply_to,
+    )
   })
+}
+
+pub fn now_nanoseconds() -> Int {
+  let #(seconds, nanoseconds) =
+    timestamp.system_time() |> timestamp.to_unix_seconds_and_nanoseconds
+  seconds * 1_000_000_000 + nanoseconds
+}
+
+/// Write to one of this replica's own listeners.
+pub fn send_to_listener(
+  store: Store,
+  session_id: String,
+  listener_id: String,
+  message: ListenerMessage,
+) -> Nil {
+  process.send(store.subject, SendToListener(session_id, listener_id, message))
+}
+
+/// Deliver an encoded notification if the session's newest listener belongs
+/// to this replica.
+pub fn deliver_if_owner(
+  store: Store,
+  session_id: String,
+  payload: String,
+  record: Option(fn(String, String) -> String),
+) -> Nil {
+  process.send(store.subject, DeliverIfOwner(session_id, payload, record))
+}
+
+/// Close a listener and stop delivering to it.
+pub fn drop_listener(
+  store: Store,
+  session_id: String,
+  listener_id: String,
+) -> Nil {
+  process.send(store.subject, DropListener(session_id, listener_id))
+}
+
+/// This replica's session streams for a session, with their attach times.
+pub fn session_streams(
+  store: Store,
+  session_id: String,
+) -> List(#(String, Int)) {
+  process.call(store.subject, 1000, SessionStreams(session_id, _))
+}
+
+pub fn has_listener(store: Store, session_id: String) -> Bool {
+  process.call(store.subject, 1000, HasListener(session_id, _))
+}
+
+/// The sessions this replica holds state for.
+pub fn session_ids(store: Store) -> List(String) {
+  process.call(store.subject, 1000, SessionIds)
 }
 
 pub fn unregister_listener(
@@ -338,9 +452,10 @@ fn handle_message(
       })
       continue(subject, sessions)
     }
-    RegisterListener(session_id, listener_id, listener, reply_to) -> {
+    RegisterListener(session_id, listener_id, listener, kind, at, reply_to) -> {
       let next_sessions = case dict.has_key(sessions, session_id) {
-        True -> attach_listener(sessions, session_id, listener_id, listener)
+        True ->
+          attach_listener(sessions, session_id, listener_id, listener, kind, at)
         False -> {
           process.send(listener, CloseListener)
           sessions
@@ -348,6 +463,71 @@ fn handle_message(
       }
       process.send(reply_to, Nil)
       continue(subject, next_sessions)
+    }
+    SendToListener(session_id, listener_id, message) -> {
+      case dict.get(sessions, session_id) {
+        Ok(session) ->
+          case
+            list.find(live_listeners(session.listener), fn(listener) {
+              listener.id == listener_id && listener.kind != RemoteStream
+            })
+          {
+            Ok(listener) -> process.send(listener.subject, message)
+            Error(Nil) -> Nil
+          }
+        Error(Nil) -> Nil
+      }
+      continue(subject, sessions)
+    }
+    DeliverIfOwner(session_id, payload, record) -> {
+      case dict.get(sessions, session_id) {
+        Ok(session) ->
+          case live_listeners(session.listener) {
+            [listener, ..] if listener.kind != RemoteStream ->
+              process.send(listener.subject, case record {
+                Some(record) ->
+                  DeliverReplay(record(listener.id, payload), payload, False)
+                None -> DeliverPayload(payload)
+              })
+            _ -> Nil
+          }
+        Error(Nil) -> Nil
+      }
+      continue(subject, sessions)
+    }
+    DropListener(session_id, listener_id) -> {
+      case dict.get(sessions, session_id) {
+        Ok(session) ->
+          session.listener
+          |> list.filter(fn(listener) { listener.id == listener_id })
+          |> list.each(fn(listener) {
+            process.send(listener.subject, CloseListener)
+          })
+        Error(Nil) -> Nil
+      }
+      continue(subject, detach_listener(sessions, session_id, listener_id))
+    }
+    SessionStreams(session_id, reply_to) -> {
+      process.send(reply_to, case dict.get(sessions, session_id) {
+        Ok(session) ->
+          session.listener
+          |> live_listeners
+          |> list.filter(fn(listener) { listener.kind == SessionStream })
+          |> list.map(fn(listener) { #(listener.id, listener.attached_at) })
+        Error(Nil) -> []
+      })
+      continue(subject, sessions)
+    }
+    HasListener(session_id, reply_to) -> {
+      process.send(reply_to, case dict.get(sessions, session_id) {
+        Ok(session) -> live_listeners(session.listener) != []
+        Error(Nil) -> False
+      })
+      continue(subject, sessions)
+    }
+    SessionIds(reply_to) -> {
+      process.send(reply_to, dict.keys(sessions))
+      continue(subject, sessions)
     }
     UnregisterListener(session_id, listener_id, owner, reply_to) -> {
       let next_sessions =
@@ -578,6 +758,8 @@ fn attach_listener(
   session_id: String,
   listener_id: String,
   listener: process.Subject(ListenerMessage),
+  kind: ListenerKind,
+  attached_at: Int,
 ) -> Dict(String, Session) {
   case process.subject_owner(listener) {
     Error(_) -> sessions
@@ -597,6 +779,8 @@ fn attach_listener(
             get_session(sessions, session_id)
           let listeners = live_listeners(current_listener)
           let monitor = process.monitor(owner)
+          let attached =
+            Listener(listener_id, listener, owner, monitor, kind, attached_at)
 
           queued_requests
           |> list.each(fn(request) {
@@ -606,20 +790,17 @@ fn attach_listener(
               Ok(pending) -> pending.record
               Error(_) -> None
             }
-            deliver_request(
-              Listener(listener_id, listener, owner, monitor),
-              request,
-              record,
-            )
+            deliver_request(attached, request, record)
           })
 
+          // Newest first, so that delivery picks the most recent stream.
+          let listeners =
+            [attached, ..listeners]
+            |> list.sort(fn(a, b) { int.compare(b.attached_at, a.attached_at) })
           dict.insert(
             sessions,
             session_id,
-            Session([], pending_requests, [
-              Listener(listener_id, listener, owner, monitor),
-              ..listeners
-            ]),
+            Session([], pending_requests, listeners),
           )
         }
       }

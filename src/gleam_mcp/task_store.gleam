@@ -21,7 +21,36 @@ import gleam_mcp/persistence/memory
 import youid/uuid
 
 pub opaque type Store {
-  Store(subject: process.Subject(Message), records: persistence.TaskStore)
+  Store(subject: process.Subject(Message), records: Records)
+}
+
+/// How this replica takes part in a group of replicas sharing task records.
+pub type Peers {
+  Peers(
+    /// Identifies this replica as the owner of the workers it runs.
+    id: String,
+    /// Whether the replica with the given id is still running.
+    alive: fn(String) -> Bool,
+    /// Tell the other replicas that a task reached a final state or vanished.
+    changed: fn(String) -> Nil,
+    /// Hand MRTR inputs to the replica that can resume the task.
+    submit_inputs: fn(String, Option(String), Dict(String, jsonrpc.Value)) ->
+      Nil,
+  )
+}
+
+/// A replica that shares its records with no one.
+pub fn alone(id: String) -> Peers {
+  Peers(
+    id: id,
+    alive: fn(owner) { owner == id },
+    changed: fn(_) { Nil },
+    submit_inputs: fn(_, _, _) { Nil },
+  )
+}
+
+type Records {
+  Records(store: persistence.TaskStore, peers: Peers)
 }
 
 type Waiter =
@@ -33,7 +62,7 @@ type Resume =
 /// What this replica holds for a task, alongside its persisted record.
 type Entry {
   Entry(
-    records: persistence.TaskStore,
+    records: Records,
     waiters: List(Waiter),
     worker: Option(TrackedWorker),
     retention: Option(process.Timer),
@@ -73,9 +102,6 @@ type Access {
   Unscoped
   Scoped(Option(String))
 }
-
-type Records =
-  persistence.TaskStore
 
 pub opaque type Message {
   Create(
@@ -133,6 +159,7 @@ pub opaque type Message {
     task_id: String,
     access: Access,
     inputs: Dict(String, jsonrpc.Value),
+    forwarded: Bool,
     reply: process.Subject(Result(Nil, jsonrpc.RpcError)),
   )
   WorkerDown(process.Down)
@@ -184,7 +211,11 @@ pub fn new() -> Store {
   let assert Ok(actor.Started(data: records, ..)) =
     memory.start_tasks(process.new_name("gleam_mcp_task_records"))
   let assert Ok(actor.Started(data: store, ..)) =
-    start(process.new_name("gleam_mcp_task_store"), records)
+    start(
+      process.new_name("gleam_mcp_task_store"),
+      records,
+      alone(uuid.v4_string()),
+    )
   store
 }
 
@@ -193,6 +224,7 @@ pub fn new() -> Store {
 pub fn start(
   name: process.Name(Message),
   records: persistence.TaskStore,
+  peers: Peers,
 ) -> actor.StartResult(Store) {
   actor.new_with_initialiser(1000, fn(subject) {
     let selector =
@@ -201,7 +233,7 @@ pub fn start(
       |> process.select_monitors(WorkerDown)
     actor.initialised(State(subject, dict.new()))
     |> actor.selecting(selector)
-    |> actor.returning(Store(subject, records))
+    |> actor.returning(Store(subject, Records(records, peers)))
     |> Ok
   })
   |> actor.named(name)
@@ -212,25 +244,45 @@ pub fn start(
 pub fn supervised(
   name: process.Name(Message),
   records: persistence.TaskStore,
+  peers: Peers,
 ) -> supervision.ChildSpecification(Store) {
-  supervision.worker(fn() { start(name, records) })
+  supervision.worker(fn() { start(name, records, peers) })
 }
 
 /// A handle to the task store registered under `name`.
 pub fn named(
   name: process.Name(Message),
   records: persistence.TaskStore,
+  peers: Peers,
 ) -> Store {
-  Store(process.named_subject(name), records)
+  Store(process.named_subject(name), Records(records, peers))
 }
 
-/// Persist tasks created through the returned handle in `records`.
+/// Persist tasks used through the returned handle in `records`.
 pub fn with_records(store: Store, records: persistence.TaskStore) -> Store {
-  Store(..store, records: records)
+  Store(..store, records: Records(..store.records, store: records))
+}
+
+/// Share tasks used through the returned handle with other replicas.
+pub fn with_peers(store: Store, peers: Peers) -> Store {
+  Store(..store, records: Records(..store.records, peers: peers))
 }
 
 pub fn records(store: Store) -> persistence.TaskStore {
-  store.records
+  store.records.store
+}
+
+/// Apply MRTR inputs that another replica received for a task this replica
+/// runs. Inputs are never forwarded again.
+pub fn submit_forwarded_inputs(
+  store: Store,
+  task_id: String,
+  scope: Option(String),
+  inputs: Dict(String, jsonrpc.Value),
+) -> Result(Nil, jsonrpc.RpcError) {
+  call(store, fn(reply) {
+    SubmitInputs(store.records, task_id, Scoped(scope), inputs, True, reply)
+  })
 }
 
 /// Wake this replica's waiters and stop its worker after another replica
@@ -338,7 +390,7 @@ pub fn submit_inputs_scoped(
   inputs: Dict(String, jsonrpc.Value),
 ) -> Result(Nil, jsonrpc.RpcError) {
   call(store, fn(reply) {
-    SubmitInputs(store.records, task_id, Scoped(scope), inputs, reply)
+    SubmitInputs(store.records, task_id, Scoped(scope), inputs, False, reply)
   })
 }
 
@@ -486,9 +538,10 @@ fn handle_message(
             |> option.map(fn(ttl) {
               timestamp.add(timestamp.system_time(), duration.milliseconds(ttl))
             }),
+          owner: None,
           version: 0,
         )
-      case records.insert(record) {
+      case records.store.insert(record) {
         Error(error) -> {
           process.send(reply, Error(store_error(error)))
           entries
@@ -572,9 +625,17 @@ fn handle_message(
       )
       entries
     }
-    SubmitInputs(records, task_id, access, inputs, reply) -> {
+    SubmitInputs(records, task_id, access, inputs, forwarded, reply) -> {
       let #(entries, response) =
-        submit_inputs(entries, records, task_id, access, inputs, subject)
+        submit_inputs(
+          entries,
+          records,
+          task_id,
+          access,
+          inputs,
+          forwarded,
+          subject,
+        )
       process.send(reply, response)
       entries
     }
@@ -650,20 +711,23 @@ fn handle_message(
       }
     WorkerDown(process.PortDown(..)) -> entries
     CloseScope(records, scope, reply) -> {
-      let entries = case records.delete_scope(scope) {
-        Ok(ids) ->
+      let entries = case records.store.delete_scope(scope) {
+        Ok(ids) -> {
+          list.each(ids, records.peers.changed)
           release_entries(
             entries,
             ids,
             jsonrpc.invalid_params_error("Task scope was closed"),
           )
+        }
         Error(_) -> entries
       }
       process.send(reply, Nil)
       entries
     }
     Expire(records, task_id) -> {
-      let _ = records.delete(task_id)
+      let _ = records.store.delete(task_id)
+      records.peers.changed(task_id)
       release_entries(entries, [task_id], task_expired_error(task_id))
     }
     Forget(task_ids, reason) -> release_entries(entries, task_ids, reason)
@@ -684,7 +748,7 @@ fn handle_message(
       }
       process.send(
         reply,
-        records.list(scope)
+        records.store.list(scope)
           |> result.map_error(store_error)
           |> result.map(fn(found) {
             found
@@ -875,7 +939,10 @@ fn start_worker_entry(
     update(records, task_id, fn(record) {
       case is_terminal(record.task.status), entry.worker {
         False, None ->
-          prepare(record) |> result.map(fn(record) { #(record, Nil) })
+          prepare(record)
+          |> result.map(fn(record) {
+            #(TaskRecord(..record, owner: Some(records.peers.id)), Nil)
+          })
         _, _ ->
           Error(jsonrpc.invalid_params_error("Task cannot start another worker"))
       }
@@ -949,6 +1016,7 @@ fn submit_inputs(
   task_id: String,
   access: Access,
   inputs: Dict(String, jsonrpc.Value),
+  forwarded: Bool,
   subject: process.Subject(Message),
 ) -> #(Dict(String, Entry), Result(Nil, jsonrpc.RpcError)) {
   case load(records, task_id, access), dict.get(entries, task_id) {
@@ -995,6 +1063,17 @@ fn submit_inputs(
           }
       }
     }
+    // Another replica holds the resume function for this task.
+    Ok(TaskRecord(task: actions.Task(status: actions.InputRequired, ..), ..)), _
+      if !forwarded
+    -> {
+      let scope = case access {
+        Scoped(scope) -> scope
+        Unscoped -> None
+      }
+      records.peers.submit_inputs(task_id, scope, inputs)
+      #(entries, Ok(Nil))
+    }
     Ok(_), _ -> #(entries, Ok(Nil))
   }
 }
@@ -1030,6 +1109,10 @@ fn cancel_task(
           }
         }
       })
+  }
+  case cancelled {
+    Ok(_) -> records.peers.changed(task_id)
+    Error(_) -> Nil
   }
   case cancelled, dict.get(entries, task_id) {
     Ok(_), Ok(entry) -> {
@@ -1073,6 +1156,10 @@ fn complete_task(
         #(task, result_for_task(task, task_id, final_outcome)),
       ))
     })
+  case completed {
+    Ok(_) -> records.peers.changed(task_id)
+    Error(_) -> Nil
+  }
   case completed, dict.get(entries, task_id) {
     Ok(#(task, result)), Ok(entry) -> {
       stop_worker(entry.worker)
@@ -1111,14 +1198,53 @@ fn load(
   task_id: String,
   access: Access,
 ) -> Result(TaskRecord, jsonrpc.RpcError) {
-  case records.get(task_id) {
+  case records.store.get(task_id) {
     Error(error) -> Error(store_error(error))
     Ok(Some(record)) ->
       case expired(record), can_access(record, access) {
-        False, True -> Ok(record)
+        False, True -> Ok(fail_orphan(records, record))
         _, _ -> Error(task_not_found_error(task_id))
       }
     Ok(None) -> Error(task_not_found_error(task_id))
+  }
+}
+
+/// A task whose owning replica has stopped will never finish, so fail it.
+fn fail_orphan(records: Records, record: TaskRecord) -> TaskRecord {
+  case record.owner, is_terminal(record.task.status) {
+    Some(owner), False ->
+      case records.peers.alive(owner) {
+        True -> record
+        False -> {
+          let outcome =
+            Error(jsonrpc.RpcError(
+              -32_603,
+              "The replica running this task stopped before it finished",
+              None,
+            ))
+          let failed =
+            TaskRecord(
+              ..record,
+              task: terminal_task(record.task, outcome),
+              outcome: Some(outcome),
+              inputs: dict.new(),
+              version: record.version + 1,
+            )
+          case records.store.replace(failed) {
+            Ok(True) -> {
+              records.peers.changed(record.task.task_id)
+              failed
+            }
+            // Another reader failed it first, or the store is unavailable.
+            _ ->
+              case records.store.get(record.task.task_id) {
+                Ok(Some(current)) -> current
+                _ -> record
+              }
+          }
+        }
+      }
+    _, _ -> record
   }
 }
 
@@ -1143,7 +1269,9 @@ fn update_attempt(
   case next == record {
     True -> Ok(value)
     False ->
-      case records.replace(TaskRecord(..next, version: record.version + 1)) {
+      case
+        records.store.replace(TaskRecord(..next, version: record.version + 1))
+      {
         Ok(True) -> Ok(value)
         Ok(False) if attempts > 1 ->
           update_attempt(records, task_id, apply, attempts - 1)

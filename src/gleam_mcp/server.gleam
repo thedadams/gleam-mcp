@@ -15,11 +15,13 @@ import gleam/string
 import gleam/time/duration.{type Duration}
 import gleam/time/timestamp
 import gleam_mcp/actions
+import gleam_mcp/client/codec as client_codec
 import gleam_mcp/jsonrpc
 import gleam_mcp/mcp
 import gleam_mcp/persistence
 import gleam_mcp/persistence/memory
 import gleam_mcp/server/capabilities
+import gleam_mcp/server/cluster
 import gleam_mcp/server/codec
 import gleam_mcp/server/janitor
 import gleam_mcp/server/oauth
@@ -164,6 +166,8 @@ pub opaque type Server {
     task_result_request_handler: Option(TaskResultRequestHandler),
     options: Options,
     services: process.Name(janitor.Message),
+    cluster: cluster.Cluster,
+    relay: process.Name(cluster.RelayMessage),
   )
 }
 
@@ -196,6 +200,8 @@ type RegisteredPrompt {
 pub fn new(implementation: actions.Implementation) -> Server {
   let tasks = process.new_name("gleam_mcp_task_store")
   let task_records = process.new_name("gleam_mcp_task_records")
+  // Identifies this server's processes to replicas sharing its stores.
+  let replicas = cluster.private(uuid.v4_string())
   let http = process.new_name("gleam_mcp_streamable_http")
   let requests = process.new_name("gleam_mcp_runtime")
   let subscriptions = process.new_name("gleam_mcp_subscriptions")
@@ -206,6 +212,7 @@ pub fn new(implementation: actions.Implementation) -> Server {
     |> static_supervisor.add(task_store.supervised(
       tasks,
       memory.tasks(task_records),
+      task_peers(replicas),
     ))
     |> static_supervisor.add(streamable_http_store.supervised(http))
     |> static_supervisor.add(runtime.supervised(requests))
@@ -216,7 +223,7 @@ pub fn new(implementation: actions.Implementation) -> Server {
     implementation,
     None,
     None,
-    task_store.named(tasks, memory.tasks(task_records)),
+    task_store.named(tasks, memory.tasks(task_records), task_peers(replicas)),
     streamable_http_store.named(http),
     runtime.named(requests),
     runtime.named_subscriptions(subscriptions),
@@ -248,11 +255,14 @@ pub fn new(implementation: actions.Implementation) -> Server {
       tool_task_lifecycles: dict.new(),
     ),
     process.new_name("gleam_mcp_janitor"),
+    replicas,
+    process.new_name("gleam_mcp_relay"),
   )
 }
 
-/// Start the background work a configured server needs: sweeping expired
-/// sessions and tasks from their stores. Call it once the server is fully
+/// Start the background work a configured server needs: relaying events
+/// between replicas, and sweeping expired sessions and tasks from their
+/// stores. Call it once the server is fully
 /// configured. The streamable HTTP and stdio transports call it for you, and
 /// calling it again for the same server does nothing.
 pub fn start_services(server: Server) -> Result(Nil, actor.StartError) {
@@ -274,11 +284,191 @@ pub fn start_services(server: Server) -> Result(Nil, actor.StartError) {
           },
         )
       static_supervisor.new(static_supervisor.OneForOne)
+      |> static_supervisor.add(cluster.supervised_relay(
+        server.relay,
+        server.cluster,
+        relay_handlers(server),
+      ))
       |> static_supervisor.add(janitor.supervised(server.services, config))
       |> static_supervisor.start
       |> result.replace(Nil)
     }
   }
+}
+
+/// Share sessions, subscriptions and tasks with the other replicas of this
+/// server: the nodes connected to this one through Erlang distribution that
+/// use the same cluster `name`. Pair it with session and task stores that
+/// every replica shares.
+pub fn with_cluster(server: Server, name: String) -> Server {
+  let replicas = cluster.shared(name, cluster.replica(server.cluster))
+  Server(
+    ..server,
+    cluster: replicas,
+    task_store: task_store.with_peers(server.task_store, task_peers(replicas)),
+  )
+}
+
+fn task_peers(replicas: cluster.Cluster) -> task_store.Peers {
+  task_store.Peers(
+    id: cluster.replica(replicas),
+    alive: cluster.alive(replicas, _),
+    changed: fn(task) {
+      cluster.publish(replicas, cluster.Broadcast, cluster.TaskChanged(task))
+    },
+    submit_inputs: fn(task, scope, inputs) {
+      cluster.publish(
+        replicas,
+        cluster.Broadcast,
+        cluster.TaskInputs(task, scope, inputs),
+      )
+    },
+  )
+}
+
+fn relay_handlers(server: Server) -> cluster.Handlers {
+  let http = server.http_store
+  cluster.Handlers(
+    listener_attached: fn(session, listener, attached_at, origin) {
+      start_remote_stream(server, session, listener, attached_at, origin)
+    },
+    listener_detached: fn(session, listener) {
+      streamable_http_store.drop_listener(http, session, listener)
+    },
+    listeners_requested: fn(session) {
+      streamable_http_store.session_streams(http, session)
+      |> list.each(fn(stream) {
+        cluster.publish(
+          server.cluster,
+          cluster.Session(session),
+          cluster.ListenerAttached(stream.0, stream.1),
+        )
+      })
+    },
+    write: fn(session, listener, event_id, payload, close) {
+      streamable_http_store.send_to_listener(
+        http,
+        session,
+        listener,
+        case event_id, close {
+          Some(id), _ -> streamable_http_store.DeliverReplay(id, payload, close)
+          None, True -> streamable_http_store.DeliverResponse(payload)
+          None, False -> streamable_http_store.DeliverPayload(payload)
+        },
+      )
+    },
+    notify: fn(session, payload) {
+      streamable_http_store.deliver_if_owner(
+        http,
+        session,
+        payload,
+        legacy_event_recorder(server, session),
+      )
+    },
+    client_response: fn(session, body) {
+      let _ = streamable_http_store.resolve_response(http, session, body)
+      Nil
+    },
+    cancel_request: fn(session, id) {
+      runtime.cancel(server.runtime, Some(session), id)
+    },
+    close_session: fn(session) { close_local_session(server, session) },
+    notification: fn(payload) {
+      case client_codec.decode_server_message(payload) {
+        Ok(client_codec.ActionNotification(notification)) ->
+          runtime.publish(server.subscriptions, notification)
+        _ -> Nil
+      }
+    },
+    task_changed: fn(task) { task_store.changed(server.task_store, task) },
+    task_inputs: fn(task, scope, inputs) {
+      let _ =
+        task_store.submit_forwarded_inputs(
+          server.task_store,
+          task,
+          scope,
+          inputs,
+        )
+      Nil
+    },
+    sessions: fn() { streamable_http_store.session_ids(http) },
+  )
+}
+
+/// Stand in locally for a session stream another replica holds, so that this
+/// replica queues and delivers to it exactly as to its own streams.
+fn start_remote_stream(
+  server: Server,
+  session: String,
+  listener: String,
+  attached_at: Int,
+  origin: String,
+) -> Nil {
+  let http = server.http_store
+  let ready = process.new_subject()
+  let _ =
+    process.spawn_unlinked(fn() {
+      let stream = process.new_subject()
+      let _ = streamable_http_store.ensure_session(http, Some(session))
+      streamable_http_store.register_listener_as(
+        http,
+        session,
+        listener,
+        stream,
+        streamable_http_store.RemoteStream,
+        attached_at,
+      )
+      process.send(ready, Nil)
+      forward_remote_stream(server, session, listener, origin, stream)
+    })
+  let _ = process.receive(ready, 1000)
+  Nil
+}
+
+fn forward_remote_stream(
+  server: Server,
+  session: String,
+  listener: String,
+  origin: String,
+  stream: process.Subject(streamable_http_store.ListenerMessage),
+) -> Nil {
+  let write = fn(event_id, payload, close) {
+    cluster.publish(
+      server.cluster,
+      cluster.Session(session),
+      cluster.Write(listener, event_id, payload, close),
+    )
+  }
+  let message = process.receive_forever(stream)
+  case message, cluster.alive(server.cluster, origin) {
+    streamable_http_store.CloseListener, _ -> Nil
+    // The replica holding the stream has stopped, so stop standing in for it.
+    _, False ->
+      streamable_http_store.drop_listener(server.http_store, session, listener)
+    _, True -> {
+      case message {
+        streamable_http_store.DeliverRequest(request) ->
+          write(None, client_codec.encode_server_request(request), False)
+        streamable_http_store.DeliverNotification(notification) ->
+          write(None, client_codec.encode_notification(notification), False)
+        streamable_http_store.DeliverResponse(payload) ->
+          write(None, payload, True)
+        streamable_http_store.DeliverReplay(id, payload, close) ->
+          write(Some(id), payload, close)
+        streamable_http_store.DeliverPayload(payload) ->
+          write(None, payload, False)
+        streamable_http_store.CloseListener -> Nil
+      }
+      forward_remote_stream(server, session, listener, origin, stream)
+    }
+  }
+}
+
+/// Make this replica receive events for a session it is serving.
+pub fn attach_session(server: Server, session_id: String) -> Nil {
+  let _ =
+    streamable_http_store.ensure_session(server.http_store, Some(session_id))
+  cluster.join(server.relay, session_id)
 }
 
 pub fn implementation(server: Server) -> actions.Implementation {
@@ -1567,6 +1757,11 @@ pub fn publish_notification(
   notification: jsonrpc.Request(actions.ActionNotification),
 ) -> Nil {
   runtime.publish(server.subscriptions, notification)
+  cluster.publish(
+    server.cluster,
+    cluster.Broadcast,
+    cluster.Notification(client_codec.encode_notification(notification)),
+  )
 }
 
 fn subscription_accepts(
@@ -2169,9 +2364,18 @@ pub fn handle_notification_with_context(
           }
         }
         actions.NotifyCancelled(params) -> {
-          case params.request_id {
-            Some(id) -> cancel_incoming_request(server, context, id)
-            None -> Nil
+          case params.request_id, context.session_id {
+            Some(id), Some(session) -> {
+              cancel_incoming_request(server, context, id)
+              // The request may be running on another replica.
+              cluster.publish(
+                server.cluster,
+                cluster.Session(session),
+                cluster.CancelRequest(id),
+              )
+            }
+            Some(id), None -> cancel_incoming_request(server, context, id)
+            None, _ -> Nil
           }
           Ok(Nil)
         }
@@ -2316,6 +2520,17 @@ pub fn close_session(server: Server, session_id: String) -> Nil {
       task_store.close_scope(server.task_store, Some("session:" <> session_id))
   }
   let _ = store.delete(session_id)
+  cluster.publish(
+    server.cluster,
+    cluster.Session(session_id),
+    cluster.CloseSession,
+  )
+  close_local_session(server, session_id)
+}
+
+/// Release what this replica holds for a session another replica closed.
+fn close_local_session(server: Server, session_id: String) -> Nil {
+  cluster.leave(server.relay, session_id)
   runtime.close(server.runtime, session_id)
   runtime.close_subscription_scope(server.subscriptions, session_id)
   streamable_http_store.delete_session(server.http_store, session_id)
@@ -2409,15 +2624,60 @@ pub fn register_streamable_http_listener(
   listener_id: String,
   listener: process.Subject(streamable_http_store.ListenerMessage),
 ) -> Nil {
-  let Server(http_store: http_store, ..) = server
-  // The session may have been created by another replica.
-  ensure_local_session(server, session_id)
-  streamable_http_store.register_listener(
-    http_store,
+  register_listener_as(
+    server,
     session_id,
     listener_id,
     listener,
+    streamable_http_store.SessionStream,
   )
+}
+
+/// Register the response stream of one request. Only this replica writes to
+/// it.
+pub fn register_streamable_http_request_stream(
+  server: Server,
+  session_id: String,
+  listener_id: String,
+  listener: process.Subject(streamable_http_store.ListenerMessage),
+) -> Nil {
+  register_listener_as(
+    server,
+    session_id,
+    listener_id,
+    listener,
+    streamable_http_store.RequestStream,
+  )
+}
+
+fn register_listener_as(
+  server: Server,
+  session_id: String,
+  listener_id: String,
+  listener: process.Subject(streamable_http_store.ListenerMessage),
+  kind: streamable_http_store.ListenerKind,
+) -> Nil {
+  // The session may have been created by another replica.
+  ensure_local_session(server, session_id)
+  cluster.join(server.relay, session_id)
+  let attached_at = streamable_http_store.now_nanoseconds()
+  streamable_http_store.register_listener_as(
+    server.http_store,
+    session_id,
+    listener_id,
+    listener,
+    kind,
+    attached_at,
+  )
+  case kind {
+    streamable_http_store.SessionStream ->
+      cluster.publish(
+        server.cluster,
+        cluster.Session(session_id),
+        cluster.ListenerAttached(listener_id, attached_at),
+      )
+    _ -> Nil
+  }
 }
 
 pub fn unregister_streamable_http_listener(
@@ -2427,6 +2687,11 @@ pub fn unregister_streamable_http_listener(
 ) -> Nil {
   let Server(http_store: http_store, ..) = server
   streamable_http_store.unregister_listener(http_store, session_id, listener_id)
+  cluster.publish(
+    server.cluster,
+    cluster.Session(session_id),
+    cluster.ListenerDetached(listener_id),
+  )
 }
 
 /// A superseded SSE connection must not unregister its replacement.
@@ -2441,6 +2706,11 @@ pub fn unregister_current_streamable_http_listener(
     listener_id,
     process.self(),
   )
+  cluster.publish(
+    server.cluster,
+    cluster.Session(session_id),
+    cluster.ListenerDetached(listener_id),
+  )
 }
 
 pub fn handle_server_sent_response(
@@ -2451,7 +2721,22 @@ pub fn handle_server_sent_response(
   case session_id(context) {
     Some(value) -> {
       let Server(http_store: http_store, ..) = server
-      streamable_http_store.resolve_response(http_store, value, body)
+      case
+        streamable_http_store.resolve_response(http_store, value, body),
+        cluster.is_shared(server.cluster)
+      {
+        Ok(Nil), _ -> Ok(Nil)
+        // Another replica may be waiting for this response.
+        Error(_), True -> {
+          cluster.publish(
+            server.cluster,
+            cluster.Session(value),
+            cluster.ClientResponse(body),
+          )
+          Ok(Nil)
+        }
+        Error(error), False -> Error(error)
+      }
     }
     None ->
       Error(jsonrpc.invalid_params_error(
@@ -2516,12 +2801,23 @@ fn send_legacy_notification(
   case session_id(context) {
     Some(value) -> {
       let Server(http_store: http_store, ..) = server
-      streamable_http_store.send_notification_with_recorder(
-        http_store,
-        value,
-        notification,
-        legacy_event_recorder(server, value),
-      )
+      case streamable_http_store.has_listener(http_store, value) {
+        True ->
+          streamable_http_store.send_notification_with_recorder(
+            http_store,
+            value,
+            notification,
+            legacy_event_recorder(server, value),
+          )
+        // This replica may not know the session's streams; the replica with
+        // the newest one delivers.
+        False ->
+          cluster.publish(
+            server.cluster,
+            cluster.Session(value),
+            cluster.Notify(client_codec.encode_notification(notification)),
+          )
+      }
       Ok(Nil)
     }
     None ->

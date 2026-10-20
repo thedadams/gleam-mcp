@@ -320,7 +320,8 @@ fn handle_outgoing(
       state.write(client_codec.encode_notification(notification))
       state
     }
-    streamable_http_store.DeliverResponse(payload) -> {
+    streamable_http_store.DeliverResponse(payload)
+    | streamable_http_store.DeliverPayload(payload) -> {
       state.write(payload)
       state
     }

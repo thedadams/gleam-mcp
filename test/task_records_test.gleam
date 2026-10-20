@@ -1,4 +1,6 @@
+import gleam/dict
 import gleam/erlang/process
+import gleam/int
 import gleam/option.{None, Some}
 import gleam/otp/actor
 import gleam/time/duration
@@ -19,8 +21,23 @@ fn records() -> persistence.TaskStore {
 
 /// A task store for one replica, sharing `records` with the others.
 fn replica(records: persistence.TaskStore) -> task_store.Store {
+  replica_with(records, fn(_) { True })
+}
+
+fn replica_with(
+  records: persistence.TaskStore,
+  alive: fn(String) -> Bool,
+) -> task_store.Store {
+  let id = "replica-" <> int.to_string(int.random(1_000_000_000))
+  let peers =
+    task_store.Peers(
+      id: id,
+      alive: alive,
+      changed: fn(_) { Nil },
+      submit_inputs: fn(_, _, _) { Nil },
+    )
   let assert Ok(actor.Started(data: store, ..)) =
-    task_store.start(process.new_name("task_replica_test"), records)
+    task_store.start(process.new_name("task_replica_test"), records, peers)
   store
 }
 
@@ -166,4 +183,79 @@ pub fn janitor_closes_expired_sessions_test() {
       ),
     )
   process.receive(closed, 1000) |> should.equal(Ok("gone"))
+}
+
+pub fn tasks_of_a_stopped_replica_fail_when_read_test() {
+  let shared = records()
+  let owner = replica(shared)
+  let survivor = replica_with(shared, fn(_) { False })
+  let task = task_store.create(owner, None)
+  task_store.start_worker(owner, task.task_id, fn() {
+    process.sleep_forever()
+    Ok(sample_result())
+  })
+  |> should.be_ok
+
+  let failed = task_store.get(survivor, task.task_id) |> should.be_ok
+  should.equal(failed.status, actions.Failed)
+  task_store.result(survivor, task.task_id) |> should.be_error
+}
+
+pub fn inputs_for_a_task_resumed_elsewhere_are_forwarded_test() {
+  let shared = records()
+  let forwarded = process.new_subject()
+  let owner = replica(shared)
+  let assert Ok(actor.Started(data: other, ..)) =
+    task_store.start(
+      process.new_name("task_replica_test"),
+      shared,
+      task_store.Peers(
+        id: "other",
+        alive: fn(_) { True },
+        changed: fn(_) { Nil },
+        submit_inputs: fn(id, scope, inputs) {
+          process.send(forwarded, #(id, scope, inputs))
+        },
+      ),
+    )
+  let task = task_store.create(owner, None)
+  let request = jsonrpc.VObject([#("method", jsonrpc.VString("elicit"))])
+  task_store.start_modern_worker(owner, task.task_id, fn() {
+    Ok(
+      task_store.ModernInputRequired(
+        dict.from_list([#("name", request)]),
+        fn(_) { Ok(task_store.ModernComplete(jsonrpc.VNull)) },
+      ),
+    )
+  })
+  |> should.be_ok
+  await_status(other, task.task_id, actions.InputRequired, 50)
+
+  let inputs = dict.from_list([#("name", jsonrpc.VString("Ada"))])
+  task_store.submit_inputs_scoped(other, task.task_id, None, inputs)
+  |> should.be_ok
+  process.receive(forwarded, 1000)
+  |> should.equal(Ok(#(task.task_id, None, inputs)))
+
+  task_store.submit_forwarded_inputs(owner, task.task_id, None, inputs)
+  |> should.be_ok
+  // Announcements are disabled here, so wait where the task runs.
+  task_store.result(owner, task.task_id) |> should.be_ok
+}
+
+fn await_status(
+  store: task_store.Store,
+  id: String,
+  status: actions.TaskStatus,
+  attempts: Int,
+) -> Nil {
+  let assert Ok(task) = task_store.get(store, id)
+  case task.status == status, attempts {
+    True, _ -> Nil
+    False, 0 -> panic as "Task never reached the expected status"
+    False, _ -> {
+      process.sleep(10)
+      await_status(store, id, status, attempts - 1)
+    }
+  }
 }

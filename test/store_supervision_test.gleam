@@ -15,9 +15,13 @@ pub fn supervised_task_store_survives_a_crash_test() {
   let assert Ok(_) =
     static_supervisor.new(static_supervisor.OneForOne)
     |> static_supervisor.add(memory.supervised_tasks(records_name))
-    |> static_supervisor.add(task_store.supervised(name, records))
+    |> static_supervisor.add(task_store.supervised(
+      name,
+      records,
+      task_store.alone("replica"),
+    ))
     |> static_supervisor.start
-  let store = task_store.named(name, records)
+  let store = task_store.named(name, records, task_store.alone("replica"))
   let _ = task_store.create(store, None)
 
   kill_and_await_restart(name)
