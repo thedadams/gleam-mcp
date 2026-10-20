@@ -161,7 +161,9 @@ in-memory stores by default. To survive restarts or serve one client from
 several replicas without sticky routing, every replica needs:
 
 - shared stores: `server.with_session_store` and `server.with_task_store`, for
-  example from `gleam_mcp_postgres`;
+  example from `gleam_mcp_postgres` (`adapters/postgres`). For a single
+  replica that must survive restarts, `gleam_mcp_sqlite` (`adapters/sqlite`)
+  is enough;
 - the same request state secret: `server.with_request_state_secret`;
 - the same cluster name: `server.with_cluster`, which fails without the secret;
 - connected nodes: start each node with Erlang distribution (`-name` and a

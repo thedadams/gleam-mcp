@@ -77,3 +77,43 @@ jobs:
           MCP_2026_STDIO_ARGS: /tmp/mcp-2026-sdk/server.mjs stdio
           MCP_2026_CLIENT_SCRIPT: /tmp/mcp-2026-sdk/client.mjs
         run: gleam test
+
+  adapters:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Gleam & OTP
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: "28"
+          gleam-version: "1.19.0"
+          rebar3-version: "3"
+
+      - name: Format adapters
+        run: gleam format --check adapters/postgres/src adapters/postgres/test adapters/sqlite/src adapters/sqlite/test
+
+      - name: Test PostgreSQL stores
+        working-directory: adapters/postgres
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+        run: gleam test
+
+      - name: Test SQLite stores
+        working-directory: adapters/sqlite
+        run: gleam test
