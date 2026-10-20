@@ -2,12 +2,22 @@ import gleam/dict
 import gleam/erlang/process
 import gleam/list
 import gleam/option.{type Option, None, Some}
+import gleam/otp/actor
+import gleam/otp/supervision
 import gleam_mcp/actions
 import gleam_mcp/jsonrpc
 import gleam_mcp/server/streamable_http_store
 
 pub opaque type Store(a) {
   Store(process.Subject(Message(a)))
+}
+
+type State(a) {
+  State(
+    subject: process.Subject(Message(a)),
+    pending: dict.Dict(#(Option(String), jsonrpc.RequestId), Pending(a)),
+    subscriptions: dict.Dict(String, List(String)),
+  )
 }
 
 type Pending(a) {
@@ -19,7 +29,7 @@ type Pending(a) {
   )
 }
 
-type Message(a) {
+pub opaque type Message(a) {
   Begin(
     Option(String),
     jsonrpc.RequestId,
@@ -51,16 +61,42 @@ type Message(a) {
   SubscribedUris(String, process.Subject(List(String)))
 }
 
+/// Start an unsupervised request store linked to the calling process.
 pub fn new() -> Store(a) {
-  let ready = process.new_subject()
-  let _ =
-    process.spawn(fn() {
-      let subject = process.new_subject()
-      process.send(ready, subject)
-      loop(subject, dict.new(), dict.new())
-    })
-  let assert Ok(subject) = process.receive(ready, 1000)
-  Store(subject)
+  let assert Ok(actor.Started(data: store, ..)) =
+    start_store(process.new_name("gleam_mcp_runtime"))
+  store
+}
+
+/// Start the request store registered under `name`, so that a supervisor can
+/// restart it without invalidating the handles returned by `named`.
+pub fn start_store(
+  name: process.Name(Message(a)),
+) -> actor.StartResult(Store(a)) {
+  actor.new_with_initialiser(1000, fn(subject) {
+    let selector =
+      process.new_selector()
+      |> process.select(subject)
+      |> process.select_monitors(WorkerDown)
+    actor.initialised(State(subject, dict.new(), dict.new()))
+    |> actor.selecting(selector)
+    |> actor.returning(Store(subject))
+    |> Ok
+  })
+  |> actor.named(name)
+  |> actor.on_message(handle_message)
+  |> actor.start
+}
+
+pub fn supervised(
+  name: process.Name(Message(a)),
+) -> supervision.ChildSpecification(Store(a)) {
+  supervision.worker(fn() { start_store(name) })
+}
+
+/// A handle to the request store registered under `name`.
+pub fn named(name: process.Name(Message(a))) -> Store(a) {
+  Store(process.named_subject(name))
 }
 
 /// Run each request in an isolated, cancellable Gleam worker.
@@ -98,10 +134,9 @@ pub fn start_with_reply(
   reply: process.Subject(Result(a, jsonrpc.RpcError)),
 ) -> Nil {
   let Store(subject) = store
-  let registered = process.new_subject()
-  process.send(subject, Begin(session, id, timeout_ms, work, reply, registered))
-  let assert Ok(Nil) = process.receive(registered, 1000)
-  Nil
+  process.call(subject, 1000, fn(registered) {
+    Begin(session, id, timeout_ms, work, reply, registered)
+  })
 }
 
 pub fn cancel(
@@ -119,10 +154,7 @@ pub fn active(
   id: jsonrpc.RequestId,
 ) -> Bool {
   let Store(subject) = store
-  let reply = process.new_subject()
-  process.send(subject, Active(scope, id, reply))
-  let assert Ok(active) = process.receive(reply, 1000)
-  active
+  process.call(subject, 1000, fn(reply) { Active(scope, id, reply) })
 }
 
 pub fn active_worker(
@@ -132,18 +164,14 @@ pub fn active_worker(
   worker: process.Pid,
 ) -> Bool {
   let Store(subject) = store
-  let reply = process.new_subject()
-  process.send(subject, ActiveWorker(scope, id, worker, reply))
-  let assert Ok(active) = process.receive(reply, 1000)
-  active
+  process.call(subject, 1000, fn(reply) {
+    ActiveWorker(scope, id, worker, reply)
+  })
 }
 
 pub fn close(store: Store(a), session: String) -> Nil {
   let Store(subject) = store
-  let reply = process.new_subject()
-  process.send(subject, Close(session, reply))
-  let assert Ok(Nil) = process.receive(reply, 1000)
-  Nil
+  process.call(subject, 1000, fn(reply) { Close(session, reply) })
 }
 
 pub fn subscribe(
@@ -153,38 +181,27 @@ pub fn subscribe(
   enabled: Bool,
 ) -> Nil {
   let Store(subject) = store
-  let reply = process.new_subject()
-  process.send(subject, Subscribe(session, uri, enabled, reply))
-  let assert Ok(Nil) = process.receive(reply, 1000)
-  Nil
+  process.call(subject, 1000, fn(reply) {
+    Subscribe(session, uri, enabled, reply)
+  })
 }
 
 pub fn subscribers(store: Store(a), uri: String) -> List(String) {
   let Store(subject) = store
-  let reply = process.new_subject()
-  process.send(subject, Subscribers(uri, reply))
-  let assert Ok(sessions) = process.receive(reply, 1000)
-  sessions
+  process.call(subject, 1000, fn(reply) { Subscribers(uri, reply) })
 }
 
 pub fn subscribed_uris(store: Store(a), session: String) -> List(String) {
   let Store(subject) = store
-  let reply = process.new_subject()
-  process.send(subject, SubscribedUris(session, reply))
-  let assert Ok(uris) = process.receive(reply, 1000)
-  uris
+  process.call(subject, 1000, fn(reply) { SubscribedUris(session, reply) })
 }
 
-fn loop(
-  subject: process.Subject(Message(a)),
-  pending: dict.Dict(#(Option(String), jsonrpc.RequestId), Pending(a)),
-  subscriptions: dict.Dict(String, List(String)),
-) -> Nil {
-  let selector =
-    process.new_selector()
-    |> process.select(subject)
-    |> process.select_monitors(WorkerDown)
-  case process.selector_receive_forever(selector) {
+fn handle_message(
+  state: State(a),
+  message: Message(a),
+) -> actor.Next(State(a), Message(a)) {
+  let State(subject:, pending:, subscriptions:) = state
+  case message {
     Begin(session, id, timeout, work, reply, registered) -> {
       let key = #(session, id)
       case dict.has_key(pending, key) {
@@ -194,7 +211,7 @@ fn loop(
             Error(jsonrpc.RpcError(-32_600, "Duplicate active request id", None)),
           )
           process.send(registered, Nil)
-          loop(subject, pending, subscriptions)
+          continue(subject, pending, subscriptions)
         }
         False -> {
           let worker =
@@ -215,7 +232,7 @@ fn loop(
           let timer =
             process.send_after(subject, timeout, Timeout(session, id, worker))
           process.send(registered, Nil)
-          loop(
+          continue(
             subject,
             dict.insert(pending, key, Pending(worker, monitor, timer, reply)),
             subscriptions,
@@ -228,7 +245,7 @@ fn loop(
         Ok(entry) if entry.worker == worker -> process.send(ready, Nil)
         _ -> process.kill(worker)
       }
-      loop(subject, pending, subscriptions)
+      continue(subject, pending, subscriptions)
     }
     Finished(session, id, worker, outcome) -> {
       let key = #(session, id)
@@ -236,9 +253,9 @@ fn loop(
         Ok(entry) if entry.worker == worker -> {
           release_tracking(entry)
           process.send(entry.reply, outcome)
-          loop(subject, dict.delete(pending, key), subscriptions)
+          continue(subject, dict.delete(pending, key), subscriptions)
         }
-        _ -> loop(subject, pending, subscriptions)
+        _ -> continue(subject, pending, subscriptions)
       }
     }
     Timeout(session, id, worker) -> {
@@ -249,9 +266,9 @@ fn loop(
             entry,
             jsonrpc.RpcError(-32_800, "Request timed out", None),
           )
-          loop(subject, dict.delete(pending, key), subscriptions)
+          continue(subject, dict.delete(pending, key), subscriptions)
         }
-        _ -> loop(subject, pending, subscriptions)
+        _ -> continue(subject, pending, subscriptions)
       }
     }
     WorkerDown(process.ProcessDown(_, worker, _)) -> {
@@ -268,12 +285,13 @@ fn loop(
               None,
             )),
           )
-          loop(subject, dict.delete(pending, key), subscriptions)
+          continue(subject, dict.delete(pending, key), subscriptions)
         }
-        Error(Nil) -> loop(subject, pending, subscriptions)
+        Error(Nil) -> continue(subject, pending, subscriptions)
       }
     }
-    WorkerDown(process.PortDown(..)) -> loop(subject, pending, subscriptions)
+    WorkerDown(process.PortDown(..)) ->
+      continue(subject, pending, subscriptions)
     Abort(session, id, message) -> {
       let key = #(session, id)
       case dict.get(pending, key) {
@@ -282,18 +300,18 @@ fn loop(
         }
         Error(_) -> Nil
       }
-      loop(subject, dict.delete(pending, key), subscriptions)
+      continue(subject, dict.delete(pending, key), subscriptions)
     }
     ActiveWorker(scope, id, worker, reply) -> {
       process.send(reply, case dict.get(pending, #(scope, id)) {
         Ok(entry) -> entry.worker == worker
         Error(_) -> False
       })
-      loop(subject, pending, subscriptions)
+      continue(subject, pending, subscriptions)
     }
     Active(scope, id, reply) -> {
       process.send(reply, dict.has_key(pending, #(scope, id)))
-      loop(subject, pending, subscriptions)
+      continue(subject, pending, subscriptions)
     }
     Close(session, reply) -> {
       let next =
@@ -310,7 +328,7 @@ fn loop(
           }
         })
       process.send(reply, Nil)
-      loop(subject, next, dict.delete(subscriptions, session))
+      continue(subject, next, dict.delete(subscriptions, session))
     }
     Subscribe(session, uri, enabled, reply) -> {
       let current = case dict.get(subscriptions, session) {
@@ -326,7 +344,7 @@ fn loop(
         False -> list.filter(current, fn(value) { value != uri })
       }
       process.send(reply, Nil)
-      loop(subject, pending, dict.insert(subscriptions, session, next))
+      continue(subject, pending, dict.insert(subscriptions, session, next))
     }
     Subscribers(uri, reply) -> {
       process.send(
@@ -340,16 +358,24 @@ fn loop(
             }
           }),
       )
-      loop(subject, pending, subscriptions)
+      continue(subject, pending, subscriptions)
     }
     SubscribedUris(session, reply) -> {
       process.send(reply, case dict.get(subscriptions, session) {
         Ok(uris) -> uris
         Error(_) -> []
       })
-      loop(subject, pending, subscriptions)
+      continue(subject, pending, subscriptions)
     }
   }
+}
+
+fn continue(
+  subject: process.Subject(Message(a)),
+  pending: dict.Dict(#(Option(String), jsonrpc.RequestId), Pending(a)),
+  subscriptions: dict.Dict(String, List(String)),
+) -> actor.Next(State(a), Message(a)) {
+  actor.continue(State(subject, pending, subscriptions))
 }
 
 fn release_tracking(entry: Pending(a)) -> Nil {
@@ -381,7 +407,7 @@ type ModernSubscription {
   )
 }
 
-type SubscriptionMessage {
+pub opaque type SubscriptionMessage {
   Listen(
     String,
     jsonrpc.RequestId,
@@ -400,15 +426,41 @@ type SubscriptionMessage {
   ListenerDown(process.Down)
 }
 
+/// Start an unsupervised subscription store linked to the calling process.
 pub fn new_subscriptions() -> SubscriptionStore {
-  let ready = process.new_subject()
-  let _ =
-    process.spawn(fn() {
-      let subject = process.new_subject()
-      process.send(ready, subject)
-      subscription_loop(subject, dict.new())
-    })
-  SubscriptionStore(process.receive(ready, 1000) |> expect_ok)
+  let assert Ok(actor.Started(data: store, ..)) =
+    start_subscriptions(process.new_name("gleam_mcp_subscriptions"))
+  store
+}
+
+pub fn start_subscriptions(
+  name: process.Name(SubscriptionMessage),
+) -> actor.StartResult(SubscriptionStore) {
+  actor.new_with_initialiser(1000, fn(subject) {
+    let selector =
+      process.new_selector()
+      |> process.select(subject)
+      |> process.select_monitors(ListenerDown)
+    actor.initialised(dict.new())
+    |> actor.selecting(selector)
+    |> actor.returning(SubscriptionStore(subject))
+    |> Ok
+  })
+  |> actor.named(name)
+  |> actor.on_message(handle_subscription_message)
+  |> actor.start
+}
+
+pub fn supervised_subscriptions(
+  name: process.Name(SubscriptionMessage),
+) -> supervision.ChildSpecification(SubscriptionStore) {
+  supervision.worker(fn() { start_subscriptions(name) })
+}
+
+pub fn named_subscriptions(
+  name: process.Name(SubscriptionMessage),
+) -> SubscriptionStore {
+  SubscriptionStore(process.named_subject(name))
 }
 
 pub fn listen_request(
@@ -423,9 +475,7 @@ pub fn listen_request(
   closing: String,
 ) -> Result(Nil, jsonrpc.RpcError) {
   let SubscriptionStore(subject) = store
-  let reply = process.new_subject()
-  process.send(
-    subject,
+  process.call(subject, 1000, fn(reply) {
     Listen(
       scope,
       id,
@@ -435,9 +485,8 @@ pub fn listen_request(
       acknowledgment,
       closing,
       reply,
-    ),
-  )
-  process.receive(reply, 1000) |> expect_ok
+    )
+  })
 }
 
 pub fn subscription_active(
@@ -446,9 +495,7 @@ pub fn subscription_active(
   id: jsonrpc.RequestId,
 ) -> Bool {
   let SubscriptionStore(subject) = store
-  let reply = process.new_subject()
-  process.send(subject, SubscriptionActive(scope, id, reply))
-  process.receive(reply, 1000) |> expect_ok
+  process.call(subject, 1000, fn(reply) { SubscriptionActive(scope, id, reply) })
 }
 
 pub fn publish(
@@ -465,9 +512,7 @@ pub fn cancel_subscription(
   id: jsonrpc.RequestId,
 ) -> Nil {
   let SubscriptionStore(subject) = store
-  let reply = process.new_subject()
-  process.send(subject, EndSubscription(scope, id, reply))
-  process.receive(reply, 1000) |> expect_ok
+  process.call(subject, 1000, fn(reply) { EndSubscription(scope, id, reply) })
 }
 
 pub fn close_subscription_scope(
@@ -475,20 +520,17 @@ pub fn close_subscription_scope(
   scope: String,
 ) -> Nil {
   let SubscriptionStore(subject) = store
-  let reply = process.new_subject()
-  process.send(subject, EndScope(scope, reply))
-  process.receive(reply, 1000) |> expect_ok
+  process.call(subject, 1000, fn(reply) { EndScope(scope, reply) })
 }
 
-fn subscription_loop(
-  subject: process.Subject(SubscriptionMessage),
-  subscriptions: dict.Dict(#(String, jsonrpc.RequestId), ModernSubscription),
-) -> Nil {
-  let selector =
-    process.new_selector()
-    |> process.select(subject)
-    |> process.select_monitors(ListenerDown)
-  case process.selector_receive_forever(selector) {
+type Subscriptions =
+  dict.Dict(#(String, jsonrpc.RequestId), ModernSubscription)
+
+fn handle_subscription_message(
+  subscriptions: Subscriptions,
+  message: SubscriptionMessage,
+) -> actor.Next(Subscriptions, SubscriptionMessage) {
+  case message {
     Listen(
       scope,
       id,
@@ -510,7 +552,7 @@ fn subscription_loop(
               None,
             )),
           )
-          subscription_loop(subject, subscriptions)
+          actor.continue(subscriptions)
         }
         False, Error(_) -> {
           process.send(
@@ -519,7 +561,7 @@ fn subscription_loop(
               "Subscription listener has no owner",
             )),
           )
-          subscription_loop(subject, subscriptions)
+          actor.continue(subscriptions)
         }
         False, Ok(owner) -> {
           case process.is_alive(owner) {
@@ -530,7 +572,7 @@ fn subscription_loop(
                   "Subscription listener is closed",
                 )),
               )
-              subscription_loop(subject, subscriptions)
+              actor.continue(subscriptions)
             }
             True -> {
               let monitor = process.monitor(owner)
@@ -543,21 +585,18 @@ fn subscription_loop(
                 )),
               )
               process.send(reply, Ok(Nil))
-              subscription_loop(
-                subject,
-                dict.insert(
-                  subscriptions,
-                  key,
-                  ModernSubscription(
-                    owner,
-                    monitor,
-                    listener,
-                    accepts,
-                    correlate,
-                    closing,
-                  ),
+              actor.continue(dict.insert(
+                subscriptions,
+                key,
+                ModernSubscription(
+                  owner,
+                  monitor,
+                  listener,
+                  accepts,
+                  correlate,
+                  closing,
                 ),
-              )
+              ))
             }
           }
         }
@@ -565,7 +604,7 @@ fn subscription_loop(
     }
     SubscriptionActive(scope, id, reply) -> {
       process.send(reply, dict.has_key(subscriptions, #(scope, id)))
-      subscription_loop(subject, subscriptions)
+      actor.continue(subscriptions)
     }
     Publish(notification) -> {
       let subscriptions =
@@ -590,7 +629,7 @@ fn subscription_loop(
             }
           }
         })
-      subscription_loop(subject, subscriptions)
+      actor.continue(subscriptions)
     }
     EndSubscription(scope, id, reply) -> {
       let key = #(scope, id)
@@ -605,7 +644,7 @@ fn subscription_loop(
         Error(_) -> Nil
       }
       process.send(reply, Nil)
-      subscription_loop(subject, dict.delete(subscriptions, key))
+      actor.continue(dict.delete(subscriptions, key))
     }
     EndScope(scope, reply) -> {
       let subscriptions =
@@ -623,11 +662,10 @@ fn subscription_loop(
           }
         })
       process.send(reply, Nil)
-      subscription_loop(subject, subscriptions)
+      actor.continue(subscriptions)
     }
     ListenerDown(process.ProcessDown(_, owner, _)) -> {
-      subscription_loop(
-        subject,
+      actor.continue(
         dict.filter(subscriptions, fn(_, subscription) {
           case subscription.owner == owner {
             True -> {
@@ -639,12 +677,6 @@ fn subscription_loop(
         }),
       )
     }
-    ListenerDown(process.PortDown(..)) ->
-      subscription_loop(subject, subscriptions)
+    ListenerDown(process.PortDown(..)) -> actor.continue(subscriptions)
   }
-}
-
-fn expect_ok(result: Result(a, b)) -> a {
-  let assert Ok(value) = result
-  value
 }

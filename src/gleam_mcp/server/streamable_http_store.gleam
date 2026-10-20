@@ -5,6 +5,8 @@ import gleam/int
 import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}
+import gleam/otp/actor
+import gleam/otp/supervision
 import gleam/result
 import gleam_mcp/actions
 import gleam_mcp/client/codec as client_codec
@@ -34,7 +36,7 @@ pub type SessionMetadata {
   )
 }
 
-type Message {
+pub opaque type Message {
   GetMetadata(String, process.Subject(Option(SessionMetadata)))
   SetMetadata(String, SessionMetadata, process.Subject(Nil))
   DeleteSession(String, process.Subject(Nil))
@@ -118,38 +120,65 @@ type PendingRequest {
   )
 }
 
-pub fn new() -> Store {
-  let reply_to = process.new_subject()
-  let _ = process.spawn(fn() { start_store(reply_to) })
-  let subject = expect_ok(process.receive(reply_to, 1000))
-  Store(subject)
+type State {
+  State(
+    subject: process.Subject(Message),
+    sessions: Dict(String, Session),
+    metadata: Dict(String, SessionMetadata),
+  )
 }
 
-fn start_store(reply_to: process.Subject(process.Subject(Message))) {
-  let subject = process.new_subject()
-  process.send(reply_to, subject)
-  loop(subject, dict.new(), dict.new())
+/// Start an unsupervised store linked to the calling process.
+pub fn new() -> Store {
+  let assert Ok(actor.Started(data: store, ..)) =
+    start(process.new_name("gleam_mcp_streamable_http"))
+  store
+}
+
+/// Start the store registered under `name`, so that a supervisor can restart
+/// it without invalidating the handles returned by `named`.
+pub fn start(name: process.Name(Message)) -> actor.StartResult(Store) {
+  actor.new_with_initialiser(1000, fn(subject) {
+    let selector =
+      process.new_selector()
+      |> process.select(subject)
+      |> process.select_monitors(CallerDown)
+    actor.initialised(State(subject, dict.new(), dict.new()))
+    |> actor.selecting(selector)
+    |> actor.returning(Store(subject))
+    |> Ok
+  })
+  |> actor.named(name)
+  |> actor.on_message(handle_message)
+  |> actor.start
+}
+
+pub fn supervised(
+  name: process.Name(Message),
+) -> supervision.ChildSpecification(Store) {
+  supervision.worker(fn() { start(name) })
+}
+
+/// A handle to the store registered under `name`.
+pub fn named(name: process.Name(Message)) -> Store {
+  Store(process.named_subject(name))
 }
 
 pub fn ensure_session(store: Store, session_id: Option(String)) -> String {
   let Store(subject) = store
-  let reply_to = process.new_subject()
-  process.send(subject, EnsureSession(session_id, reply_to))
-  expect_ok(process.receive(reply_to, 1000))
+  process.call(subject, 1000, fn(reply_to) {
+    EnsureSession(session_id, reply_to)
+  })
 }
 
 pub fn has_session(store: Store, session_id: String) -> Bool {
   let Store(subject) = store
-  let reply_to = process.new_subject()
-  process.send(subject, HasSession(session_id, reply_to))
-  expect_ok(process.receive(reply_to, 1000))
+  process.call(subject, 1000, fn(reply_to) { HasSession(session_id, reply_to) })
 }
 
 pub fn metadata(store: Store, session_id: String) -> Option(SessionMetadata) {
   let Store(subject) = store
-  let reply_to = process.new_subject()
-  process.send(subject, GetMetadata(session_id, reply_to))
-  expect_ok(process.receive(reply_to, 1000))
+  process.call(subject, 1000, fn(reply_to) { GetMetadata(session_id, reply_to) })
 }
 
 pub fn set_metadata(
@@ -158,16 +187,16 @@ pub fn set_metadata(
   metadata: SessionMetadata,
 ) -> Nil {
   let Store(subject) = store
-  let reply_to = process.new_subject()
-  process.send(subject, SetMetadata(session_id, metadata, reply_to))
-  expect_ok(process.receive(reply_to, 1000))
+  process.call(subject, 1000, fn(reply_to) {
+    SetMetadata(session_id, metadata, reply_to)
+  })
 }
 
 pub fn delete_session(store: Store, session_id: String) -> Nil {
   let Store(subject) = store
-  let reply_to = process.new_subject()
-  process.send(subject, DeleteSession(session_id, reply_to))
-  expect_ok(process.receive(reply_to, 1000))
+  process.call(subject, 1000, fn(reply_to) {
+    DeleteSession(session_id, reply_to)
+  })
 }
 
 pub fn new_listener_id() -> String {
@@ -180,13 +209,9 @@ pub fn register_listener(
   listener_id: String,
   listener: process.Subject(ListenerMessage),
 ) -> Nil {
-  let Store(subject) = store
-  let reply_to = process.new_subject()
-  process.send(
-    subject,
-    RegisterListener(session_id, listener_id, listener, reply_to),
-  )
-  expect_ok(process.receive(reply_to, 1000))
+  process.call(store.subject, 1000, fn(reply_to) {
+    RegisterListener(session_id, listener_id, listener, reply_to)
+  })
 }
 
 pub fn unregister_listener(
@@ -194,13 +219,9 @@ pub fn unregister_listener(
   session_id: String,
   listener_id: String,
 ) -> Nil {
-  let Store(subject) = store
-  let reply_to = process.new_subject()
-  process.send(
-    subject,
-    UnregisterListener(session_id, listener_id, None, reply_to),
-  )
-  expect_ok(process.receive(reply_to, 1000))
+  process.call(store.subject, 1000, fn(reply_to) {
+    UnregisterListener(session_id, listener_id, None, reply_to)
+  })
 }
 
 pub fn unregister_listener_owned(
@@ -209,12 +230,9 @@ pub fn unregister_listener_owned(
   listener_id: String,
   owner: process.Pid,
 ) -> Nil {
-  let reply_to = process.new_subject()
-  process.send(
-    store.subject,
-    UnregisterListener(session_id, listener_id, Some(owner), reply_to),
-  )
-  expect_ok(process.receive(reply_to, 1000))
+  process.call(store.subject, 1000, fn(reply_to) {
+    UnregisterListener(session_id, listener_id, Some(owner), reply_to)
+  })
 }
 
 pub fn send_request(
@@ -303,27 +321,23 @@ pub fn resolve_response(
   body: String,
 ) -> Result(Nil, jsonrpc.RpcError) {
   let Store(subject) = store
-  let reply_to = process.new_subject()
-  process.send(subject, ResolveResponse(session_id, body, reply_to))
-  expect_ok(process.receive(reply_to, 1000))
+  process.call(subject, 1000, fn(reply_to) {
+    ResolveResponse(session_id, body, reply_to)
+  })
 }
 
-fn loop(
-  subject: process.Subject(Message),
-  sessions: Dict(String, Session),
-  metadata: Dict(String, SessionMetadata),
-) -> Nil {
-  let selector =
-    process.new_selector()
-    |> process.select(subject)
-    |> process.select_monitors(CallerDown)
-  case process.selector_receive_forever(selector) {
+fn handle_message(
+  state: State,
+  message: Message,
+) -> actor.Next(State, Message) {
+  let State(subject:, sessions:, metadata:) = state
+  case message {
     GetMetadata(session_id, reply_to) -> {
       process.send(reply_to, case dict.get(metadata, session_id) {
         Ok(entry) -> Some(entry)
         Error(_) -> None
       })
-      loop(subject, sessions, metadata)
+      continue(subject, sessions, metadata)
     }
     SetMetadata(session_id, entry, reply_to) -> {
       process.send(reply_to, Nil)
@@ -331,7 +345,7 @@ fn loop(
         True -> dict.insert(metadata, session_id, entry)
         False -> metadata
       }
-      loop(subject, sessions, next)
+      continue(subject, sessions, next)
     }
     DeleteSession(session_id, reply_to) -> {
       case dict.get(sessions, session_id) {
@@ -354,7 +368,7 @@ fn loop(
         Error(_) -> Nil
       }
       process.send(reply_to, Nil)
-      loop(
+      continue(
         subject,
         dict.delete(sessions, session_id),
         dict.delete(metadata, session_id),
@@ -366,14 +380,14 @@ fn loop(
         None -> uuid.v4_string()
       }
       process.send(reply_to, ensured)
-      loop(subject, ensure_session_entry(sessions, ensured), metadata)
+      continue(subject, ensure_session_entry(sessions, ensured), metadata)
     }
     HasSession(session_id, reply_to) -> {
       process.send(reply_to, case dict.get(sessions, session_id) {
         Ok(_) -> True
         Error(Nil) -> False
       })
-      loop(subject, sessions, metadata)
+      continue(subject, sessions, metadata)
     }
     RegisterListener(session_id, listener_id, listener, reply_to) -> {
       let next_sessions = case dict.has_key(sessions, session_id) {
@@ -384,13 +398,13 @@ fn loop(
         }
       }
       process.send(reply_to, Nil)
-      loop(subject, next_sessions, metadata)
+      continue(subject, next_sessions, metadata)
     }
     UnregisterListener(session_id, listener_id, owner, reply_to) -> {
       let next_sessions =
         detach_listener_owned(sessions, session_id, listener_id, owner)
       process.send(reply_to, Nil)
-      loop(subject, next_sessions, metadata)
+      continue(subject, next_sessions, metadata)
     }
     SendRequest(session_id, request, reply_to, timeout_ms, record) -> {
       let next_sessions = case dict.has_key(sessions, session_id) {
@@ -414,7 +428,7 @@ fn loop(
           sessions
         }
       }
-      loop(subject, next_sessions, metadata)
+      continue(subject, next_sessions, metadata)
     }
     SendNotification(session_id, notification, record) -> {
       let next_sessions =
@@ -424,7 +438,7 @@ fn loop(
           notification,
           record,
         )
-      loop(subject, next_sessions, metadata)
+      continue(subject, next_sessions, metadata)
     }
     SendRecorded(session_id, event_id, payload) -> {
       let next =
@@ -433,7 +447,7 @@ fn loop(
           session_id,
           DeliverReplay(event_id, payload, False),
         )
-      loop(subject, next, metadata)
+      continue(subject, next, metadata)
     }
     SendStreamResponse(session_id, stream_id, payload, record) -> {
       let next =
@@ -444,13 +458,13 @@ fn loop(
           payload,
           record,
         )
-      loop(subject, next, metadata)
+      continue(subject, next, metadata)
     }
     ResolveResponse(session_id, body, reply_to) -> {
       let #(next_sessions, result) =
         resolve_pending_response(sessions, session_id, body)
       process.send(reply_to, result)
-      loop(subject, next_sessions, metadata)
+      continue(subject, next_sessions, metadata)
     }
     ExpireRequest(session_id, pending_id, reply_to) -> {
       let session = get_session(sessions, session_id)
@@ -461,7 +475,7 @@ fn loop(
           expire_and_cancel(sessions, session_id, pending_id)
         _ -> sessions
       }
-      loop(subject, next, metadata)
+      continue(subject, next, metadata)
     }
     CallerDown(process.ProcessDown(_, caller, _)) -> {
       let sessions = remove_listener_owner(sessions, caller)
@@ -483,10 +497,18 @@ fn loop(
             },
           )
         })
-      loop(subject, next, metadata)
+      continue(subject, next, metadata)
     }
-    CallerDown(process.PortDown(..)) -> loop(subject, sessions, metadata)
+    CallerDown(process.PortDown(..)) -> continue(subject, sessions, metadata)
   }
+}
+
+fn continue(
+  subject: process.Subject(Message),
+  sessions: Dict(String, Session),
+  metadata: Dict(String, SessionMetadata),
+) -> actor.Next(State, Message) {
+  actor.continue(State(subject, sessions, metadata))
 }
 
 fn deliver_recorded_notification(
@@ -996,12 +1018,5 @@ fn request_id_key(id: jsonrpc.RequestId) -> String {
   case id {
     jsonrpc.IntId(value) -> "int:" <> int.to_string(value)
     jsonrpc.StringId(value) -> "string:" <> value
-  }
-}
-
-fn expect_ok(value: Result(a, Nil)) -> a {
-  case value {
-    Ok(inner) -> inner
-    Error(Nil) -> panic as "Timed out waiting for streamable HTTP store"
   }
 }

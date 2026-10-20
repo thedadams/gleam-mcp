@@ -3,6 +3,8 @@ import gleam/erlang/process
 import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
+import gleam/otp/actor
+import gleam/otp/supervision
 import gleam/result
 import gleam/time/duration
 import gleam/time/timestamp
@@ -67,7 +69,7 @@ type Access {
   Scoped(Option(String))
 }
 
-type Message {
+pub opaque type Message {
   Create(
     ttl_ms: Option(Int),
     scope: Option(String),
@@ -147,17 +149,44 @@ const default_poll_interval_ms = 5000
 /// unlimited; applications can apply their own default before creating a task.
 pub const maximum_ttl_ms = 86_400_000
 
-pub fn new() -> Store {
-  let reply_to = process.new_subject()
-  let _ = process.spawn(fn() { start_store(reply_to) })
-  let subject = expect_ok(process.receive(reply_to, 1000))
-  Store(subject)
+type State {
+  State(subject: process.Subject(Message), entries: Dict(String, Entry))
 }
 
-fn start_store(reply_to: process.Subject(process.Subject(Message))) {
-  let subject = process.new_subject()
-  process.send(reply_to, subject)
-  loop(subject, dict.new())
+/// Start an unsupervised task store linked to the calling process.
+pub fn new() -> Store {
+  let assert Ok(actor.Started(data: store, ..)) =
+    start(process.new_name("gleam_mcp_task_store"))
+  store
+}
+
+/// Start the task store registered under `name`, so that a supervisor can
+/// restart it without invalidating the handles returned by `named`.
+pub fn start(name: process.Name(Message)) -> actor.StartResult(Store) {
+  actor.new_with_initialiser(1000, fn(subject) {
+    let selector =
+      process.new_selector()
+      |> process.select(subject)
+      |> process.select_monitors(WorkerDown)
+    actor.initialised(State(subject, dict.new()))
+    |> actor.selecting(selector)
+    |> actor.returning(Store(subject))
+    |> Ok
+  })
+  |> actor.named(name)
+  |> actor.on_message(handle_message)
+  |> actor.start
+}
+
+pub fn supervised(
+  name: process.Name(Message),
+) -> supervision.ChildSpecification(Store) {
+  supervision.worker(fn() { start(name) })
+}
+
+/// A handle to the task store registered under `name`.
+pub fn named(name: process.Name(Message)) -> Store {
+  Store(process.named_subject(name))
 }
 
 pub fn create(store: Store, ttl_ms: Option(Int)) -> actions.Task {
@@ -303,10 +332,9 @@ fn result_with_access(
   task_id: String,
   access: Access,
 ) -> Result(actions.TaskResult, jsonrpc.RpcError) {
-  let Store(subject) = store
-  let reply_to = process.new_subject()
-  process.send(subject, Result(task_id, access, reply_to))
-  process.receive_forever(reply_to)
+  process.call_forever(store.subject, fn(reply_to) {
+    Result(task_id, access, reply_to)
+  })
 }
 
 pub fn cancel(
@@ -341,21 +369,15 @@ pub fn cancel_result_scoped(
 }
 
 fn call(store: Store, message: fn(process.Subject(reply)) -> Message) -> reply {
-  let Store(subject) = store
-  let reply_to = process.new_subject()
-  process.send(subject, message(reply_to))
-  expect_ok(process.receive(reply_to, 1000))
+  process.call(store.subject, 1000, message)
 }
 
-fn loop(
-  subject: process.Subject(Message),
-  entries: Dict(String, Entry),
-) -> Nil {
-  let selector =
-    process.new_selector()
-    |> process.select(subject)
-    |> process.select_monitors(WorkerDown)
-  case process.selector_receive_forever(selector) {
+fn handle_message(
+  state: State,
+  message: Message,
+) -> actor.Next(State, Message) {
+  let State(subject:, entries:) = state
+  case message {
     Create(requested_ttl_ms, scope, poll_interval_ms, lifecycle, reply_to) -> {
       let ttl_ms = actual_ttl(requested_ttl_ms)
       let task =
@@ -373,7 +395,7 @@ fn loop(
           Some(process.send_after(subject, ttl, Expire(task.task_id)))
         None -> None
       }
-      loop(
+      continue(
         subject,
         dict.insert(
           entries,
@@ -396,39 +418,39 @@ fn loop(
       let #(next_entries, response) =
         update_task_status(entries, task_id, status, status_message)
       process.send(reply_to, response)
-      loop(subject, next_entries)
+      continue(subject, next_entries)
     }
     Complete(task_id, outcome, reply_to) -> {
       let #(next_entries, response, waiters, task_result) =
         complete_task(entries, task_id, outcome)
       process.send(reply_to, response)
       notify_waiters(waiters, task_result)
-      loop(subject, next_entries)
+      continue(subject, next_entries)
     }
     StartWorker(task_id, worker, reply_to) -> {
       let #(next_entries, response) =
         start_task_worker(entries, task_id, subject, worker)
       process.send(reply_to, response)
-      loop(subject, next_entries)
+      continue(subject, next_entries)
     }
     StartModern(task_id, worker, reply) -> {
       let #(next, response) =
         start_modern_task(entries, task_id, subject, worker)
       process.send(reply, response)
-      loop(subject, next)
+      continue(subject, next)
     }
     Peek(task_id, access, reply) -> {
       process.send(reply, case find_entry(entries, task_id, access) {
         Ok(entry) -> Ok(Snapshot(entry.task, entry.outcome, entry.inputs))
         Error(_) -> Error(task_not_found_error(task_id))
       })
-      loop(subject, entries)
+      continue(subject, entries)
     }
     SubmitInputs(task_id, access, inputs, reply) -> {
       case find_entry(entries, task_id, access) {
         Error(_) -> {
           process.send(reply, Error(task_not_found_error(task_id)))
-          loop(subject, entries)
+          continue(subject, entries)
         }
         Ok(entry) -> {
           case entry.resume, entry.task.status {
@@ -446,7 +468,7 @@ fn loop(
               case dict.size(supplied) > 0 {
                 False -> {
                   process.send(reply, Ok(Nil))
-                  loop(subject, entries)
+                  continue(subject, entries)
                 }
                 True -> {
                   let next_resume = fn(more) {
@@ -458,7 +480,7 @@ fn loop(
                   case dict.size(remaining) == 0 {
                     False -> {
                       process.send(reply, Ok(Nil))
-                      loop(subject, entries)
+                      continue(subject, entries)
                     }
                     True -> {
                       let #(next, response) =
@@ -466,7 +488,7 @@ fn loop(
                           next_resume(dict.new())
                         })
                       process.send(reply, response)
-                      loop(subject, next)
+                      continue(subject, next)
                     }
                   }
                 }
@@ -474,7 +496,7 @@ fn loop(
             }
             _, _ -> {
               process.send(reply, Ok(Nil))
-              loop(subject, entries)
+              continue(subject, entries)
             }
           }
         }
@@ -503,7 +525,7 @@ fn loop(
                       inputs: inputs,
                       resume: Some(resume),
                     )
-                  loop(subject, dict.insert(entries, task_id, entry))
+                  continue(subject, dict.insert(entries, task_id, entry))
                 }
                 False -> {
                   let #(next, _, waiters, outcome) =
@@ -515,7 +537,7 @@ fn loop(
                       )),
                     )
                   notify_waiters(waiters, outcome)
-                  loop(subject, next)
+                  continue(subject, next)
                 }
               }
             }
@@ -531,11 +553,11 @@ fn loop(
               let #(next, _, waiters, result) =
                 complete_task(entries, task_id, outcome)
               notify_waiters(waiters, result)
-              loop(subject, next)
+              continue(subject, next)
             }
           }
         }
-        _ -> loop(subject, entries)
+        _ -> continue(subject, entries)
       }
     }
     WorkerReady(task_id, pid, ready) -> {
@@ -545,7 +567,7 @@ fn loop(
         -> process.send(ready, Nil)
         _ -> process.kill(pid)
       }
-      loop(subject, entries)
+      continue(subject, entries)
     }
     WorkerFinished(task_id, pid, outcome) -> {
       case dict.get(entries, task_id) {
@@ -558,9 +580,9 @@ fn loop(
           let #(next_entries, _, waiters, task_result) =
             complete_task(entries, task_id, outcome)
           notify_waiters(waiters, task_result)
-          loop(subject, next_entries)
+          continue(subject, next_entries)
         }
-        _ -> loop(subject, entries)
+        _ -> continue(subject, entries)
       }
     }
     WorkerDown(process.ProcessDown(_, pid, _)) -> {
@@ -582,12 +604,12 @@ fn loop(
           let #(next_entries, _, waiters, task_result) =
             complete_task(entries, task_id, Error(error))
           notify_waiters(waiters, task_result)
-          loop(subject, next_entries)
+          continue(subject, next_entries)
         }
-        Error(Nil) -> loop(subject, entries)
+        Error(Nil) -> continue(subject, entries)
       }
     }
-    WorkerDown(process.PortDown(..)) -> loop(subject, entries)
+    WorkerDown(process.PortDown(..)) -> continue(subject, entries)
     CloseScope(scope, reply) -> {
       let next =
         dict.filter(entries, fn(_, entry) {
@@ -603,7 +625,7 @@ fn loop(
           }
         })
       process.send(reply, Nil)
-      loop(subject, next)
+      continue(subject, next)
     }
     Expire(task_id) -> {
       case dict.get(entries, task_id) {
@@ -612,7 +634,7 @@ fn loop(
         }
         Error(Nil) -> Nil
       }
-      loop(subject, dict.delete(entries, task_id))
+      continue(subject, dict.delete(entries, task_id))
     }
     List(access, reply_to) -> {
       process.send(
@@ -625,12 +647,12 @@ fn loop(
             task
           }),
       )
-      loop(subject, entries)
+      continue(subject, entries)
     }
     Get(task_id, access, reply_to) -> {
       let #(next_entries, response) = get_task(entries, task_id, access)
       process.send(reply_to, response)
-      loop(subject, next_entries)
+      continue(subject, next_entries)
     }
     Result(task_id, access, reply_to) -> {
       let #(next_entries, response) =
@@ -639,14 +661,21 @@ fn loop(
         Some(value) -> process.send(reply_to, value)
         None -> Nil
       }
-      loop(subject, next_entries)
+      continue(subject, next_entries)
     }
     Cancel(task_id, access, reply_to) -> {
       let #(next_entries, response) = cancel_task(entries, task_id, access)
       process.send(reply_to, response)
-      loop(subject, next_entries)
+      continue(subject, next_entries)
     }
   }
+}
+
+fn continue(
+  subject: process.Subject(Message),
+  entries: Dict(String, Entry),
+) -> actor.Next(State, Message) {
+  actor.continue(State(subject, entries))
 }
 
 fn start_task_worker(
@@ -1117,13 +1146,6 @@ fn task_status_name(status: actions.TaskStatus) -> String {
     actions.Completed -> "completed"
     actions.Failed -> "failed"
     actions.Cancelled -> "cancelled"
-  }
-}
-
-fn expect_ok(value: Result(a, Nil)) -> a {
-  case value {
-    Ok(inner) -> inner
-    Error(Nil) -> panic as "Timed out waiting for task store"
   }
 }
 

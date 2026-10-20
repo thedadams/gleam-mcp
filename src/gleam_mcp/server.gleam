@@ -7,6 +7,7 @@ import gleam/int
 import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}
+import gleam/otp/static_supervisor
 import gleam/result
 import gleam/string
 import gleam/time/timestamp
@@ -172,15 +173,28 @@ type RegisteredPrompt {
   RegisteredPrompt(prompt: actions.Prompt, handler: PromptHandler)
 }
 
+/// Create a server whose stores run under a supervisor linked to the calling
+/// process. Call it from a process that lives as long as the server is used.
 pub fn new(implementation: actions.Implementation) -> Server {
+  let tasks = process.new_name("gleam_mcp_task_store")
+  let http = process.new_name("gleam_mcp_streamable_http")
+  let requests = process.new_name("gleam_mcp_runtime")
+  let subscriptions = process.new_name("gleam_mcp_subscriptions")
+  let assert Ok(_) =
+    static_supervisor.new(static_supervisor.OneForOne)
+    |> static_supervisor.add(task_store.supervised(tasks))
+    |> static_supervisor.add(streamable_http_store.supervised(http))
+    |> static_supervisor.add(runtime.supervised(requests))
+    |> static_supervisor.add(runtime.supervised_subscriptions(subscriptions))
+    |> static_supervisor.start
   Server(
     implementation,
     None,
     None,
-    task_store.new(),
-    streamable_http_store.new(),
-    runtime.new(),
-    runtime.new_subscriptions(),
+    task_store.named(tasks),
+    streamable_http_store.named(http),
+    runtime.named(requests),
+    runtime.named_subscriptions(subscriptions),
     [],
     [],
     [],
