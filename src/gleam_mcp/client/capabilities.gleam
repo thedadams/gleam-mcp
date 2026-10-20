@@ -759,10 +759,11 @@ fn list_tasks_result(
 ) -> Result(Response(ServerActionResult), RpcError) {
   use _ <- result.try(validate_task_cursor(params))
   let Config(task_store: tasks, ..) = config
+  use tasks <- result.try(task_store.list(tasks))
   Ok(jsonrpc.ResultResponse(
     id,
     actions.ServerResultListTasks(actions.ListTasksResult(
-      tasks: task_store.list(tasks),
+      tasks: tasks,
       page: actions.Page(None),
       meta: None,
     )),

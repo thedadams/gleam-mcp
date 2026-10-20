@@ -26,19 +26,7 @@ pub type ListenerMessage {
   CloseListener
 }
 
-pub type SessionMetadata {
-  SessionMetadata(
-    protocol_version: String,
-    client_capabilities: actions.ClientCapabilities,
-    initialized: Bool,
-    ready: Bool,
-    principal: Option(String),
-  )
-}
-
 pub opaque type Message {
-  GetMetadata(String, process.Subject(Option(SessionMetadata)))
-  SetMetadata(String, SessionMetadata, process.Subject(Nil))
   DeleteSession(String, process.Subject(Nil))
   EnsureSession(session_id: Option(String), reply_to: process.Subject(String))
   HasSession(session_id: String, reply_to: process.Subject(Bool))
@@ -121,11 +109,7 @@ type PendingRequest {
 }
 
 type State {
-  State(
-    subject: process.Subject(Message),
-    sessions: Dict(String, Session),
-    metadata: Dict(String, SessionMetadata),
-  )
+  State(subject: process.Subject(Message), sessions: Dict(String, Session))
 }
 
 /// Start an unsupervised store linked to the calling process.
@@ -143,7 +127,7 @@ pub fn start(name: process.Name(Message)) -> actor.StartResult(Store) {
       process.new_selector()
       |> process.select(subject)
       |> process.select_monitors(CallerDown)
-    actor.initialised(State(subject, dict.new(), dict.new()))
+    actor.initialised(State(subject, dict.new()))
     |> actor.selecting(selector)
     |> actor.returning(Store(subject))
     |> Ok
@@ -174,22 +158,6 @@ pub fn ensure_session(store: Store, session_id: Option(String)) -> String {
 pub fn has_session(store: Store, session_id: String) -> Bool {
   let Store(subject) = store
   process.call(subject, 1000, fn(reply_to) { HasSession(session_id, reply_to) })
-}
-
-pub fn metadata(store: Store, session_id: String) -> Option(SessionMetadata) {
-  let Store(subject) = store
-  process.call(subject, 1000, fn(reply_to) { GetMetadata(session_id, reply_to) })
-}
-
-pub fn set_metadata(
-  store: Store,
-  session_id: String,
-  metadata: SessionMetadata,
-) -> Nil {
-  let Store(subject) = store
-  process.call(subject, 1000, fn(reply_to) {
-    SetMetadata(session_id, metadata, reply_to)
-  })
 }
 
 pub fn delete_session(store: Store, session_id: String) -> Nil {
@@ -330,23 +298,8 @@ fn handle_message(
   state: State,
   message: Message,
 ) -> actor.Next(State, Message) {
-  let State(subject:, sessions:, metadata:) = state
+  let State(subject:, sessions:) = state
   case message {
-    GetMetadata(session_id, reply_to) -> {
-      process.send(reply_to, case dict.get(metadata, session_id) {
-        Ok(entry) -> Some(entry)
-        Error(_) -> None
-      })
-      continue(subject, sessions, metadata)
-    }
-    SetMetadata(session_id, entry, reply_to) -> {
-      process.send(reply_to, Nil)
-      let next = case dict.has_key(sessions, session_id) {
-        True -> dict.insert(metadata, session_id, entry)
-        False -> metadata
-      }
-      continue(subject, sessions, next)
-    }
     DeleteSession(session_id, reply_to) -> {
       case dict.get(sessions, session_id) {
         Ok(session) -> {
@@ -368,11 +321,7 @@ fn handle_message(
         Error(_) -> Nil
       }
       process.send(reply_to, Nil)
-      continue(
-        subject,
-        dict.delete(sessions, session_id),
-        dict.delete(metadata, session_id),
-      )
+      continue(subject, dict.delete(sessions, session_id))
     }
     EnsureSession(session_id, reply_to) -> {
       let ensured = case session_id {
@@ -380,14 +329,14 @@ fn handle_message(
         None -> uuid.v4_string()
       }
       process.send(reply_to, ensured)
-      continue(subject, ensure_session_entry(sessions, ensured), metadata)
+      continue(subject, ensure_session_entry(sessions, ensured))
     }
     HasSession(session_id, reply_to) -> {
       process.send(reply_to, case dict.get(sessions, session_id) {
         Ok(_) -> True
         Error(Nil) -> False
       })
-      continue(subject, sessions, metadata)
+      continue(subject, sessions)
     }
     RegisterListener(session_id, listener_id, listener, reply_to) -> {
       let next_sessions = case dict.has_key(sessions, session_id) {
@@ -398,13 +347,13 @@ fn handle_message(
         }
       }
       process.send(reply_to, Nil)
-      continue(subject, next_sessions, metadata)
+      continue(subject, next_sessions)
     }
     UnregisterListener(session_id, listener_id, owner, reply_to) -> {
       let next_sessions =
         detach_listener_owned(sessions, session_id, listener_id, owner)
       process.send(reply_to, Nil)
-      continue(subject, next_sessions, metadata)
+      continue(subject, next_sessions)
     }
     SendRequest(session_id, request, reply_to, timeout_ms, record) -> {
       let next_sessions = case dict.has_key(sessions, session_id) {
@@ -428,7 +377,7 @@ fn handle_message(
           sessions
         }
       }
-      continue(subject, next_sessions, metadata)
+      continue(subject, next_sessions)
     }
     SendNotification(session_id, notification, record) -> {
       let next_sessions =
@@ -438,7 +387,7 @@ fn handle_message(
           notification,
           record,
         )
-      continue(subject, next_sessions, metadata)
+      continue(subject, next_sessions)
     }
     SendRecorded(session_id, event_id, payload) -> {
       let next =
@@ -447,7 +396,7 @@ fn handle_message(
           session_id,
           DeliverReplay(event_id, payload, False),
         )
-      continue(subject, next, metadata)
+      continue(subject, next)
     }
     SendStreamResponse(session_id, stream_id, payload, record) -> {
       let next =
@@ -458,13 +407,13 @@ fn handle_message(
           payload,
           record,
         )
-      continue(subject, next, metadata)
+      continue(subject, next)
     }
     ResolveResponse(session_id, body, reply_to) -> {
       let #(next_sessions, result) =
         resolve_pending_response(sessions, session_id, body)
       process.send(reply_to, result)
-      continue(subject, next_sessions, metadata)
+      continue(subject, next_sessions)
     }
     ExpireRequest(session_id, pending_id, reply_to) -> {
       let session = get_session(sessions, session_id)
@@ -475,7 +424,7 @@ fn handle_message(
           expire_and_cancel(sessions, session_id, pending_id)
         _ -> sessions
       }
-      continue(subject, next, metadata)
+      continue(subject, next)
     }
     CallerDown(process.ProcessDown(_, caller, _)) -> {
       let sessions = remove_listener_owner(sessions, caller)
@@ -497,18 +446,17 @@ fn handle_message(
             },
           )
         })
-      continue(subject, next, metadata)
+      continue(subject, next)
     }
-    CallerDown(process.PortDown(..)) -> continue(subject, sessions, metadata)
+    CallerDown(process.PortDown(..)) -> continue(subject, sessions)
   }
 }
 
 fn continue(
   subject: process.Subject(Message),
   sessions: Dict(String, Session),
-  metadata: Dict(String, SessionMetadata),
 ) -> actor.Next(State, Message) {
-  actor.continue(State(subject, sessions, metadata))
+  actor.continue(State(subject, sessions))
 }
 
 fn deliver_recorded_notification(

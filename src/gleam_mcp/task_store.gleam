@@ -1,8 +1,14 @@
+//// Tasks are persisted as `persistence.TaskRecord`s, so any replica sharing
+//// the record store can read, cancel or await them. The replica that runs a
+//// task's worker keeps the parts that cannot be persisted: the worker itself,
+//// local result waiters, the retention timer and the MRTR resume function.
+
 import gleam/dict.{type Dict}
 import gleam/erlang/process
 import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
+import gleam/order
 import gleam/otp/actor
 import gleam/otp/supervision
 import gleam/result
@@ -10,25 +16,28 @@ import gleam/time/duration
 import gleam/time/timestamp
 import gleam_mcp/actions
 import gleam_mcp/jsonrpc
+import gleam_mcp/persistence.{type TaskRecord, TaskRecord}
+import gleam_mcp/persistence/memory
 import youid/uuid
 
 pub opaque type Store {
-  Store(subject: process.Subject(Message))
+  Store(subject: process.Subject(Message), records: persistence.TaskStore)
 }
 
+type Waiter =
+  process.Subject(Result(actions.TaskResult, jsonrpc.RpcError))
+
+type Resume =
+  fn(Dict(String, jsonrpc.Value)) -> Result(ModernOutcome, jsonrpc.RpcError)
+
+/// What this replica holds for a task, alongside its persisted record.
 type Entry {
   Entry(
-    task: actions.Task,
-    outcome: Option(Result(actions.TaskResult, jsonrpc.RpcError)),
-    waiters: List(process.Subject(Result(actions.TaskResult, jsonrpc.RpcError))),
-    scope: Option(String),
+    records: persistence.TaskStore,
+    waiters: List(Waiter),
     worker: Option(TrackedWorker),
     retention: Option(process.Timer),
-    lifecycle: Option(TaskLifecycle),
-    inputs: Dict(String, jsonrpc.Value),
-    resume: Option(
-      fn(Dict(String, jsonrpc.Value)) -> Result(ModernOutcome, jsonrpc.RpcError),
-    ),
+    resume: Option(Resume),
   )
 }
 
@@ -49,11 +58,7 @@ pub type TaskLifecycle {
 /// Modern tasks can wait for MRTR input before resuming their monitored worker.
 pub type ModernOutcome {
   ModernComplete(jsonrpc.Value)
-  ModernInputRequired(
-    inputs: Dict(String, jsonrpc.Value),
-    resume: fn(Dict(String, jsonrpc.Value)) ->
-      Result(ModernOutcome, jsonrpc.RpcError),
-  )
+  ModernInputRequired(inputs: Dict(String, jsonrpc.Value), resume: Resume)
 }
 
 pub type Snapshot {
@@ -69,26 +74,33 @@ type Access {
   Scoped(Option(String))
 }
 
+type Records =
+  persistence.TaskStore
+
 pub opaque type Message {
   Create(
+    records: Records,
     ttl_ms: Option(Int),
     scope: Option(String),
     poll_interval_ms: Int,
     lifecycle: Option(TaskLifecycle),
-    reply_to: process.Subject(actions.Task),
+    reply_to: process.Subject(Result(actions.Task, jsonrpc.RpcError)),
   )
   UpdateStatus(
+    records: Records,
     task_id: String,
     status: actions.TaskStatus,
     status_message: Option(String),
     reply_to: process.Subject(Result(actions.Task, jsonrpc.RpcError)),
   )
   Complete(
+    records: Records,
     task_id: String,
     outcome: Result(actions.TaskResult, jsonrpc.RpcError),
     reply_to: process.Subject(Result(actions.Task, jsonrpc.RpcError)),
   )
   StartWorker(
+    records: Records,
     task_id: String,
     worker: fn() -> Result(actions.TaskResult, jsonrpc.RpcError),
     reply_to: process.Subject(Result(Nil, jsonrpc.RpcError)),
@@ -100,6 +112,7 @@ pub opaque type Message {
     outcome: Result(actions.TaskResult, jsonrpc.RpcError),
   )
   StartModern(
+    records: Records,
     task_id: String,
     worker: fn() -> Result(ModernOutcome, jsonrpc.RpcError),
     reply: process.Subject(Result(Nil, jsonrpc.RpcError)),
@@ -110,40 +123,52 @@ pub opaque type Message {
     outcome: Result(ModernOutcome, jsonrpc.RpcError),
   )
   Peek(
+    records: Records,
     task_id: String,
     access: Access,
     reply: process.Subject(Result(Snapshot, jsonrpc.RpcError)),
   )
   SubmitInputs(
+    records: Records,
     task_id: String,
     access: Access,
     inputs: Dict(String, jsonrpc.Value),
     reply: process.Subject(Result(Nil, jsonrpc.RpcError)),
   )
   WorkerDown(process.Down)
-  Expire(task_id: String)
-  CloseScope(scope: Option(String), reply: process.Subject(Nil))
-  List(access: Access, reply_to: process.Subject(List(actions.Task)))
+  Expire(records: Records, task_id: String)
+  CloseScope(
+    records: Records,
+    scope: Option(String),
+    reply: process.Subject(Nil),
+  )
+  List(
+    records: Records,
+    access: Access,
+    reply_to: process.Subject(Result(List(actions.Task), jsonrpc.RpcError)),
+  )
   Get(
+    records: Records,
     task_id: String,
     access: Access,
     reply_to: process.Subject(Result(actions.Task, jsonrpc.RpcError)),
   )
-  Result(
-    task_id: String,
-    access: Access,
-    reply_to: process.Subject(Result(actions.TaskResult, jsonrpc.RpcError)),
-  )
+  Result(records: Records, task_id: String, access: Access, reply_to: Waiter)
   Cancel(
+    records: Records,
     task_id: String,
     access: Access,
     reply_to: process.Subject(
       Result(actions.CancelTaskResult, jsonrpc.RpcError),
     ),
   )
+  Changed(task_id: String)
+  Forget(task_ids: List(String), reason: jsonrpc.RpcError)
 }
 
 const default_poll_interval_ms = 5000
+
+const update_attempts = 5
 
 /// Finite retention requests are limited to one day. A missing TTL remains
 /// unlimited; applications can apply their own default before creating a task.
@@ -153,16 +178,22 @@ type State {
   State(subject: process.Subject(Message), entries: Dict(String, Entry))
 }
 
-/// Start an unsupervised task store linked to the calling process.
+/// Start an unsupervised task store, with in-memory records, linked to the
+/// calling process.
 pub fn new() -> Store {
+  let assert Ok(actor.Started(data: records, ..)) =
+    memory.start_tasks(process.new_name("gleam_mcp_task_records"))
   let assert Ok(actor.Started(data: store, ..)) =
-    start(process.new_name("gleam_mcp_task_store"))
+    start(process.new_name("gleam_mcp_task_store"), records)
   store
 }
 
 /// Start the task store registered under `name`, so that a supervisor can
 /// restart it without invalidating the handles returned by `named`.
-pub fn start(name: process.Name(Message)) -> actor.StartResult(Store) {
+pub fn start(
+  name: process.Name(Message),
+  records: persistence.TaskStore,
+) -> actor.StartResult(Store) {
   actor.new_with_initialiser(1000, fn(subject) {
     let selector =
       process.new_selector()
@@ -170,7 +201,7 @@ pub fn start(name: process.Name(Message)) -> actor.StartResult(Store) {
       |> process.select_monitors(WorkerDown)
     actor.initialised(State(subject, dict.new()))
     |> actor.selecting(selector)
-    |> actor.returning(Store(subject))
+    |> actor.returning(Store(subject, records))
     |> Ok
   })
   |> actor.named(name)
@@ -180,13 +211,41 @@ pub fn start(name: process.Name(Message)) -> actor.StartResult(Store) {
 
 pub fn supervised(
   name: process.Name(Message),
+  records: persistence.TaskStore,
 ) -> supervision.ChildSpecification(Store) {
-  supervision.worker(fn() { start(name) })
+  supervision.worker(fn() { start(name, records) })
 }
 
 /// A handle to the task store registered under `name`.
-pub fn named(name: process.Name(Message)) -> Store {
-  Store(process.named_subject(name))
+pub fn named(
+  name: process.Name(Message),
+  records: persistence.TaskStore,
+) -> Store {
+  Store(process.named_subject(name), records)
+}
+
+/// Persist tasks created through the returned handle in `records`.
+pub fn with_records(store: Store, records: persistence.TaskStore) -> Store {
+  Store(..store, records: records)
+}
+
+pub fn records(store: Store) -> persistence.TaskStore {
+  store.records
+}
+
+/// Wake this replica's waiters and stop its worker after another replica
+/// changed a task's record.
+pub fn changed(store: Store, task_id: String) -> Nil {
+  process.send(store.subject, Changed(task_id))
+}
+
+/// Release this replica's state for tasks whose records were removed.
+pub fn forget(
+  store: Store,
+  task_ids: List(String),
+  reason: jsonrpc.RpcError,
+) -> Nil {
+  process.send(store.subject, Forget(task_ids, reason))
 }
 
 pub fn create(store: Store, ttl_ms: Option(Int)) -> actions.Task {
@@ -212,7 +271,9 @@ pub fn create_scoped_with_poll_interval(
   scope: Option(String),
   poll_interval_ms: Int,
 ) -> actions.Task {
-  create_scoped_with_lifecycle(store, ttl_ms, scope, poll_interval_ms, None)
+  let assert Ok(task) =
+    create_scoped_with_lifecycle(store, ttl_ms, scope, poll_interval_ms, None)
+  task
 }
 
 pub fn create_scoped_with_lifecycle(
@@ -221,16 +282,23 @@ pub fn create_scoped_with_lifecycle(
   scope: Option(String),
   poll_interval_ms: Int,
   lifecycle: Option(TaskLifecycle),
-) -> actions.Task {
+) -> Result(actions.Task, jsonrpc.RpcError) {
   call(store, fn(reply_to) {
-    Create(ttl_ms, scope, int.max(poll_interval_ms, 0), lifecycle, reply_to)
+    Create(
+      store.records,
+      ttl_ms,
+      scope,
+      int.max(poll_interval_ms, 0),
+      lifecycle,
+      reply_to,
+    )
   })
 }
 
 /// Release tasks owned by a closing application/session scope. Other scopes,
 /// including durable authenticated owners, are left to their own lifecycle.
 pub fn close_scope(store: Store, scope: Option(String)) -> Nil {
-  call(store, fn(reply) { CloseScope(scope, reply) })
+  call(store, fn(reply) { CloseScope(store.records, scope, reply) })
 }
 
 /// Run a task worker with cancellation managed by the store. The worker is
@@ -240,7 +308,9 @@ pub fn start_worker(
   task_id: String,
   worker: fn() -> Result(actions.TaskResult, jsonrpc.RpcError),
 ) -> Result(Nil, jsonrpc.RpcError) {
-  call(store, fn(reply_to) { StartWorker(task_id, worker, reply_to) })
+  call(store, fn(reply_to) {
+    StartWorker(store.records, task_id, worker, reply_to)
+  })
 }
 
 pub fn start_modern_worker(
@@ -248,7 +318,7 @@ pub fn start_modern_worker(
   task_id: String,
   worker: fn() -> Result(ModernOutcome, jsonrpc.RpcError),
 ) -> Result(Nil, jsonrpc.RpcError) {
-  call(store, fn(reply) { StartModern(task_id, worker, reply) })
+  call(store, fn(reply) { StartModern(store.records, task_id, worker, reply) })
 }
 
 /// Read status and a final payload without blocking. Ownership is checked even
@@ -258,7 +328,7 @@ pub fn snapshot_scoped(
   task_id: String,
   scope: Option(String),
 ) -> Result(Snapshot, jsonrpc.RpcError) {
-  call(store, fn(reply) { Peek(task_id, Scoped(scope), reply) })
+  call(store, fn(reply) { Peek(store.records, task_id, Scoped(scope), reply) })
 }
 
 pub fn submit_inputs_scoped(
@@ -267,7 +337,9 @@ pub fn submit_inputs_scoped(
   scope: Option(String),
   inputs: Dict(String, jsonrpc.Value),
 ) -> Result(Nil, jsonrpc.RpcError) {
-  call(store, fn(reply) { SubmitInputs(task_id, Scoped(scope), inputs, reply) })
+  call(store, fn(reply) {
+    SubmitInputs(store.records, task_id, Scoped(scope), inputs, reply)
+  })
 }
 
 pub fn complete(
@@ -275,7 +347,9 @@ pub fn complete(
   task_id: String,
   outcome: Result(actions.TaskResult, jsonrpc.RpcError),
 ) -> Result(actions.Task, jsonrpc.RpcError) {
-  call(store, fn(reply_to) { Complete(task_id, outcome, reply_to) })
+  call(store, fn(reply_to) {
+    Complete(store.records, task_id, outcome, reply_to)
+  })
 }
 
 pub fn update_status(
@@ -285,23 +359,26 @@ pub fn update_status(
   status_message: Option(String),
 ) -> Result(actions.Task, jsonrpc.RpcError) {
   call(store, fn(reply_to) {
-    UpdateStatus(task_id, status, status_message, reply_to)
+    UpdateStatus(store.records, task_id, status, status_message, reply_to)
   })
 }
 
-pub fn list(store: Store) -> List(actions.Task) {
-  call(store, fn(reply_to) { List(Unscoped, reply_to) })
+pub fn list(store: Store) -> Result(List(actions.Task), jsonrpc.RpcError) {
+  call(store, fn(reply_to) { List(store.records, Unscoped, reply_to) })
 }
 
-pub fn list_scoped(store: Store, scope: Option(String)) -> List(actions.Task) {
-  call(store, fn(reply_to) { List(Scoped(scope), reply_to) })
+pub fn list_scoped(
+  store: Store,
+  scope: Option(String),
+) -> Result(List(actions.Task), jsonrpc.RpcError) {
+  call(store, fn(reply_to) { List(store.records, Scoped(scope), reply_to) })
 }
 
 pub fn get(
   store: Store,
   task_id: String,
 ) -> Result(actions.Task, jsonrpc.RpcError) {
-  call(store, fn(reply_to) { Get(task_id, Unscoped, reply_to) })
+  call(store, fn(reply_to) { Get(store.records, task_id, Unscoped, reply_to) })
 }
 
 pub fn get_scoped(
@@ -309,7 +386,9 @@ pub fn get_scoped(
   task_id: String,
   scope: Option(String),
 ) -> Result(actions.Task, jsonrpc.RpcError) {
-  call(store, fn(reply_to) { Get(task_id, Scoped(scope), reply_to) })
+  call(store, fn(reply_to) {
+    Get(store.records, task_id, Scoped(scope), reply_to)
+  })
 }
 
 pub fn result(
@@ -333,7 +412,7 @@ fn result_with_access(
   access: Access,
 ) -> Result(actions.TaskResult, jsonrpc.RpcError) {
   process.call_forever(store.subject, fn(reply_to) {
-    Result(task_id, access, reply_to)
+    Result(store.records, task_id, access, reply_to)
   })
 }
 
@@ -357,7 +436,9 @@ pub fn cancel_result(
   store: Store,
   task_id: String,
 ) -> Result(actions.CancelTaskResult, jsonrpc.RpcError) {
-  call(store, fn(reply_to) { Cancel(task_id, Unscoped, reply_to) })
+  call(store, fn(reply_to) {
+    Cancel(store.records, task_id, Unscoped, reply_to)
+  })
 }
 
 pub fn cancel_result_scoped(
@@ -365,7 +446,9 @@ pub fn cancel_result_scoped(
   task_id: String,
   scope: Option(String),
 ) -> Result(actions.CancelTaskResult, jsonrpc.RpcError) {
-  call(store, fn(reply_to) { Cancel(task_id, Scoped(scope), reply_to) })
+  call(store, fn(reply_to) {
+    Cancel(store.records, task_id, Scoped(scope), reply_to)
+  })
 }
 
 fn call(store: Store, message: fn(process.Subject(reply)) -> Message) -> reply {
@@ -377,8 +460,8 @@ fn handle_message(
   message: Message,
 ) -> actor.Next(State, Message) {
   let State(subject:, entries:) = state
-  case message {
-    Create(requested_ttl_ms, scope, poll_interval_ms, lifecycle, reply_to) -> {
+  let next = case message {
+    Create(records, requested_ttl_ms, scope, poll_interval_ms, lifecycle, reply) -> {
       let ttl_ms = actual_ttl(requested_ttl_ms)
       let task =
         new_task(
@@ -389,203 +472,163 @@ fn handle_message(
           ttl_ms,
           Some(poll_interval_ms),
         )
-      process.send(reply_to, task)
-      let retention = case ttl_ms {
-        Some(ttl) ->
-          Some(process.send_after(subject, ttl, Expire(task.task_id)))
-        None -> None
+      let record =
+        TaskRecord(
+          task: task,
+          scope: scope,
+          outcome: None,
+          inputs: dict.new(),
+          cancellation_status_message: lifecycle
+            |> option.then(fn(options) { options.cancellation_status_message }),
+          cancellation_meta: lifecycle
+            |> option.then(fn(options) { options.cancellation_meta }),
+          expires_at: ttl_ms
+            |> option.map(fn(ttl) {
+              timestamp.add(timestamp.system_time(), duration.milliseconds(ttl))
+            }),
+          version: 0,
+        )
+      case records.insert(record) {
+        Error(error) -> {
+          process.send(reply, Error(store_error(error)))
+          entries
+        }
+        Ok(Nil) -> {
+          process.send(reply, Ok(task))
+          case ttl_ms {
+            Some(ttl) -> {
+              let timer =
+                process.send_after(subject, ttl, Expire(records, task.task_id))
+              dict.insert(
+                entries,
+                task.task_id,
+                Entry(..empty_entry(records), retention: Some(timer)),
+              )
+            }
+            None -> entries
+          }
+        }
       }
-      continue(
-        subject,
-        dict.insert(
+    }
+    UpdateStatus(records, task_id, status, status_message, reply) -> {
+      let #(entries, response) = case status {
+        actions.Cancelled -> {
+          let #(entries, cancelled) =
+            cancel_task(entries, records, task_id, Unscoped, True)
+          #(entries, cancelled |> result.map(fn(result) { result.task }))
+        }
+        _ -> #(
           entries,
-          task.task_id,
-          Entry(
-            task,
-            None,
-            [],
-            scope,
-            None,
-            retention,
-            lifecycle,
-            dict.new(),
-            None,
-          ),
-        ),
-      )
-    }
-    UpdateStatus(task_id, status, status_message, reply_to) -> {
-      let #(next_entries, response) =
-        update_task_status(entries, task_id, status, status_message)
-      process.send(reply_to, response)
-      continue(subject, next_entries)
-    }
-    Complete(task_id, outcome, reply_to) -> {
-      let #(next_entries, response, waiters, task_result) =
-        complete_task(entries, task_id, outcome)
-      process.send(reply_to, response)
-      notify_waiters(waiters, task_result)
-      continue(subject, next_entries)
-    }
-    StartWorker(task_id, worker, reply_to) -> {
-      let #(next_entries, response) =
-        start_task_worker(entries, task_id, subject, worker)
-      process.send(reply_to, response)
-      continue(subject, next_entries)
-    }
-    StartModern(task_id, worker, reply) -> {
-      let #(next, response) =
-        start_modern_task(entries, task_id, subject, worker)
+          update(records, task_id, fn(record) {
+            case is_terminal(record.task.status), status {
+              True, _ -> Ok(#(record, record.task))
+              False, actions.Completed | False, actions.Failed ->
+                Error(jsonrpc.invalid_params_error(
+                  "A completed or failed task must have a final result",
+                ))
+              False, _ -> {
+                let task = set_task_status(record.task, status, status_message)
+                Ok(#(TaskRecord(..record, task: task), task))
+              }
+            }
+          }),
+        )
+      }
       process.send(reply, response)
-      continue(subject, next)
+      entries
     }
-    Peek(task_id, access, reply) -> {
-      process.send(reply, case find_entry(entries, task_id, access) {
-        Ok(entry) -> Ok(Snapshot(entry.task, entry.outcome, entry.inputs))
-        Error(_) -> Error(task_not_found_error(task_id))
-      })
-      continue(subject, entries)
+    Complete(records, task_id, outcome, reply) -> {
+      let #(entries, response) =
+        complete_task(entries, records, task_id, outcome)
+      process.send(reply, response)
+      entries
     }
-    SubmitInputs(task_id, access, inputs, reply) -> {
-      case find_entry(entries, task_id, access) {
-        Error(_) -> {
-          process.send(reply, Error(task_not_found_error(task_id)))
-          continue(subject, entries)
-        }
+    StartWorker(records, task_id, worker, reply) -> {
+      let #(entries, response) =
+        start_worker_entry(
+          entries,
+          records,
+          task_id,
+          subject,
+          fn(pid) { WorkerFinished(task_id, pid, worker()) },
+          fn(record) { Ok(record) },
+        )
+      process.send(reply, response)
+      entries
+    }
+    StartModern(records, task_id, worker, reply) -> {
+      let #(entries, response) =
+        start_modern_task(entries, records, task_id, subject, worker)
+      process.send(reply, response)
+      entries
+    }
+    Peek(records, task_id, access, reply) -> {
+      process.send(
+        reply,
+        load(records, task_id, access)
+          |> result.map(fn(record) {
+            Snapshot(record.task, record.outcome, record.inputs)
+          }),
+      )
+      entries
+    }
+    SubmitInputs(records, task_id, access, inputs, reply) -> {
+      let #(entries, response) =
+        submit_inputs(entries, records, task_id, access, inputs, subject)
+      process.send(reply, response)
+      entries
+    }
+    ModernFinished(task_id, pid, outcome) ->
+      case running_entry(entries, task_id, pid) {
+        Error(Nil) -> entries
         Ok(entry) -> {
-          case entry.resume, entry.task.status {
-            Some(resume), actions.InputRequired -> {
-              // Unknown and already consumed keys are ignored. Retain missing
-              // inputs until a later update supplies them all.
-              let supplied =
-                dict.filter(inputs, fn(key, _) {
-                  dict.has_key(entry.inputs, key)
-                })
-              let remaining =
-                dict.filter(entry.inputs, fn(key, _) {
-                  !dict.has_key(supplied, key)
-                })
-              case dict.size(supplied) > 0 {
-                False -> {
-                  process.send(reply, Ok(Nil))
-                  continue(subject, entries)
-                }
-                True -> {
-                  let next_resume = fn(more) {
-                    resume(dict.merge(supplied, more))
-                  }
-                  let entry =
-                    Entry(..entry, inputs: remaining, resume: Some(next_resume))
-                  let entries = dict.insert(entries, task_id, entry)
-                  case dict.size(remaining) == 0 {
-                    False -> {
-                      process.send(reply, Ok(Nil))
-                      continue(subject, entries)
-                    }
-                    True -> {
-                      let #(next, response) =
-                        start_modern_task(entries, task_id, subject, fn() {
-                          next_resume(dict.new())
-                        })
-                      process.send(reply, response)
-                      continue(subject, next)
-                    }
-                  }
-                }
-              }
-            }
-            _, _ -> {
-              process.send(reply, Ok(Nil))
-              continue(subject, entries)
-            }
-          }
-        }
-      }
-    }
-    ModernFinished(task_id, pid, outcome) -> {
-      case dict.get(entries, task_id) {
-        Ok(Entry(worker: Some(TrackedWorker(pid: worker, ..)), ..) as entry)
-          if worker == pid
-        -> {
-          release_worker_monitor(entry.worker)
-          let entry = Entry(..entry, worker: None)
-          let entries = dict.insert(entries, task_id, entry)
-          case outcome {
-            Ok(ModernInputRequired(inputs, resume)) -> {
-              case dict.size(inputs) > 0 {
-                True -> {
-                  let entry =
-                    Entry(
-                      ..entry,
-                      task: set_task_status(
-                        entry.task,
-                        actions.InputRequired,
-                        None,
-                      ),
-                      inputs: inputs,
-                      resume: Some(resume),
-                    )
-                  continue(subject, dict.insert(entries, task_id, entry))
-                }
-                False -> {
-                  let #(next, _, waiters, outcome) =
-                    complete_task(
-                      entries,
-                      task_id,
-                      Error(jsonrpc.invalid_params_error(
-                        "Task input requests must not be empty",
-                      )),
-                    )
-                  notify_waiters(waiters, outcome)
-                  continue(subject, next)
-                }
-              }
-            }
-            outcome -> {
-              let outcome = case outcome {
-                Ok(ModernComplete(value)) -> Ok(actions.TaskResultModern(value))
-                Ok(ModernInputRequired(..)) ->
-                  Error(jsonrpc.invalid_params_error(
-                    "Task input requests must not be empty",
-                  ))
-                Error(error) -> Error(error)
-              }
-              let #(next, _, waiters, result) =
-                complete_task(entries, task_id, outcome)
-              notify_waiters(waiters, result)
-              continue(subject, next)
-            }
-          }
-        }
-        _ -> continue(subject, entries)
-      }
-    }
-    WorkerReady(task_id, pid, ready) -> {
-      case dict.get(entries, task_id) {
-        Ok(Entry(worker: Some(TrackedWorker(pid: worker, ..)), ..))
-          if worker == pid
-        -> process.send(ready, Nil)
-        _ -> process.kill(pid)
-      }
-      continue(subject, entries)
-    }
-    WorkerFinished(task_id, pid, outcome) -> {
-      case dict.get(entries, task_id) {
-        Ok(Entry(worker: Some(TrackedWorker(pid: worker, ..)), ..) as entry)
-          if worker == pid
-        -> {
           release_worker_monitor(entry.worker)
           let entries =
             dict.insert(entries, task_id, Entry(..entry, worker: None))
-          let #(next_entries, _, waiters, task_result) =
-            complete_task(entries, task_id, outcome)
-          notify_waiters(waiters, task_result)
-          continue(subject, next_entries)
+          case outcome {
+            Ok(ModernInputRequired(inputs, resume)) ->
+              case dict.size(inputs) > 0 {
+                True -> await_inputs(entries, entry, task_id, inputs, resume)
+                False ->
+                  complete_task(
+                    entries,
+                    entry.records,
+                    task_id,
+                    Error(jsonrpc.invalid_params_error(
+                      "Task input requests must not be empty",
+                    )),
+                  ).0
+              }
+            Ok(ModernComplete(value)) ->
+              complete_task(
+                entries,
+                entry.records,
+                task_id,
+                Ok(actions.TaskResultModern(value)),
+              ).0
+            Error(error) ->
+              complete_task(entries, entry.records, task_id, Error(error)).0
+          }
         }
-        _ -> continue(subject, entries)
       }
+    WorkerReady(task_id, pid, ready) -> {
+      case running_entry(entries, task_id, pid) {
+        Ok(_) -> process.send(ready, Nil)
+        Error(Nil) -> process.kill(pid)
+      }
+      entries
     }
-    WorkerDown(process.ProcessDown(_, pid, _)) -> {
+    WorkerFinished(task_id, pid, outcome) ->
+      case running_entry(entries, task_id, pid) {
+        Error(Nil) -> entries
+        Ok(entry) -> {
+          release_worker_monitor(entry.worker)
+          let entries =
+            dict.insert(entries, task_id, Entry(..entry, worker: None))
+          complete_task(entries, entry.records, task_id, outcome).0
+        }
+      }
+    WorkerDown(process.ProcessDown(_, pid, _)) ->
       case
         list.find(dict.to_list(entries), fn(pair) {
           case pair.1.worker {
@@ -594,129 +637,226 @@ fn handle_message(
           }
         })
       {
-        Ok(#(task_id, _)) -> {
+        Ok(#(task_id, entry)) -> {
           let error =
             jsonrpc.RpcError(
               -32_603,
               "Task worker exited before completing",
               None,
             )
-          let #(next_entries, _, waiters, task_result) =
-            complete_task(entries, task_id, Error(error))
-          notify_waiters(waiters, task_result)
-          continue(subject, next_entries)
+          complete_task(entries, entry.records, task_id, Error(error)).0
         }
-        Error(Nil) -> continue(subject, entries)
+        Error(Nil) -> entries
       }
-    }
-    WorkerDown(process.PortDown(..)) -> continue(subject, entries)
-    CloseScope(scope, reply) -> {
-      let next =
-        dict.filter(entries, fn(_, entry) {
-          case entry.scope == scope {
-            True -> {
-              release_entry(
-                entry,
-                Error(jsonrpc.invalid_params_error("Task scope was closed")),
-              )
-              False
-            }
-            False -> True
-          }
-        })
+    WorkerDown(process.PortDown(..)) -> entries
+    CloseScope(records, scope, reply) -> {
+      let entries = case records.delete_scope(scope) {
+        Ok(ids) ->
+          release_entries(
+            entries,
+            ids,
+            jsonrpc.invalid_params_error("Task scope was closed"),
+          )
+        Error(_) -> entries
+      }
       process.send(reply, Nil)
-      continue(subject, next)
+      entries
     }
-    Expire(task_id) -> {
+    Expire(records, task_id) -> {
+      let _ = records.delete(task_id)
+      release_entries(entries, [task_id], task_expired_error(task_id))
+    }
+    Forget(task_ids, reason) -> release_entries(entries, task_ids, reason)
+    Changed(task_id) ->
       case dict.get(entries, task_id) {
-        Ok(entry) -> {
-          release_entry(entry, Error(task_expired_error(task_id)))
-        }
-        Error(Nil) -> Nil
+        Error(Nil) -> entries
+        Ok(entry) ->
+          case load(entry.records, task_id, Unscoped) {
+            Ok(record) -> settle(entries, task_id, entry, record)
+            // The record is gone, so nothing will ever complete it.
+            Error(error) -> release_entries(entries, [task_id], error)
+          }
       }
-      continue(subject, dict.delete(entries, task_id))
-    }
-    List(access, reply_to) -> {
+    List(records, access, reply) -> {
+      let scope = case access {
+        Unscoped -> persistence.AnyScope
+        Scoped(scope) -> persistence.Scope(scope)
+      }
       process.send(
-        reply_to,
-        entries
-          |> dict.to_list
-          |> list.filter(fn(pair) { can_access(pair.1, access) })
-          |> list.map(fn(entry) {
-            let #(_, Entry(task:, ..)) = entry
-            task
+        reply,
+        records.list(scope)
+          |> result.map_error(store_error)
+          |> result.map(fn(found) {
+            found
+            |> list.filter(fn(record) { !expired(record) })
+            |> list.map(fn(record) { record.task })
           }),
       )
-      continue(subject, entries)
+      entries
     }
-    Get(task_id, access, reply_to) -> {
-      let #(next_entries, response) = get_task(entries, task_id, access)
-      process.send(reply_to, response)
-      continue(subject, next_entries)
+    Get(records, task_id, access, reply) -> {
+      process.send(
+        reply,
+        load(records, task_id, access) |> result.map(fn(record) { record.task }),
+      )
+      entries
     }
-    Result(task_id, access, reply_to) -> {
-      let #(next_entries, response) =
-        get_result(entries, task_id, access, reply_to)
-      case response {
-        Some(value) -> process.send(reply_to, value)
-        None -> Nil
+    Result(records, task_id, access, reply) ->
+      case load(records, task_id, access) {
+        Error(error) -> {
+          process.send(reply, Error(error))
+          entries
+        }
+        Ok(record) ->
+          case final_result(record) {
+            Some(outcome) -> {
+              process.send(reply, outcome)
+              entries
+            }
+            None -> {
+              let entry = local_entry(entries, task_id, records)
+              dict.insert(
+                entries,
+                task_id,
+                Entry(..entry, waiters: [reply, ..entry.waiters]),
+              )
+            }
+          }
       }
-      continue(subject, next_entries)
+    Cancel(records, task_id, access, reply) -> {
+      let #(entries, response) =
+        cancel_task(entries, records, task_id, access, False)
+      process.send(reply, response)
+      entries
     }
-    Cancel(task_id, access, reply_to) -> {
-      let #(next_entries, response) = cancel_task(entries, task_id, access)
-      process.send(reply_to, response)
-      continue(subject, next_entries)
+  }
+  actor.continue(State(subject, next))
+}
+
+fn empty_entry(records: Records) -> Entry {
+  Entry(records, [], None, None, None)
+}
+
+fn local_entry(
+  entries: Dict(String, Entry),
+  task_id: String,
+  records: Records,
+) -> Entry {
+  case dict.get(entries, task_id) {
+    Ok(entry) -> entry
+    Error(Nil) -> empty_entry(records)
+  }
+}
+
+fn running_entry(
+  entries: Dict(String, Entry),
+  task_id: String,
+  pid: process.Pid,
+) -> Result(Entry, Nil) {
+  case dict.get(entries, task_id) {
+    Ok(Entry(worker: Some(TrackedWorker(pid: worker, ..)), ..) as entry)
+      if worker == pid
+    -> Ok(entry)
+    _ -> Error(Nil)
+  }
+}
+
+/// Drop local state that no longer serves a purpose.
+fn tidy(entries: Dict(String, Entry), task_id: String) -> Dict(String, Entry) {
+  case dict.get(entries, task_id) {
+    Ok(Entry(waiters: [], worker: None, retention: None, resume: None, ..)) ->
+      dict.delete(entries, task_id)
+    _ -> entries
+  }
+}
+
+/// The result `tasks/result` returns once a task has reached a final state.
+fn final_result(
+  record: TaskRecord,
+) -> Option(Result(actions.TaskResult, jsonrpc.RpcError)) {
+  let task_id = record.task.task_id
+  case record.outcome, record.task.status {
+    Some(outcome), _ -> Some(result_for_task(record.task, task_id, outcome))
+    None, actions.Cancelled -> Some(Error(cancelled_task_error(task_id)))
+    None, actions.Completed | None, actions.Failed ->
+      Some(Error(task_not_found_error(task_id)))
+    None, _ -> None
+  }
+}
+
+/// Bring local state in line with a record another writer may have changed.
+fn settle(
+  entries: Dict(String, Entry),
+  task_id: String,
+  entry: Entry,
+  record: TaskRecord,
+) -> Dict(String, Entry) {
+  case final_result(record) {
+    None -> entries
+    Some(outcome) -> {
+      stop_worker(entry.worker)
+      notify_waiters(entry.waiters, outcome)
+      dict.insert(
+        entries,
+        task_id,
+        Entry(..entry, waiters: [], worker: None, resume: None),
+      )
+      |> tidy(task_id)
     }
   }
 }
 
-fn continue(
-  subject: process.Subject(Message),
+fn release_entries(
   entries: Dict(String, Entry),
-) -> actor.Next(State, Message) {
-  actor.continue(State(subject, entries))
-}
-
-fn start_task_worker(
-  entries: Dict(String, Entry),
-  task_id: String,
-  subject: process.Subject(Message),
-  worker: fn() -> Result(actions.TaskResult, jsonrpc.RpcError),
-) -> #(Dict(String, Entry), Result(Nil, jsonrpc.RpcError)) {
-  start_worker_entry(
-    entries,
-    task_id,
-    subject,
-    fn(pid) { WorkerFinished(task_id, pid, worker()) },
-    fn(entry) { entry },
-  )
+  task_ids: List(String),
+  reason: jsonrpc.RpcError,
+) -> Dict(String, Entry) {
+  list.fold(task_ids, entries, fn(entries, task_id) {
+    case dict.get(entries, task_id) {
+      Ok(entry) -> {
+        stop_worker(entry.worker)
+        case entry.retention {
+          Some(timer) -> {
+            let _ = process.cancel_timer(timer)
+            Nil
+          }
+          None -> Nil
+        }
+        notify_waiters(entry.waiters, Error(reason))
+        dict.delete(entries, task_id)
+      }
+      Error(Nil) -> entries
+    }
+  })
 }
 
 fn start_modern_task(
   entries: Dict(String, Entry),
+  records: Records,
   task_id: String,
   subject: process.Subject(Message),
   worker: fn() -> Result(ModernOutcome, jsonrpc.RpcError),
 ) -> #(Dict(String, Entry), Result(Nil, jsonrpc.RpcError)) {
   start_worker_entry(
     entries,
+    records,
     task_id,
     subject,
     fn(pid) { ModernFinished(task_id, pid, worker()) },
-    fn(entry) {
-      Entry(
-        ..entry,
-        task: set_task_status(
-          entry.task,
-          actions.Working,
-          case entry.task.status {
-            actions.Working -> entry.task.status_message
-            _ -> None
-          },
+    fn(record) {
+      Ok(
+        TaskRecord(
+          ..record,
+          task: set_task_status(
+            record.task,
+            actions.Working,
+            case record.task.status {
+              actions.Working -> record.task.status_message
+              _ -> None
+            },
+          ),
+          inputs: dict.new(),
         ),
-        inputs: dict.new(),
-        resume: None,
       )
     },
   )
@@ -724,203 +864,317 @@ fn start_modern_task(
 
 fn start_worker_entry(
   entries: Dict(String, Entry),
+  records: Records,
   task_id: String,
   subject: process.Subject(Message),
   finish: fn(process.Pid) -> Message,
-  prepare: fn(Entry) -> Entry,
+  prepare: fn(TaskRecord) -> Result(TaskRecord, jsonrpc.RpcError),
 ) -> #(Dict(String, Entry), Result(Nil, jsonrpc.RpcError)) {
-  case dict.get(entries, task_id) {
-    Ok(entry) ->
-      case is_terminal(entry.task.status), entry.worker {
-        False, None -> {
-          let pid =
-            process.spawn_unlinked(fn() {
-              let ready = process.new_subject()
-              process.send(subject, WorkerReady(task_id, process.self(), ready))
-              process.receive_forever(ready)
-              process.send(subject, finish(process.self()))
-            })
-          let monitor = process.monitor(pid)
-          let entry = prepare(entry)
-          #(
-            dict.insert(
-              entries,
-              task_id,
-              Entry(..entry, worker: Some(TrackedWorker(pid, monitor))),
-            ),
-            Ok(Nil),
-          )
-        }
-        _, _ -> #(
-          entries,
-          Error(jsonrpc.invalid_params_error("Task cannot start another worker")),
-        )
+  let entry = local_entry(entries, task_id, records)
+  let prepared =
+    update(records, task_id, fn(record) {
+      case is_terminal(record.task.status), entry.worker {
+        False, None ->
+          prepare(record) |> result.map(fn(record) { #(record, Nil) })
+        _, _ ->
+          Error(jsonrpc.invalid_params_error("Task cannot start another worker"))
       }
-    Error(_) -> #(entries, Error(task_not_found_error(task_id)))
-  }
-}
-
-fn update_task_status(
-  entries: Dict(String, Entry),
-  task_id: String,
-  status: actions.TaskStatus,
-  status_message: Option(String),
-) -> #(Dict(String, Entry), Result(actions.Task, jsonrpc.RpcError)) {
-  case dict.get(entries, task_id) {
-    Ok(entry) -> {
-      case is_terminal(entry.task.status), status {
-        True, _ -> #(entries, Ok(entry.task))
-        False, actions.Completed | False, actions.Failed -> #(
+    })
+  case prepared {
+    Error(error) -> #(entries, Error(error))
+    Ok(Nil) -> {
+      let pid =
+        process.spawn_unlinked(fn() {
+          let ready = process.new_subject()
+          process.send(subject, WorkerReady(task_id, process.self(), ready))
+          process.receive_forever(ready)
+          process.send(subject, finish(process.self()))
+        })
+      let monitor = process.monitor(pid)
+      #(
+        dict.insert(
           entries,
-          Error(jsonrpc.invalid_params_error(
-            "A completed or failed task must have a final result",
-          )),
-        )
-        False, actions.Cancelled -> {
-          let #(entries, cancelled) = cancel_task(entries, task_id, Unscoped)
-          #(entries, cancelled |> result.map(fn(result) { result.task }))
-        }
-        False, _ -> {
-          let updated = set_task_status(entry.task, status, status_message)
-          #(
-            dict.insert(entries, task_id, Entry(..entry, task: updated)),
-            Ok(updated),
-          )
-        }
-      }
+          task_id,
+          Entry(
+            ..entry,
+            records: records,
+            worker: Some(TrackedWorker(pid, monitor)),
+            resume: None,
+          ),
+        ),
+        Ok(Nil),
+      )
     }
-    Error(Nil) -> #(entries, Error(task_not_found_error(task_id)))
   }
 }
 
-fn get_task(
+fn await_inputs(
   entries: Dict(String, Entry),
+  entry: Entry,
   task_id: String,
-  access: Access,
-) -> #(Dict(String, Entry), Result(actions.Task, jsonrpc.RpcError)) {
-  case find_entry(entries, task_id, access) {
-    Ok(entry) -> #(entries, Ok(entry.task))
-    Error(Nil) -> #(entries, Error(task_not_found_error(task_id)))
+  inputs: Dict(String, jsonrpc.Value),
+  resume: Resume,
+) -> Dict(String, Entry) {
+  let awaiting =
+    update(entry.records, task_id, fn(record) {
+      case is_terminal(record.task.status) {
+        True -> Ok(#(record, False))
+        False ->
+          Ok(#(
+            TaskRecord(
+              ..record,
+              task: set_task_status(record.task, actions.InputRequired, None),
+              inputs: inputs,
+            ),
+            True,
+          ))
+      }
+    })
+  case awaiting {
+    Ok(True) ->
+      dict.insert(
+        entries,
+        task_id,
+        Entry(..entry, worker: None, resume: Some(resume)),
+      )
+    Ok(False) -> tidy(entries, task_id)
+    Error(error) ->
+      complete_task(entries, entry.records, task_id, Error(error)).0
   }
 }
 
-fn get_result(
+fn submit_inputs(
   entries: Dict(String, Entry),
+  records: Records,
   task_id: String,
   access: Access,
-  reply_to: process.Subject(Result(actions.TaskResult, jsonrpc.RpcError)),
-) -> #(
-  Dict(String, Entry),
-  Option(Result(actions.TaskResult, jsonrpc.RpcError)),
-) {
-  case find_entry(entries, task_id, access) {
-    Ok(entry) ->
-      case entry.outcome {
-        Some(result) -> #(
-          entries,
-          Some(result_for_task(entry.task, task_id, result)),
-        )
-        None -> {
-          case entry.task.status {
-            actions.Cancelled -> #(
-              entries,
-              Some(Error(cancelled_task_error(task_id))),
-            )
-            actions.Completed | actions.Failed -> #(
-              entries,
-              Some(Error(task_not_found_error(task_id))),
-            )
-            _ -> {
-              let waiting_entry =
-                Entry(..entry, waiters: [reply_to, ..entry.waiters])
-              #(dict.insert(entries, task_id, waiting_entry), None)
+  inputs: Dict(String, jsonrpc.Value),
+  subject: process.Subject(Message),
+) -> #(Dict(String, Entry), Result(Nil, jsonrpc.RpcError)) {
+  case load(records, task_id, access), dict.get(entries, task_id) {
+    Error(error), _ -> #(entries, Error(error))
+    Ok(TaskRecord(task: actions.Task(status: actions.InputRequired, ..), ..)),
+      Ok(Entry(resume: Some(resume), ..) as entry)
+    -> {
+      // Unknown and already consumed keys are ignored. Retain missing inputs
+      // until a later update supplies them all.
+      let supplied =
+        update(records, task_id, fn(record) {
+          let supplied =
+            dict.filter(inputs, fn(key, _) { dict.has_key(record.inputs, key) })
+          let remaining =
+            dict.filter(record.inputs, fn(key, _) {
+              !dict.has_key(supplied, key)
+            })
+          Ok(#(
+            TaskRecord(..record, inputs: remaining),
+            #(supplied, dict.size(remaining) == 0),
+          ))
+        })
+      case supplied {
+        Error(error) -> #(entries, Error(error))
+        Ok(#(supplied, complete)) ->
+          case dict.size(supplied) > 0 {
+            False -> #(entries, Ok(Nil))
+            True -> {
+              let next_resume = fn(more) { resume(dict.merge(supplied, more)) }
+              let entries =
+                dict.insert(
+                  entries,
+                  task_id,
+                  Entry(..entry, resume: Some(next_resume)),
+                )
+              case complete {
+                False -> #(entries, Ok(Nil))
+                True ->
+                  start_modern_task(entries, records, task_id, subject, fn() {
+                    next_resume(dict.new())
+                  })
+              }
             }
           }
-        }
       }
-    Error(Nil) -> #(entries, Some(Error(task_not_found_error(task_id))))
+    }
+    Ok(_), _ -> #(entries, Ok(Nil))
   }
 }
 
 fn cancel_task(
   entries: Dict(String, Entry),
+  records: Records,
   task_id: String,
   access: Access,
+  // Status updates report an already terminal task instead of failing.
+  lenient: Bool,
 ) -> #(Dict(String, Entry), Result(actions.CancelTaskResult, jsonrpc.RpcError)) {
-  case find_entry(entries, task_id, access) {
-    Ok(entry) ->
-      case is_terminal(entry.task.status) {
-        True -> #(entries, Error(cannot_cancel_error(entry.task)))
-        False -> {
-          let cancelled =
-            set_task_status(
-              entry.task,
-              actions.Cancelled,
-              entry.lifecycle
-                |> option.then(fn(options) {
-                  options.cancellation_status_message
-                })
-                |> option.or(Some("The task was cancelled by request.")),
-            )
-          let next_entry =
-            Entry(..entry, task: cancelled, waiters: [], worker: None)
-          stop_worker(entry.worker)
-          notify_waiters(entry.waiters, Error(cancelled_task_error(task_id)))
-          #(
-            dict.insert(entries, task_id, next_entry),
-            Ok(actions.CancelTaskResult(
-              cancelled,
-              entry.lifecycle
-                |> option.then(fn(options) { options.cancellation_meta }),
-            )),
-          )
+  let cancelled = case load(records, task_id, access) {
+    Error(error) -> Error(error)
+    Ok(_) ->
+      update(records, task_id, fn(record) {
+        case is_terminal(record.task.status), lenient {
+          True, True ->
+            Ok(#(record, actions.CancelTaskResult(record.task, None)))
+          True, False -> Error(cannot_cancel_error(record.task))
+          False, _ -> {
+            let task =
+              set_task_status(
+                record.task,
+                actions.Cancelled,
+                record.cancellation_status_message
+                  |> option.or(Some("The task was cancelled by request.")),
+              )
+            Ok(#(
+              TaskRecord(..record, task: task),
+              actions.CancelTaskResult(task, record.cancellation_meta),
+            ))
+          }
         }
-      }
-    Error(Nil) -> #(entries, Error(task_not_found_error(task_id)))
+      })
+  }
+  case cancelled, dict.get(entries, task_id) {
+    Ok(_), Ok(entry) -> {
+      stop_worker(entry.worker)
+      notify_waiters(entry.waiters, Error(cancelled_task_error(task_id)))
+      #(
+        dict.insert(
+          entries,
+          task_id,
+          Entry(..entry, waiters: [], worker: None, resume: None),
+        )
+          |> tidy(task_id),
+        cancelled,
+      )
+    }
+    _, _ -> #(entries, cancelled)
   }
 }
 
 fn complete_task(
   entries: Dict(String, Entry),
+  records: Records,
   task_id: String,
   outcome: Result(actions.TaskResult, jsonrpc.RpcError),
-) -> #(
-  Dict(String, Entry),
-  Result(actions.Task, jsonrpc.RpcError),
-  List(process.Subject(Result(actions.TaskResult, jsonrpc.RpcError))),
-  Result(actions.TaskResult, jsonrpc.RpcError),
-) {
-  case dict.get(entries, task_id) {
-    Ok(entry) -> {
-      stop_worker(entry.worker)
-      let task = terminal_task(entry.task, outcome)
-      let final_outcome = case is_terminal(entry.task.status), entry.outcome {
+) -> #(Dict(String, Entry), Result(actions.Task, jsonrpc.RpcError)) {
+  let completed =
+    update(records, task_id, fn(record) {
+      let final_outcome = case is_terminal(record.task.status), record.outcome {
         True, Some(previous) -> previous
         True, None -> Error(cancelled_task_error(task_id))
         False, _ -> outcome
       }
-      let next_entry =
-        Entry(
-          ..entry,
+      let task = terminal_task(record.task, outcome)
+      Ok(#(
+        TaskRecord(
+          ..record,
           task: task,
           outcome: Some(final_outcome),
-          waiters: [],
-          worker: None,
-        )
+          inputs: dict.new(),
+        ),
+        #(task, result_for_task(task, task_id, final_outcome)),
+      ))
+    })
+  case completed, dict.get(entries, task_id) {
+    Ok(#(task, result)), Ok(entry) -> {
+      stop_worker(entry.worker)
+      notify_waiters(entry.waiters, result)
       #(
-        dict.insert(entries, task_id, next_entry),
+        dict.insert(
+          entries,
+          task_id,
+          Entry(..entry, waiters: [], worker: None, resume: None),
+        )
+          |> tidy(task_id),
         Ok(task),
-        entry.waiters,
-        result_for_task(task, task_id, final_outcome),
       )
     }
-    Error(Nil) -> #(
-      entries,
-      Error(task_not_found_error(task_id)),
-      [],
-      Error(task_not_found_error(task_id)),
-    )
+    Ok(#(task, _)), Error(Nil) -> #(entries, Ok(task))
+    Error(error), Ok(entry) -> {
+      // The record is unreachable, so release whoever is waiting on it.
+      stop_worker(entry.worker)
+      notify_waiters(entry.waiters, Error(error))
+      #(
+        dict.insert(
+          entries,
+          task_id,
+          Entry(..entry, waiters: [], worker: None, resume: None),
+        )
+          |> tidy(task_id),
+        Error(error),
+      )
+    }
+    Error(error), Error(Nil) -> #(entries, Error(error))
   }
+}
+
+fn load(
+  records: Records,
+  task_id: String,
+  access: Access,
+) -> Result(TaskRecord, jsonrpc.RpcError) {
+  case records.get(task_id) {
+    Error(error) -> Error(store_error(error))
+    Ok(Some(record)) ->
+      case expired(record), can_access(record, access) {
+        False, True -> Ok(record)
+        _, _ -> Error(task_not_found_error(task_id))
+      }
+    Ok(None) -> Error(task_not_found_error(task_id))
+  }
+}
+
+/// Apply a change to a task's record, retrying when another writer changed
+/// the record first.
+fn update(
+  records: Records,
+  task_id: String,
+  apply: fn(TaskRecord) -> Result(#(TaskRecord, a), jsonrpc.RpcError),
+) -> Result(a, jsonrpc.RpcError) {
+  update_attempt(records, task_id, apply, update_attempts)
+}
+
+fn update_attempt(
+  records: Records,
+  task_id: String,
+  apply: fn(TaskRecord) -> Result(#(TaskRecord, a), jsonrpc.RpcError),
+  attempts: Int,
+) -> Result(a, jsonrpc.RpcError) {
+  use record <- result.try(load(records, task_id, Unscoped))
+  use #(next, value) <- result.try(apply(record))
+  case next == record {
+    True -> Ok(value)
+    False ->
+      case records.replace(TaskRecord(..next, version: record.version + 1)) {
+        Ok(True) -> Ok(value)
+        Ok(False) if attempts > 1 ->
+          update_attempt(records, task_id, apply, attempts - 1)
+        Ok(False) ->
+          Error(jsonrpc.RpcError(
+            -32_603,
+            "Task was changed concurrently: " <> task_id,
+            None,
+          ))
+        Error(error) -> Error(store_error(error))
+      }
+  }
+}
+
+fn expired(record: TaskRecord) -> Bool {
+  case record.expires_at {
+    Some(expires_at) ->
+      timestamp.compare(expires_at, timestamp.system_time()) != order.Gt
+    None -> False
+  }
+}
+
+fn can_access(record: TaskRecord, access: Access) -> Bool {
+  case access {
+    Unscoped -> True
+    Scoped(scope) -> record.scope == scope
+  }
+}
+
+fn store_error(error: persistence.StoreError) -> jsonrpc.RpcError {
+  jsonrpc.RpcError(-32_603, "Task store unavailable: " <> error.message, None)
 }
 
 fn terminal_task(
@@ -1012,28 +1266,6 @@ fn actual_ttl(requested: Option(Int)) -> Option(Int) {
     Some(ttl) if ttl < 0 -> Some(0)
     Some(ttl) if ttl > maximum_ttl_ms -> Some(maximum_ttl_ms)
     ttl -> ttl
-  }
-}
-
-fn can_access(entry: Entry, access: Access) -> Bool {
-  case access {
-    Unscoped -> True
-    Scoped(scope) -> entry.scope == scope
-  }
-}
-
-fn find_entry(
-  entries: Dict(String, Entry),
-  task_id: String,
-  access: Access,
-) -> Result(Entry, Nil) {
-  case dict.get(entries, task_id) {
-    Ok(entry) ->
-      case can_access(entry, access) {
-        True -> Ok(entry)
-        False -> Error(Nil)
-      }
-    Error(Nil) -> Error(Nil)
   }
 }
 
@@ -1147,19 +1379,4 @@ fn task_status_name(status: actions.TaskStatus) -> String {
     actions.Failed -> "failed"
     actions.Cancelled -> "cancelled"
   }
-}
-
-fn release_entry(
-  entry: Entry,
-  outcome: Result(actions.TaskResult, jsonrpc.RpcError),
-) -> Nil {
-  stop_worker(entry.worker)
-  case entry.retention {
-    Some(timer) -> {
-      let _ = process.cancel_timer(timer)
-      Nil
-    }
-    None -> Nil
-  }
-  notify_waiters(entry.waiters, outcome)
 }

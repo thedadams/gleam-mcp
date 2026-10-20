@@ -191,7 +191,6 @@ pub fn completed_request_timer_cannot_expire_a_reused_id_test() {
 fn assert_session_stays_missing(app: store.Store, session: String) -> Nil {
   store.send_request(app, session, ping("closed"), 50) |> should.be_error
   should.be_false(store.has_session(app, session))
-  store.metadata(app, session) |> should.be_none
   let listener = process.new_subject()
   store.register_listener(app, session, "new-listener", listener)
   should.equal(process.receive(listener, 1000), Ok(store.CloseListener))

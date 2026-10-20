@@ -83,6 +83,7 @@ pub fn handler_with_max_body_and_middleware(
   middleware: ClientActionMiddleware,
 ) -> fn(request.Request(mist.Connection)) ->
   response.Response(mist.ResponseData) {
+  let assert Ok(Nil) = server.start_services(server)
   fn(req) { handle(server, req, max_body_bytes, middleware) }
 }
 
@@ -1230,9 +1231,11 @@ fn require_existing_session(
   case requested_session_id {
     None -> Error(#(400, "Missing MCP session id"))
     Some(id) ->
-      case server.has_streamable_http_session(server, id) {
-        False -> Error(#(404, "Unknown MCP session"))
-        True ->
+      case server.find_session(server, id) {
+        // A store outage must not make clients discard a valid session.
+        Error(_) -> Error(#(503, "MCP session store unavailable"))
+        Ok(None) -> Error(#(404, "Unknown MCP session"))
+        Ok(Some(_)) ->
           case server.bind_session(server, id, principal) {
             True -> Ok(id)
             False -> Error(#(404, "Unknown MCP session"))

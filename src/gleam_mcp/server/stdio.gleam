@@ -64,6 +64,7 @@ pub fn serve_with_writer(
   lines: yielder.Yielder(String),
   write: fn(String) -> Nil,
 ) -> Nil {
+  let assert Ok(Nil) = server.start_services(app_server)
   let input = process.new_subject()
   let outgoing = process.new_subject()
   let session_id = server.ensure_streamable_http_session(app_server, None)

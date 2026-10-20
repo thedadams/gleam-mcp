@@ -1,6 +1,8 @@
 import gleam/erlang/process
 import gleam/option.{None}
 import gleam/otp/static_supervisor
+import gleam_mcp/jsonrpc
+import gleam_mcp/persistence/memory
 import gleam_mcp/server/runtime
 import gleam_mcp/server/streamable_http_store
 import gleam_mcp/task_store
@@ -8,17 +10,21 @@ import gleeunit/should
 
 pub fn supervised_task_store_survives_a_crash_test() {
   let name = process.new_name("task_store_supervision_test")
+  let records_name = process.new_name("task_records_supervision_test")
+  let records = memory.tasks(records_name)
   let assert Ok(_) =
     static_supervisor.new(static_supervisor.OneForOne)
-    |> static_supervisor.add(task_store.supervised(name))
+    |> static_supervisor.add(memory.supervised_tasks(records_name))
+    |> static_supervisor.add(task_store.supervised(name, records))
     |> static_supervisor.start
-  let store = task_store.named(name)
+  let store = task_store.named(name, records)
   let _ = task_store.create(store, None)
 
   kill_and_await_restart(name)
 
-  // The restarted store starts empty but is reachable through the same handle.
-  task_store.list(store) |> should.equal([])
+  // Records outlive the restarted store, which stays reachable through the
+  // same handle.
+  task_store.list(store) |> should.be_ok |> should.not_equal([])
   let task = task_store.create(store, None)
   task_store.get(store, task.task_id) |> should.be_ok
 }
@@ -47,8 +53,8 @@ pub fn supervised_runtime_survives_a_crash_test() {
 
   kill_and_await_restart(name)
 
-  runtime.subscribe(store, "session", "file:///a", True)
-  runtime.subscribers(store, "file:///a") |> should.equal(["session"])
+  runtime.run(store, None, jsonrpc.IntId(1), 1000, fn() { Ok(1) })
+  |> should.equal(Ok(1))
 }
 
 fn kill_and_await_restart(name: process.Name(message)) -> Nil {

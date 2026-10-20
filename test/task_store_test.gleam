@@ -124,8 +124,8 @@ pub fn scoped_task_access_does_not_expose_other_requestors_test() {
   let owner = Some("owner")
   let other = Some("other")
   let task = task_store.create_scoped(store, None, owner)
-  should.equal(task_store.list_scoped(store, owner), [task])
-  should.equal(task_store.list_scoped(store, other), [])
+  should.equal(task_store.list_scoped(store, owner), Ok([task]))
+  should.equal(task_store.list_scoped(store, other), Ok([]))
   task_store.get_scoped(store, task.task_id, other) |> should.be_error
   task_store.cancel_scoped(store, task.task_id, other) |> should.be_error
   task_store.result_scoped(store, task.task_id, other) |> should.be_error
@@ -344,7 +344,7 @@ pub fn expired_tasks_release_waiters_and_stop_workers_test() {
       process.send(reply, task_store.result(store, task.task_id))
     })
   process.receive(reply, 1000) |> should.be_ok |> should.be_error
-  should.equal(task_store.list(store), [])
+  should.equal(task_store.list(store), Ok([]))
   task_store.get(store, task.task_id) |> should.be_error
 }
 
@@ -403,6 +403,7 @@ pub fn application_task_lifecycle_preserves_initial_and_final_stage_messages_tes
       1000,
       Some(task_store.TaskLifecycle(Some("Gathering sources..."), None, None)),
     )
+    |> should.be_ok
   should.equal(task.status_message, Some("Gathering sources..."))
   task_store.update_status(
     store,
@@ -435,6 +436,7 @@ pub fn configured_cancellation_payload_is_owner_checked_and_defaults_remain_unch
       1000,
       Some(lifecycle),
     )
+    |> should.be_ok
   task_store.cancel_result_scoped(store, task.task_id, Some("other"))
   |> should.be_error
   let unchanged = task_store.get(store, task.task_id) |> should.be_ok

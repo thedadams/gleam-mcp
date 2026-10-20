@@ -7,15 +7,21 @@ import gleam/int
 import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}
+import gleam/order
+import gleam/otp/actor
 import gleam/otp/static_supervisor
 import gleam/result
 import gleam/string
+import gleam/time/duration.{type Duration}
 import gleam/time/timestamp
 import gleam_mcp/actions
 import gleam_mcp/jsonrpc
 import gleam_mcp/mcp
+import gleam_mcp/persistence
+import gleam_mcp/persistence/memory
 import gleam_mcp/server/capabilities
 import gleam_mcp/server/codec
+import gleam_mcp/server/janitor
 import gleam_mcp/server/oauth
 import gleam_mcp/server/runtime
 import gleam_mcp/server/streamable_http_store
@@ -26,6 +32,14 @@ import youid/uuid
 const task_extension = "io.modelcontextprotocol/tasks"
 
 const server_sent_request_timeout_ms = 3_600_000
+
+const sweep_interval_ms = 60_000
+
+/// Idle 2025-11-25 sessions are kept for 30 days.
+const default_session_ttl_hours = 720
+
+/// A session's lifetime is extended at most once a day.
+const default_session_refresh_hours = 24
 
 pub type ToolHandler =
   fn(Option(dict.Dict(String, jsonrpc.Value))) ->
@@ -117,6 +131,9 @@ type Options {
     extensions: dict.Dict(String, jsonrpc.Value),
     projection: Option(fn(Server, RequestContext) -> Server),
     session_close: Option(fn(String) -> Nil),
+    sessions: persistence.SessionStore,
+    session_ttl: Duration,
+    session_refresh: Duration,
     legacy_events: Option(LegacyEventStore),
     context_logging: Option(
       fn(RequestContext, actions.LoggingLevel) -> Result(Nil, jsonrpc.RpcError),
@@ -146,6 +163,7 @@ pub opaque type Server {
     logging_handler: Option(LoggingHandler),
     task_result_request_handler: Option(TaskResultRequestHandler),
     options: Options,
+    services: process.Name(janitor.Message),
   )
 }
 
@@ -177,21 +195,28 @@ type RegisteredPrompt {
 /// process. Call it from a process that lives as long as the server is used.
 pub fn new(implementation: actions.Implementation) -> Server {
   let tasks = process.new_name("gleam_mcp_task_store")
+  let task_records = process.new_name("gleam_mcp_task_records")
   let http = process.new_name("gleam_mcp_streamable_http")
   let requests = process.new_name("gleam_mcp_runtime")
   let subscriptions = process.new_name("gleam_mcp_subscriptions")
+  let sessions = process.new_name("gleam_mcp_sessions")
   let assert Ok(_) =
     static_supervisor.new(static_supervisor.OneForOne)
-    |> static_supervisor.add(task_store.supervised(tasks))
+    |> static_supervisor.add(memory.supervised_tasks(task_records))
+    |> static_supervisor.add(task_store.supervised(
+      tasks,
+      memory.tasks(task_records),
+    ))
     |> static_supervisor.add(streamable_http_store.supervised(http))
     |> static_supervisor.add(runtime.supervised(requests))
     |> static_supervisor.add(runtime.supervised_subscriptions(subscriptions))
+    |> static_supervisor.add(memory.supervised_sessions(sessions))
     |> static_supervisor.start
   Server(
     implementation,
     None,
     None,
-    task_store.named(tasks),
+    task_store.named(tasks, memory.tasks(task_records)),
     streamable_http_store.named(http),
     runtime.named(requests),
     runtime.named_subscriptions(subscriptions),
@@ -213,13 +238,47 @@ pub fn new(implementation: actions.Implementation) -> Server {
       extensions: dict.new(),
       projection: None,
       session_close: None,
+      sessions: memory.sessions(sessions),
+      session_ttl: duration.hours(default_session_ttl_hours),
+      session_refresh: duration.hours(default_session_refresh_hours),
       legacy_events: None,
       context_logging: None,
       resource_subscription: None,
       tool_task_options: dict.new(),
       tool_task_lifecycles: dict.new(),
     ),
+    process.new_name("gleam_mcp_janitor"),
   )
+}
+
+/// Start the background work a configured server needs: sweeping expired
+/// sessions and tasks from their stores. Call it once the server is fully
+/// configured. The streamable HTTP and stdio transports call it for you, and
+/// calling it again for the same server does nothing.
+pub fn start_services(server: Server) -> Result(Nil, actor.StartError) {
+  case process.named(server.services) {
+    Ok(_) -> Ok(Nil)
+    Error(Nil) -> {
+      let config =
+        janitor.Config(
+          sessions: server.options.sessions,
+          tasks: task_store.records(server.task_store),
+          interval_ms: sweep_interval_ms,
+          session_expired: fn(id) { close_session(server, id) },
+          tasks_expired: fn(ids) {
+            task_store.forget(
+              server.task_store,
+              ids,
+              jsonrpc.invalid_params_error("Task has expired"),
+            )
+          },
+        )
+      static_supervisor.new(static_supervisor.OneForOne)
+      |> static_supervisor.add(janitor.supervised(server.services, config))
+      |> static_supervisor.start
+      |> result.replace(Nil)
+    }
+  }
 }
 
 pub fn implementation(server: Server) -> actions.Implementation {
@@ -487,6 +546,42 @@ pub fn project_server(server: Server, context: RequestContext) -> Server {
     Some(project) -> project(server, context)
     None -> server
   }
+}
+
+/// Keep 2025-11-25 sessions and their resource subscriptions in `store`, so
+/// that every replica sharing it can serve them and they survive restarts.
+pub fn with_session_store(
+  server: Server,
+  store: persistence.SessionStore,
+) -> Server {
+  Server(..server, options: Options(..server.options, sessions: store))
+}
+
+/// Expire 2025-11-25 sessions after `ttl` without a request. Each request
+/// extends the lifetime, writing to the session store at most once per
+/// `refresh_every`.
+pub fn with_session_ttl(
+  server: Server,
+  ttl ttl: Duration,
+  refresh_every refresh_every: Duration,
+) -> Server {
+  Server(
+    ..server,
+    options: Options(
+      ..server.options,
+      session_ttl: ttl,
+      session_refresh: refresh_every,
+    ),
+  )
+}
+
+/// Keep tasks in `store`, so that every replica sharing it can read, cancel
+/// and await them, and they survive restarts.
+pub fn with_task_store(server: Server, store: persistence.TaskStore) -> Server {
+  Server(
+    ..server,
+    task_store: task_store.with_records(server.task_store, store),
+  )
 }
 
 pub fn with_legacy_event_store(
@@ -1896,14 +1991,13 @@ fn create_modern_task_with_poll_interval(
   worker: fn() -> Result(task_store.ModernOutcome, jsonrpc.RpcError),
 ) -> Result(actions.ClientActionResult, jsonrpc.RpcError) {
   use _ <- result.try(require_task_extension(server, context))
-  let task =
-    task_store.create_scoped_with_lifecycle(
-      server.task_store,
-      ttl_ms,
-      context_task_scope(server, context),
-      poll_interval_ms,
-      lifecycle,
-    )
+  use task <- result.try(task_store.create_scoped_with_lifecycle(
+    server.task_store,
+    ttl_ms,
+    context_task_scope(server, context),
+    poll_interval_ms,
+    lifecycle,
+  ))
   use _ <- result.try(
     task_store.start_modern_worker(server.task_store, task.task_id, fn() {
       worker() |> result.try(validate_task_inputs(context, _))
@@ -2059,13 +2153,10 @@ pub fn handle_notification_with_context(
               case metadata.initialized {
                 True -> {
                   let assert Some(id) = context.session_id
-                  streamable_http_store.set_metadata(
-                    server.http_store,
+                  set_session_metadata(
+                    server,
                     id,
-                    streamable_http_store.SessionMetadata(
-                      ..metadata,
-                      ready: True,
-                    ),
+                    persistence.SessionMetadata(..metadata, ready: True),
                   )
                   Ok(Nil)
                 }
@@ -2111,28 +2202,120 @@ pub fn ensure_streamable_http_session(
   server: Server,
   session_id: Option(String),
 ) -> String {
-  let Server(http_store: http_store, ..) = server
-  streamable_http_store.ensure_session(http_store, session_id)
+  let id = streamable_http_store.ensure_session(server.http_store, session_id)
+  case find_session(server, id) {
+    Ok(Some(_)) -> Nil
+    _ -> {
+      let now = timestamp.system_time()
+      let _ =
+        server.options.sessions.put(persistence.SessionRecord(
+          id: id,
+          metadata: None,
+          expires_at: timestamp.add(now, server.options.session_ttl),
+          refreshed_at: now,
+        ))
+      Nil
+    }
+  }
+  id
+}
+
+fn ensure_local_session(server: Server, session_id: String) -> Nil {
+  case has_streamable_http_session(server, session_id) {
+    True -> {
+      let _ =
+        streamable_http_store.ensure_session(
+          server.http_store,
+          Some(session_id),
+        )
+      Nil
+    }
+    False -> Nil
+  }
 }
 
 pub fn has_streamable_http_session(server: Server, session_id: String) -> Bool {
-  let Server(http_store: http_store, ..) = server
-  streamable_http_store.has_session(http_store, session_id)
+  case find_session(server, session_id) {
+    Ok(Some(_)) -> True
+    _ -> False
+  }
+}
+
+/// Look up a live session, extending its lifetime when its last refresh is at
+/// least the configured refresh interval old. An expired session is closed.
+pub fn find_session(
+  server: Server,
+  session_id: String,
+) -> Result(Option(persistence.SessionRecord), persistence.StoreError) {
+  let store = server.options.sessions
+  use found <- result.try(store.get(session_id))
+  case found {
+    None -> Ok(None)
+    Some(record) -> {
+      let now = timestamp.system_time()
+      case timestamp.compare(record.expires_at, now) {
+        order.Gt -> {
+          let since_refresh = timestamp.difference(record.refreshed_at, now)
+          case duration.compare(since_refresh, server.options.session_refresh) {
+            order.Lt -> Ok(Some(record))
+            _ -> {
+              let refreshed =
+                persistence.SessionRecord(
+                  ..record,
+                  expires_at: timestamp.add(now, server.options.session_ttl),
+                  refreshed_at: now,
+                )
+              use _ <- result.map(store.put(refreshed))
+              Some(refreshed)
+            }
+          }
+        }
+        _ -> {
+          close_session(server, session_id)
+          Ok(None)
+        }
+      }
+    }
+  }
 }
 
 pub fn session_metadata(
   server: Server,
   session_id: String,
-) -> Option(streamable_http_store.SessionMetadata) {
-  streamable_http_store.metadata(server.http_store, session_id)
+) -> Option(persistence.SessionMetadata) {
+  case find_session(server, session_id) {
+    Ok(Some(record)) -> record.metadata
+    _ -> None
+  }
+}
+
+fn set_session_metadata(
+  server: Server,
+  session_id: String,
+  metadata: persistence.SessionMetadata,
+) -> Nil {
+  case find_session(server, session_id) {
+    Ok(Some(record)) -> {
+      let _ =
+        server.options.sessions.put(
+          persistence.SessionRecord(..record, metadata: Some(metadata)),
+        )
+      Nil
+    }
+    _ -> Nil
+  }
 }
 
 pub fn close_session(server: Server, session_id: String) -> Nil {
-  case session_metadata(server, session_id) {
-    Some(metadata) if metadata.principal != None -> Nil
+  let store = server.options.sessions
+  case store.get(session_id) {
+    Ok(Some(persistence.SessionRecord(metadata: Some(metadata), ..)))
+      if metadata.principal != None
+    -> Nil
     _ ->
       task_store.close_scope(server.task_store, Some("session:" <> session_id))
   }
+  let _ = store.delete(session_id)
   runtime.close(server.runtime, session_id)
   runtime.close_subscription_scope(server.subscriptions, session_id)
   streamable_http_store.delete_session(server.http_store, session_id)
@@ -2148,13 +2331,14 @@ pub fn bind_session(
   session_id: String,
   principal: Option(String),
 ) -> Bool {
-  case session_metadata(server, session_id) {
-    Some(metadata) -> metadata.principal == principal
-    None -> {
-      streamable_http_store.set_metadata(
-        server.http_store,
+  case find_session(server, session_id) {
+    Ok(Some(persistence.SessionRecord(metadata: Some(metadata), ..))) ->
+      metadata.principal == principal
+    Ok(Some(_)) -> {
+      set_session_metadata(
+        server,
         session_id,
-        streamable_http_store.SessionMetadata(
+        persistence.SessionMetadata(
           protocol_version: jsonrpc.legacy_protocol_version,
           client_capabilities: actions.ClientCapabilities(
             None,
@@ -2170,7 +2354,16 @@ pub fn bind_session(
       )
       True
     }
+    _ -> False
   }
+}
+
+fn store_error(error: persistence.StoreError) -> jsonrpc.RpcError {
+  jsonrpc.RpcError(
+    -32_603,
+    "Session store unavailable: " <> error.message,
+    None,
+  )
 }
 
 fn context_task_scope(
@@ -2217,6 +2410,8 @@ pub fn register_streamable_http_listener(
   listener: process.Subject(streamable_http_store.ListenerMessage),
 ) -> Nil {
   let Server(http_store: http_store, ..) = server
+  // The session may have been created by another replica.
+  ensure_local_session(server, session_id)
   streamable_http_store.register_listener(
     http_store,
     session_id,
@@ -2282,6 +2477,7 @@ pub fn send_request(
   case session_id(context) {
     Some(value) -> {
       let Server(http_store: http_store, ..) = server
+      ensure_local_session(server, value)
       streamable_http_store.send_request_with_recorder(
         http_store,
         value,
@@ -2862,10 +3058,10 @@ fn subscribe_resource(
       }
       use known <- result.try(known)
       case context.session_id, known {
-        Some(id), True -> {
-          runtime.subscribe(server.runtime, id, uri, enabled)
-          Ok(actions.ClientResultEmpty(None))
-        }
+        Some(id), True ->
+          server.options.sessions.set_subscription(id, uri, enabled)
+          |> result.map(fn(_) { actions.ClientResultEmpty(None) })
+          |> result.map_error(store_error)
         None, _ ->
           Error(jsonrpc.invalid_params_error(
             "Resource subscriptions require a session",
@@ -2882,7 +3078,7 @@ pub fn resource_subscriptions(
   server: Server,
   session_id: String,
 ) -> List(String) {
-  runtime.subscribed_uris(server.runtime, session_id)
+  server.options.sessions.subscriptions(session_id) |> result.unwrap([])
 }
 
 pub fn notify_resource_updated(server: Server, uri: String) -> Nil {
@@ -2898,7 +3094,8 @@ pub fn notify_resource_updated(server: Server, uri: String) -> Nil {
       ),
     ),
   )
-  runtime.subscribers(server.runtime, uri)
+  server.options.sessions.subscribers(uri)
+  |> result.unwrap([])
   |> list.each(fn(id) {
     let _ =
       send_notification(
@@ -3072,10 +3269,10 @@ fn dispatch_request(
           let principal =
             session_metadata(server, id)
             |> option.then(fn(metadata) { metadata.principal })
-          streamable_http_store.set_metadata(
-            server.http_store,
+          set_session_metadata(
+            server,
             id,
-            streamable_http_store.SessionMetadata(
+            persistence.SessionMetadata(
               jsonrpc.legacy_protocol_version,
               params.capabilities,
               True,
@@ -3397,14 +3594,14 @@ fn call_tool_result(
                 "Tool does not support task execution",
               ))
             Some(actions.TaskMetadata(ttl_ms)), _ -> {
-              Ok(create_tool_task_result(
+              create_tool_task_result(
                 server,
                 name,
                 handler,
                 context,
                 arguments,
                 ttl_ms,
-              ))
+              )
             }
             None, Some(actions.TaskRequired) ->
               Error(jsonrpc.method_not_found_error(mcp.method_call_tool))
@@ -3435,16 +3632,15 @@ fn create_tool_task_result(
   context: RequestContext,
   arguments: Option(dict.Dict(String, jsonrpc.Value)),
   ttl_ms: Option(Int),
-) -> actions.ClientActionResult {
+) -> Result(actions.ClientActionResult, jsonrpc.RpcError) {
   let #(ttl_ms, poll_interval_ms) = tool_task_options(server, name, ttl_ms)
-  let created =
-    task_store.create_scoped_with_lifecycle(
-      server.task_store,
-      ttl_ms,
-      context_task_scope(server, context),
-      poll_interval_ms,
-      dict.get(server.options.tool_task_lifecycles, name) |> option.from_result,
-    )
+  use created <- result.map(task_store.create_scoped_with_lifecycle(
+    server.task_store,
+    ttl_ms,
+    context_task_scope(server, context),
+    poll_interval_ms,
+    dict.get(server.options.tool_task_lifecycles, name) |> option.from_result,
+  ))
   let task_context = case context {
     RequestContext(_, _) ->
       RequestContext(context.session_id, Some(created.task_id))
@@ -3514,14 +3710,14 @@ fn list_tasks_result(
   context: RequestContext,
   params: actions.PaginatedRequestParams,
 ) -> Result(actions.ClientActionResult, jsonrpc.RpcError) {
-  let tasks = case context.session_id {
+  use tasks <- result.try(case context.session_id {
     None -> task_store.list(server.task_store)
     Some(_) ->
       task_store.list_scoped(
         server.task_store,
         context_task_scope(server, context),
       )
-  }
+  })
   paginate(tasks, params.cursor, "tasks", server.options.page_size)
   |> result.map(fn(page) {
     actions.ClientResultListTasks(actions.ListTasksResult(page.0, page.1, None))

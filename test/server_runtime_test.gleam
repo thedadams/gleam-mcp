@@ -9,7 +9,7 @@ pub fn main() {
   crashed_request_workers_return_an_internal_error_immediately_test()
   finished_request_timers_cannot_cancel_reused_request_ids_test()
   cancellation_stops_only_the_matching_session_worker_test()
-  session_close_releases_pending_requests_and_subscriptions_test()
+  session_close_releases_pending_requests_test()
   request_timeout_stops_worker_and_allows_a_new_request_test()
 }
 
@@ -108,12 +108,10 @@ pub fn cancellation_stops_only_the_matching_session_worker_test() {
   process.receive(reply_b, 1000) |> should.be_ok |> should.be_ok
 }
 
-pub fn session_close_releases_pending_requests_and_subscriptions_test() {
+pub fn session_close_releases_pending_requests_test() {
   let store = runtime.new()
   let ready = process.new_subject()
   let reply = process.new_subject()
-  runtime.subscribe(store, "a", "file:///resource", True)
-  runtime.subscribe(store, "b", "file:///resource", True)
   let _ =
     process.spawn_unlinked(fn() {
       process.send(
@@ -128,7 +126,6 @@ pub fn session_close_releases_pending_requests_and_subscriptions_test() {
   process.receive(ready, 1000) |> should.be_ok
   runtime.close(store, "a")
   process.receive(reply, 1000) |> should.be_ok |> should.be_error
-  should.equal(runtime.subscribers(store, "file:///resource"), ["b"])
 }
 
 pub fn request_timeout_stops_worker_and_allows_a_new_request_test() {
