@@ -899,7 +899,9 @@ fn encode_list_tools_result(result: actions.ListToolsResult) -> jsonrpc.Value {
   |> codec_value.object
 }
 
-fn encode_call_tool_result(result: actions.CallToolResult) -> jsonrpc.Value {
+pub fn encode_call_tool_result(
+  result: actions.CallToolResult,
+) -> jsonrpc.Value {
   let actions.CallToolResult(content, structured_content, is_error, meta) =
     result
   [#("content", codec_value.array(content, codec_encode.encode_content_block))]
@@ -961,7 +963,7 @@ fn encode_list_tasks_result(result: actions.ListTasksResult) -> jsonrpc.Value {
   |> codec_value.object
 }
 
-fn encode_create_message_result(
+pub fn encode_create_message_result(
   result: actions.CreateMessageResult,
 ) -> jsonrpc.Value {
   let actions.CreateMessageResult(message, model, stop_reason, meta) = result
@@ -988,7 +990,7 @@ fn encode_sampling_content(content: actions.SamplingContent) -> jsonrpc.Value {
   }
 }
 
-fn encode_elicit_result(result: actions.ElicitResult) -> jsonrpc.Value {
+pub fn encode_elicit_result(result: actions.ElicitResult) -> jsonrpc.Value {
   let actions.ElicitResult(action, content, meta) = result
   [#("action", encode_elicit_action(action))]
   |> append_optional("content", option_map(content, encode_elicit_content))
@@ -1138,7 +1140,7 @@ fn encode_role(role: actions.Role) -> jsonrpc.Value {
   }
 }
 
-fn encode_task(task: actions.Task) -> jsonrpc.Value {
+pub fn encode_task(task: actions.Task) -> jsonrpc.Value {
   codec_encode.task_fields(task) |> codec_value.object
 }
 

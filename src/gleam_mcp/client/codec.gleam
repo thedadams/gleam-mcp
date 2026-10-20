@@ -1866,7 +1866,7 @@ fn list_tools_result_decoder() -> decode.Decoder(actions.ListToolsResult) {
   })
 }
 
-fn call_tool_result_decoder() -> decode.Decoder(actions.CallToolResult) {
+pub fn call_tool_result_decoder() -> decode.Decoder(actions.CallToolResult) {
   {
     use content <- decode.field(
       "content",
@@ -1920,7 +1920,7 @@ fn list_roots_result_decoder() -> decode.Decoder(actions.ListRootsResult) {
   }
 }
 
-fn create_message_result_decoder() -> decode.Decoder(
+pub fn create_message_result_decoder() -> decode.Decoder(
   actions.CreateMessageResult,
 ) {
   decode.one_of(legacy_create_message_result_decoder(), or: [
@@ -1979,7 +1979,7 @@ fn legacy_create_message_result_decoder() -> decode.Decoder(
   }
 }
 
-fn elicit_result_decoder() -> decode.Decoder(actions.ElicitResult) {
+pub fn elicit_result_decoder() -> decode.Decoder(actions.ElicitResult) {
   {
     use action <- decode.field("action", elicit_action_decoder())
     use content <- decode.optional_field(
@@ -3088,7 +3088,7 @@ fn tool_result_content_decoder() -> decode.Decoder(actions.ToolResultContent) {
   }
 }
 
-fn task_decoder() -> decode.Decoder(actions.Task) {
+pub fn task_decoder() -> decode.Decoder(actions.Task) {
   {
     use task_id <- decode.field("taskId", decode.string)
     use status <- decode.field("status", task_status_decoder())
@@ -3177,7 +3177,7 @@ fn meta_only_decoder() -> decode.Decoder(Option(actions.Meta)) {
   }
 }
 
-fn meta_decoder() -> decode.Decoder(actions.Meta) {
+pub fn meta_decoder() -> decode.Decoder(actions.Meta) {
   decode.map(codec_decode.value_dict_decoder(), actions.Meta)
 }
 
