@@ -1057,8 +1057,11 @@ fn parse_tokens(
     oauth_response.parse_token_response(res)
     |> result.map_error(fn(error) {
       case error {
-        oauth_response.ErrorResponse(status, error, _, _) ->
-          TokenRejected(status, error)
+        oauth_response.ErrorResponse(oauth_response.AuthorizationServerError(
+          status:,
+          error:,
+          ..,
+        )) -> TokenRejected(status, error)
         oauth_response.ParseError(_) -> InvalidTokenResponse
       }
     }),

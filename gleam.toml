@@ -21,7 +21,7 @@ in = ">= 1.1.0 and < 2.0.0"
 gleam_yielder = ">= 1.1.0 and < 2.0.0"
 child_process = ">= 2.1.4 and < 3.0.0"
 gleam_crypto = ">= 1.5.1 and < 2.0.0"
-flwr_oauth2 = ">= 3.1.0 and < 4.0.0"
+flwr_oauth2 = ">= 3.4.0 and < 4.0.0"
 httpp = { git = "https://github.com/thedadams/httpp.git", ref = "0ae1235ce37a5b5a29d01030667018a6ab59d342" }
 gzlib = ">= 2.0.0 and < 3.0.0"
 glyn = ">= 2.0.3 and < 3.0.0"

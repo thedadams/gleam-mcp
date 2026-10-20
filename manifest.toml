@@ -12,7 +12,7 @@ packages = [
   { name = "child_process", version = "2.1.4", build_tools = ["gleam"], requirements = ["gleam_erlang", "gleam_otp", "gleam_stdlib", "splitter"], otp_app = "child_process", source = "hex", outer_checksum = "573CD41D96C0FB7E1B68A847B70312BC2549820F9C3452560F5939AC38723CD1" },
   { name = "envoy", version = "1.2.0", build_tools = ["gleam"], requirements = ["gleam_stdlib"], otp_app = "envoy", source = "hex", outer_checksum = "9C6FBB6BFA02A52798BEEC5977A738CAD6E4A057F4B67FD0C8061AD2502C191A" },
   { name = "exception", version = "2.1.1", build_tools = ["gleam"], requirements = ["gleam_stdlib"], otp_app = "exception", source = "hex", outer_checksum = "6BDEA95248093599391C3B5DF1835C5C6A86C353C2F99CE539B450E3432FE117" },
-  { name = "flwr_oauth2", version = "3.1.0", build_tools = ["gleam"], requirements = ["gleam_crypto", "gleam_http", "gleam_json", "gleam_stdlib", "gleam_time"], otp_app = "flwr_oauth2", source = "hex", outer_checksum = "F7A5C5EF8958A31A3673A8848E6DB6B15DC8FF6DEE42A04253A147655C683F5F" },
+  { name = "flwr_oauth2", version = "3.4.0", build_tools = ["gleam"], requirements = ["gleam_crypto", "gleam_http", "gleam_json", "gleam_stdlib", "gleam_time"], otp_app = "flwr_oauth2", source = "hex", outer_checksum = "8BB9EBC6C30BC9088BA3646E5FC8415B06D0A0F0A561B7D1E79B43AA052FDE55" },
   { name = "gleam_crypto", version = "1.6.0", build_tools = ["gleam"], requirements = ["gleam_stdlib"], otp_app = "gleam_crypto", source = "hex", outer_checksum = "2DE9E4EF53CF6FEE049D4F765731F7178F7A11AEFAE00EEE63BF7536B354AD3F" },
   { name = "gleam_erlang", version = "1.3.0", build_tools = ["gleam"], requirements = ["gleam_stdlib"], otp_app = "gleam_erlang", source = "hex", outer_checksum = "1124AD3AA21143E5AF0FC5CF3D9529F6DB8CA03E43A55711B60B6B7B3874375C" },
   { name = "gleam_http", version = "4.3.0", build_tools = ["gleam"], requirements = ["gleam_stdlib"], otp_app = "gleam_http", source = "hex", outer_checksum = "82EA6A717C842456188C190AFB372665EA56CE13D8559BF3B1DD9E40F619EE0C" },
@@ -48,7 +48,7 @@ packages = [
 argv = { version = ">= 1.0.2 and < 2.0.0" }
 child_process = { version = ">= 2.1.4 and < 3.0.0" }
 envoy = { version = ">= 1.1.0 and < 2.0.0" }
-flwr_oauth2 = { version = ">= 3.1.0 and < 4.0.0" }
+flwr_oauth2 = { version = ">= 3.4.0 and < 4.0.0" }
 gleam_crypto = { version = ">= 1.5.1 and < 2.0.0" }
 gleam_erlang = { version = ">= 1.3.0 and < 2.0.0" }
 gleam_http = { version = ">= 4.3.0 and < 5.0.0" }
